@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模型用量 · 设计草图</title>
+<style>
+  :root {
+    --bg: #e9ebf1;
+    --panel: #fbfbfc;
+    --card: #ffffff;
+    --text: #17171a;
+    --muted: #64646e;
+    --faint: #8d8d97;
+    --line: rgba(20, 20, 30, 0.08);
+    --line-strong: rgba(20, 20, 30, 0.14);
+    --accent: #6d4aff;
+    --accent-soft: #f0ecff;
+    --blue: #3b82f6;
+    --teal: #0ea5a4;
+    --amber: #b45309;
+    --red: #d92d20;
+    --green: #0f7b4f;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 24px rgba(16, 24, 40, 0.04);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(900px 500px at 12% 0%, rgba(109, 74, 255, 0.10), transparent 60%),
+      radial-gradient(700px 400px at 90% 12%, rgba(59, 130, 246, 0.08), transparent 60%),
+      var(--bg);
+    font-family: var(--sans);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    display: grid;
+    place-items: center;
+  }
+  .shell {
+    width: 1320px;
+    height: 900px;
+    background: var(--panel);
+    border-radius: 16px;
+    box-shadow: 0 30px 90px rgba(15, 23, 42, 0.20), 0 0 0 0.5px rgba(0, 0, 0, 0.10);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .page {
+    flex: 1;
+    min-height: 0;
+    padding: 18px 22px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* hero */
+  .hero {
+    position: relative;
+    flex: 0 0 100px;
+    padding: 14px 18px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    background:
+      radial-gradient(120% 190% at 0% 0%, rgba(109, 74, 255, 0.13) 0%, transparent 55%),
+      linear-gradient(115deg, #fdfcff 0%, #f8f6ff 52%, #f4f7ff 100%);
+    overflow: hidden;
+  }
+  .hero::after {
+    content: "";
+    position: absolute;
+    right: 238px;
+    bottom: -56px;
+    width: 420px;
+    height: 150px;
+    background: radial-gradient(ellipse at center, rgba(109, 74, 255, 0.10), transparent 68%);
+    pointer-events: none;
+  }
+  .hero-copy { min-width: 0; position: relative; z-index: 1; }
+  .kicker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 5px;
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: 0.13em;
+  }
+  .kicker svg { width: 13px; height: 13px; }
+  h1 {
+    margin: 0;
+    font-size: 21px;
+    font-weight: 680;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+  }
+  .hero-sub {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+  .hero-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    color: var(--faint);
+    font-size: 10.5px;
+  }
+  .hero-meta b { color: var(--muted); font-weight: 600; }
+  .hero-meta .sep { width: 2px; height: 2px; border-radius: 50%; background: currentColor; opacity: .55; }
+  .hero-tools {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 7px;
+    flex: 0 0 auto;
+  }
+  .tool-row { display: flex; align-items: center; gap: 8px; }
+  .seg {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.72);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset;
+  }
+  .seg button {
+    height: 24px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 560;
+    cursor: default;
+    white-space: nowrap;
+  }
+  .seg button.on {
+    background: #fff;
+    color: var(--accent);
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.10), 0 0 0 0.5px rgba(109, 74, 255, 0.22);
+  }
+  .icon-btn {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.78);
+    color: var(--muted);
+    display: grid;
+    place-items: center;
+    cursor: default;
+  }
+  .icon-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .sync-line { color: var(--faint); font-size: 10px; }
+  .sync-line b { color: var(--green); font-weight: 600; }
+
+  /* tabs */
+  .tabs {
+    flex: 0 0 34px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border-bottom: 1px solid var(--line);
+  }
+  .tab {
+    position: relative;
+    height: 34px;
+    padding: 0 12px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 560;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: default;
+  }
+  .tab.active { color: var(--text); font-weight: 650; }
+  .tab.active::after {
+    content: "";
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--accent);
+  }
+  .tab .pill {
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: #fdeceb;
+    color: var(--red);
+    font-size: 9.5px;
+    font-weight: 700;
+    display: inline-grid;
+    place-items: center;
+  }
+  .tabs .spacer { flex: 1; }
+  .scope { color: var(--faint); font-size: 10px; padding-right: 2px; }
+
+  /* alert */
+  .alert {
+    flex: 0 0 34px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 12px;
+    border: 1px solid rgba(180, 83, 9, 0.20);
+    border-radius: 9px;
+    background: linear-gradient(90deg, rgba(245, 158, 11, 0.10), rgba(245, 158, 11, 0.045));
+    color: #7c3f06;
+    font-size: 11px;
+  }
+  .alert .alert-icon {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    border-radius: 5px;
+    background: rgba(180, 83, 9, 0.12);
+    display: grid;
+    place-items: center;
+  }
+  .alert .alert-icon svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .alert b { font-weight: 680; }
+  .alert .alert-detail { color: rgba(124, 63, 6, 0.78); }
+  .alert .alert-link { margin-left: auto; color: #8a4a08; font-weight: 650; white-space: nowrap; }
+  .alert .alert-link span { margin-left: 3px; }
+
+  /* kpi */
+  .kpis {
+    flex: 0 0 86px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .kpi {
+    position: relative;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: var(--card);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .kpi-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 560;
+  }
+  .kpi-label .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+  .kpi-value {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin-top: 3px;
+    font-size: 23px;
+    font-weight: 680;
+    letter-spacing: -0.025em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .kpi-value .unit { font-size: 11px; font-weight: 560; color: var(--faint); letter-spacing: 0; }
+  .delta {
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 9.5px;
+    font-weight: 680;
+    font-variant-numeric: tabular-nums;
+  }
+  .delta.up { color: var(--green); background: rgba(15, 123, 79, 0.08); }
+  .delta.warn { color: var(--amber); background: rgba(180, 83, 9, 0.09); }
+  .kpi-sub { margin-top: 4px; color: var(--faint); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .spark { position: absolute; right: 11px; bottom: 9px; width: 64px; height: 26px; opacity: .9; }
+  .spark path { fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .spark .area { stroke: none; opacity: .16; }
+
+  /* body */
+  .body {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 370px;
+    gap: 12px;
+  }
+  .col { min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+  .col.left { display: grid; grid-template-rows: minmax(0, 1fr) 228px; }
+  .col.right { display: grid; grid-template-rows: 218px 152px minmax(0, 1fr); }
+  .card {
+    min-height: 0;
+    padding: 14px 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+  }
+  .card-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+  .card-title { font-size: 12px; font-weight: 660; letter-spacing: -0.01em; }
+  .card-sub { margin-top: 2px; color: var(--faint); font-size: 10px; }
+  .card-link { color: var(--accent); font-size: 10px; font-weight: 620; white-space: nowrap; padding-top: 2px; }
+  .card-link span { margin-left: 2px; }
+
+  /* trend */
+  .trend-body { flex: 1; min-height: 0; display: flex; gap: 16px; }
+  .chart-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .legend { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 9.8px; }
+  .legend i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+  .chart { flex: 1; min-height: 0; position: relative; }
+  .chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .chart-foot { display: flex; align-items: center; justify-content: space-between; color: var(--faint); font-size: 9.8px; padding-top: 2px; }
+  .chart-foot b { color: var(--muted); font-weight: 600; }
+  .cost-side {
+    flex: 0 0 196px;
+    border-left: 1px solid var(--line);
+    padding-left: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .side-title { color: var(--muted); font-size: 10px; font-weight: 620; }
+  .donut-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .donut { width: 92px; height: 92px; flex: 0 0 auto; position: relative; }
+  .donut svg { width: 92px; height: 92px; transform: rotate(-90deg); }
+  .donut-center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
+  .donut-center b { font-size: 17px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .donut-center span { color: var(--faint); font-size: 9px; margin-top: 1px; }
+  .cost-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .cost-item { display: flex; align-items: center; gap: 6px; font-size: 9.8px; color: var(--muted); min-width: 0; }
+  .cost-item i { width: 6px; height: 6px; border-radius: 2px; flex: 0 0 auto; }
+  .cost-item .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-item b { font-weight: 620; color: var(--text); font-variant-numeric: tabular-nums; }
+  .cost-note { margin-top: auto; padding-top: 6px; border-top: 1px dashed var(--line); color: var(--faint); font-size: 9px; line-height: 1.5; }
+  .cost-note b { color: var(--amber); font-weight: 650; }
+
+  /* models */
+  .model-head, .model-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 76px 66px 48px 48px;
+    align-items: center;
+    gap: 6px;
+  }
+  .model-head {
+    flex: 0 0 20px;
+    color: var(--faint);
+    font-size: 9px;
+    letter-spacing: 0.02em;
+    border-bottom: 1px solid var(--line);
+  }
+  .model-head > span:nth-child(n+2), .model-row > span:nth-child(n+2) { text-align: right; }
+  .model-list { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .model-row {
+    flex: 1;
+    min-height: 0;
+    border-bottom: 1px solid rgba(20, 20, 30, 0.055);
+    font-size: 10.8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .model-row:last-child { border-bottom: 0; }
+  .model-name { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .model-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    font-size: 10px;
+    font-weight: 750;
+    flex: 0 0 auto;
+  }
+  .model-name .text { min-width: 0; display: block; }
+  .model-name .name { display: block; font-size: 11px; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-name .provider { display: block; color: var(--faint); font-size: 9px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .share { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .share .bar { width: 34px; height: 3px; border-radius: 99px; background: #eeeef4; overflow: hidden; }
+  .share .bar i { display: block; height: 100%; border-radius: 99px; background: var(--accent); }
+  .muted { color: var(--faint); }
+  .cost-zero { color: var(--faint); }
+  .model-foot {
+    flex: 0 0 22px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    color: var(--faint);
+    font-size: 9px;
+    border-top: 1px solid var(--line);
+  }
+  .model-foot b { color: var(--muted); font-weight: 600; }
+
+  /* quota */
+  .quota-top { flex: 1; display: flex; align-items: center; gap: 16px; min-height: 0; }
+  .quota-donut { width: 96px; height: 96px; position: relative; flex: 0 0 auto; }
+  .quota-donut svg { width: 96px; height: 96px; transform: rotate(-90deg); }
+  .quota-center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
+  .quota-center b { font-size: 22px; font-weight: 700; letter-spacing: -0.03em; color: var(--red); font-variant-numeric: tabular-nums; }
+  .quota-center span { color: var(--faint); font-size: 9px; margin-top: 1px; }
+  .quota-meters { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 9px; }
+  .meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 9.5px; color: var(--muted); }
+  .meter-top b { color: var(--text); font-size: 10.5px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .meter-top .reset { color: var(--faint); font-size: 8.6px; font-weight: 400; }
+  .meter { height: 4px; border-radius: 99px; background: #eeeef4; overflow: hidden; margin-top: 4px; }
+  .meter i { display: block; height: 100%; border-radius: 99px; }
+  .quota-note {
+    flex: 0 0 auto;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--red);
+    font-size: 9.4px;
+    font-weight: 560;
+  }
+  .quota-note .warn-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 3px rgba(217, 45, 32, 0.10); }
+  .live {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(15, 123, 79, 0.08);
+    color: var(--green);
+    font-size: 8.6px;
+    font-weight: 650;
+  }
+  .live i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+
+  /* expiry */
+  .exp-list { flex: 1; display: flex; flex-direction: column; justify-content: space-evenly; min-height: 0; }
+  .exp-row { display: flex; align-items: center; gap: 8px; font-size: 10px; }
+  .exp-icon { width: 20px; height: 20px; border-radius: 5px; display: grid; place-items: center; font-size: 9px; font-weight: 750; flex: 0 0 auto; }
+  .exp-name { flex: 1; min-width: 0; }
+  .exp-name b { display: block; font-size: 10.6px; font-weight: 620; }
+  .exp-name span { display: block; color: var(--faint); font-size: 8.9px; margin-top: 1px; }
+  .exp-tag { font-size: 9.3px; font-weight: 600; font-variant-numeric: tabular-nums; padding: 2px 5px; border-radius: 4px; white-space: nowrap; }
+  .exp-tag.ok { color: var(--green); background: rgba(15, 123, 79, 0.07); }
+  .exp-tag.warn { color: var(--amber); background: rgba(180, 83, 9, 0.09); }
+  .exp-tag.none { color: var(--faint); background: #f4f4f7; }
+  .exp-foot { flex: 0 0 18px; color: var(--faint); font-size: 8.8px; display: flex; align-items: flex-end; justify-content: space-between; border-top: 1px solid var(--line); padding-top: 4px; }
+  .exp-foot b { color: var(--muted); font-weight: 600; }
+
+  /* health */
+  .health-badge {
+    height: 17px;
+    padding: 0 6px;
+    border-radius: 4px;
+    background: rgba(180, 83, 9, 0.09);
+    color: var(--amber);
+    font-size: 8.8px;
+    font-weight: 650;
+    display: inline-flex;
+    align-items: center;
+  }
+  .health-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 2px; }
+  .hm { min-width: 0; padding: 7px 0 6px; border-radius: 7px; background: #fafafc; border: 1px solid rgba(20, 20, 30, 0.05); text-align: center; }
+  .hm b { display: block; font-size: 14.5px; font-weight: 680; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .hm span { display: block; color: var(--faint); font-size: 8.4px; margin-top: 2px; }
+  .hm.warn b { color: var(--amber); }
+  .health-note {
+    margin-top: auto;
+    padding-top: 7px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 9.4px;
+    line-height: 1.42;
+    display: flex;
+    align-items: flex-start;
+    gap: 5px;
+  }
+  .health-note .spark-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--amber); margin-top: 4px; flex: 0 0 auto; }
+  .health-note b { color: var(--amber); font-weight: 650; }
+
+  /* footer */
+  .foot {
+    flex: 0 0 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--faint);
+    font-size: 9.2px;
+  }
+  .foot b { color: var(--muted); font-weight: 600; }
+  .foot-links { display: flex; align-items: center; gap: 12px; }
+  .foot-links span { color: var(--muted); }
+  .foot-links .accent { color: var(--accent); font-weight: 600; }
+
+  /* tooltip-ish title */
+  .info {
+    width: 10px; height: 10px; border-radius: 50%;
+    border: 1px solid var(--line-strong);
+    color: var(--faint); font-size: 7px; display: inline-grid; place-items: center;
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="page">
+
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="kicker">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2.5 12.5V9.2M6.2 12.5V6.4M9.9 12.5V8.1M13.6 12.5V3.5"/>
+          </svg>
+          USAGE MONITOR
+        </div>
+        <h1>模型用量</h1>
+        <p class="hero-sub">把每一次模型调用都算清楚：Token、费用、时延与订阅额度。</p>
+        <div class="hero-meta">
+          <span>本机 <b>408</b> 个会话</span><span class="sep"></span>
+          <span><b>11</b> 个模型</span><span class="sep"></span>
+          <span>数据仅存本机</span>
+        </div>
+      </div>
+      <div class="hero-tools">
+        <div class="tool-row">
+          <div class="seg">
+            <button>今日</button>
+            <button>7 天</button>
+            <button class="on">30 天</button>
+            <button>全部</button>
+          </div>
+          <button class="icon-btn" title="刷新">
+            <svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.5"/><path d="M13 2.8V6h-3.2"/></svg>
+          </button>
+          <button class="icon-btn" title="监控设置">
+            <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.1"/><path d="M13 8a5 5 0 0 0-.1-1l1.3-1-1.2-2.1-1.5.6a5 5 0 0 0-1.7-1L9.5 2h-2.4l-.3 1.5a5 5 0 0 0-1.7 1l-1.5-.6L2.4 6l1.3 1a5 5 0 0 0 0 2l-1.3 1 1.2 2.1 1.5-.6a5 5 0 0 0 1.7 1l.3 1.5h2.4l.3-1.5a5 5 0 0 0 1.7-1l1.5.6 1.2-2.1-1.3-1a5 5 0 0 0 .1-1Z"/></svg>
+          </button>
+        </div>
+        <div class="sync-line">更新于 <b>21:22</b> · 60 秒自动刷新</div>
+      </div>
+    </section>
+
+    <nav class="tabs">
+      <button class="tab active">总览</button>
+      <button class="tab">额度与时效 <span class="pill">2</span></button>
+      <button class="tab">时延</button>
+      <button class="tab">会话明细</button>
+      <span class="spacer"></span>
+      <span class="scope">统计范围：全部项目 · 30 天</span>
+    </nav>
+
+    <div class="alert">
+      <span class="alert-icon">
+        <svg viewBox="0 0 16 16"><path d="M8 2.6 14 13H2L8 2.6Z"/><path d="M8 6v3.2"/><circle cx="8" cy="11.1" r=".55" fill="currentColor" stroke="none"/></svg>
+      </span>
+      <span><b>月度额度仅剩 2%</b><span class="alert-detail"> · OpenCode Go 本月已用 98%，预计 11月7日 13:39 重置。</span></span>
+      <span class="alert-link">查看额度 <span>→</span></span>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi">
+        <div class="kpi-label"><span class="dot"></span>总 Token <span class="info">i</span></div>
+        <div class="kpi-value">150.0M <span class="delta up">↑ 41.0%</span></div>
+        <div class="kpi-sub">输入 142.5M · 输出 7.5M</div>
+        <svg class="spark" viewBox="0 0 64 26">
+          <path class="area" fill="#6d4aff" d="M1 24 L1 21 L6 20 L11 22 L16 18 L21 19 L26 17 L31 12 L36 14 L41 10 L46 13 L51 5 L56 8 L63 2 L63 24 Z"/>
+          <path stroke="#6d4aff" d="M1 21 L6 20 L11 22 L16 18 L21 19 L26 17 L31 12 L36 14 L41 10 L46 13 L51 5 L56 8 L63 2"/>
+        </svg>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label"><span class="dot" style="background:var(--amber)"></span>估算费用</div>
+        <div class="kpi-value">$11.31 <span class="delta warn">↑ 194%</span></div>
+        <div class="kpi-sub">按量计费 · 不含订阅内调用</div>
+        <svg class="spark" viewBox="0 0 64 26">
+          <path class="area" fill="#b45309" d="M1 24 L1 22 L9 23 L17 20 L25 21 L33 16 L41 18 L49 9 L57 7 L63 4 L63 24 Z"/>
+          <path stroke="#b45309" d="M1 22 L9 23 L17 20 L25 21 L33 16 L41 18 L49 9 L57 7 L63 4"/>
+        </svg>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label"><span class="dot" style="background:var(--teal)"></span>请求数</div>
+        <div class="kpi-value">25.5K <span class="delta up">↑ 6.2%</span></div>
+        <div class="kpi-sub">日均 850 · 活跃 29 天</div>
+        <svg class="spark" viewBox="0 0 64 26">
+          <path class="area" fill="#0ea5a4" d="M1 24 L1 20 L6 21 L11 19 L16 22 L21 18 L26 20 L31 15 L36 17 L41 13 L46 12 L51 8 L56 10 L63 6 L63 24 Z"/>
+          <path stroke="#0ea5a4" d="M1 20 L6 21 L11 19 L16 22 L21 18 L26 20 L31 15 L36 17 L41 13 L46 12 L51 8 L56 10 L63 6"/>
+        </svg>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label"><span class="dot" style="background:var(--blue)"></span>缓存命中率</div>
+        <div class="kpi-value">97.0% <span class="delta up">↑ 1.4pt</span></div>
+        <div class="kpi-sub">缓存读取 4.61B tokens</div>
+        <svg class="spark" viewBox="0 0 64 26">
+          <path class="area" fill="#3b82f6" d="M1 24 L1 9 L6 7 L11 8 L16 6 L21 7 L26 5 L31 6 L36 4 L41 5 L46 4 L51 5 L56 3 L63 4 L63 24 Z"/>
+          <path stroke="#3b82f6" d="M1 9 L6 7 L11 8 L16 6 L21 7 L26 5 L31 6 L36 4 L41 5 L46 4 L51 5 L56 3 L63 4"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="body">
+      <div class="col left">
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">Token 趋势</div>
+              <div class="card-sub">有效 Token（输入 + 输出），不含缓存读取</div>
+            </div>
+            <div class="legend">
+              <span><i style="background:var(--accent)"></i>有效 Token</span>
+            </div>
+          </div>
+          <div class="trend-body">
+            <div class="chart-wrap">
+              <div class="chart" id="chart"></div>
+              <div class="chart-foot">
+                <span>缓存读取 <b>4.61B</b> · 命中率 <b>97.0%</b></span>
+                <span>峰值 <b>32.2M</b> · 11/05</span>
+              </div>
+            </div>
+            <div class="cost-side">
+              <div class="side-title">费用构成</div>
+              <div class="donut-row">
+                <div class="donut">
+                  <svg viewBox="0 0 92 92" id="donut"></svg>
+                  <div class="donut-center"><b>$11.31</b><span>30 天</span></div>
+                </div>
+                <div class="cost-legend">
+                  <div class="cost-item"><i style="background:#6d4aff"></i><span class="n">gpt-6-luna</span><b>$5.63</b></div>
+                  <div class="cost-item"><i style="background:#4f8cff"></i><span class="n">deepseek-v4.1</span><b>$4.07</b></div>
+                  <div class="cost-item"><i style="background:#14b8a6"></i><span class="n">claude-haiku-5.5</span><b>$1.50</b></div>
+                  <div class="cost-item"><i style="background:#cbd5e1"></i><span class="n">其他 8 个</span><b>$0.11</b></div>
+                </div>
+              </div>
+              <div class="cost-note"><b>49.8%</b> 的费用来自 gpt-6-luna，但它只占 <b>0.2%</b> 的有效 Token。</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head" style="margin-bottom:5px">
+            <div>
+              <div class="card-title">模型分布</div>
+              <div class="card-sub">按有效 Token 排序</div>
+            </div>
+            <span class="card-link">全部 11 个 <span>→</span></span>
+          </div>
+          <div class="model-head">
+            <span>模型</span><span>占比</span><span>Token</span><span>请求</span><span>费用</span>
+          </div>
+          <div class="model-list">
+            <div class="model-row">
+              <div class="model-name">
+                <span class="model-icon" style="background:#f0ecff;color:#6d4aff">D</span>
+                <span class="text"><span class="name">deepseek-v4.1-flash</span><span class="provider">OpenCode Go</span></span>
+              </div>
+              <span class="share"><span class="bar"><i style="width:100%"></i></span>28.3%</span>
+              <span>42.5M</span><span>10.6K</span><span>$4.07</span>
+            </div>
+            <div class="model-row">
+              <div class="model-name">
+                <span class="model-icon" style="background:#eaf2ff;color:#2563eb">D</span>
+                <span class="text"><span class="name">deepseek-v4.1-flash-max</span><span class="provider">Trae CN</span></span>
+              </div>
+              <span class="share"><span class="bar"><i style="width:83%;background:#4f8cff"></i></span>23.5%</span>
+              <span>35.2M</span><span>313</span><span class="cost-zero">$0</span>
+            </div>
+            <div class="model-row">
+              <div class="model-name">
+                <span class="model-icon" style="background:#e8fbfa;color:#0f8a89">S</span>
+                <span class="text"><span class="name">space-bunny-free</span><span class="provider">OpenCode</span></span>
+              </div>
+              <span class="share"><span class="bar"><i style="width:64%;background:#14b8a6"></i></span>18.1%</span>
+              <span>27.2M</span><span>5.7K</span><span class="cost-zero">$0</span>
+            </div>
+            <div class="model-row">
+              <div class="model-name">
+                <span class="model-icon" style="background:#fff5e8;color:#b45309">M</span>
+                <span class="text"><span class="name">minimax-m3.1-flash-free</span><span class="provider">OpenCode Go</span></span>
+              </div>
+              <span class="share"><span class="bar"><i style="width:58%;background:#f59e0b"></i></span>16.3%</span>
+              <span>24.5M</span><span>5.5K</span><span class="cost-zero">$0</span>
+            </div>
+          </div>
+          <div class="model-foot">
+            <span>其他 7 个模型 · <b>20.6M</b> tokens</span>
+            <span><b>$7.24</b> · 含 gpt-6-luna / claude-haiku</span>
+          </div>
+        </section>
+      </div>
+
+      <div class="col right">
+        <section class="card">
+          <div class="card-head" style="margin-bottom:2px">
+            <div>
+              <div class="card-title">OpenCode Go</div>
+              <div class="card-sub">订阅额度 · 实时</div>
+            </div>
+            <span class="live"><i></i>LIVE</span>
+          </div>
+          <div class="quota-top">
+            <div class="quota-donut">
+              <svg viewBox="0 0 96 96">
+                <circle cx="48" cy="48" r="39" fill="none" stroke="#f1f1f5" stroke-width="9"/>
+                <circle cx="48" cy="48" r="39" fill="none" stroke="#d92d20" stroke-width="9" stroke-linecap="round"
+                        stroke-dasharray="240.1 245" stroke-dashoffset="0"/>
+              </svg>
+              <div class="quota-center"><b>98%</b><span>本月已用</span></div>
+            </div>
+            <div class="quota-meters">
+              <div>
+                <div class="meter-top"><span>滚动 5 小时 <span class="reset">00:23 重置</span></span><b>1%</b></div>
+                <div class="meter"><i style="width:1%;background:#3b82f6"></i></div>
+              </div>
+              <div>
+                <div class="meter-top"><span>本周 <span class="reset">周一 08:00 重置</span></span><b>36%</b></div>
+                <div class="meter"><i style="width:36%;background:#6d4aff"></i></div>
+              </div>
+              <div>
+                <div class="meter-top"><span>本月 <span class="reset">16 小时后重置</span></span><b style="color:var(--red)">98%</b></div>
+                <div class="meter"><i style="width:98%;background:#d92d20"></i></div>
+              </div>
+            </div>
+          </div>
+          <div class="quota-note"><span class="warn-dot"></span>额度即将用完 · 重置前建议切换到按量模型</div>
+        </section>
+
+        <section class="card">
+          <div class="card-head" style="margin-bottom:1px">
+            <div>
+              <div class="card-title">订阅时效</div>
+              <div class="card-sub">OAuth 与 API Key 到期时间</div>
+            </div>
+            <span class="card-link">管理 <span>→</span></span>
+          </div>
+          <div class="exp-list">
+            <div class="exp-row">
+              <span class="exp-icon" style="background:#f0ecff;color:#6d4aff">Q</span>
+              <span class="exp-name"><b>Qoder CN</b><span>OAuth · 12月4日 20:37</span></span>
+              <span class="exp-tag ok">28 天</span>
+            </div>
+            <div class="exp-row">
+              <span class="exp-icon" style="background:#eaf2ff;color:#2563eb">T</span>
+              <span class="exp-name"><b>Trae CN</b><span>OAuth · 11月19日 15:37</span></span>
+              <span class="exp-tag warn">13 天</span>
+            </div>
+            <div class="exp-row">
+              <span class="exp-icon" style="background:#f1f5f9;color:#475569">D</span>
+              <span class="exp-name"><b>DeepSeek</b><span>API Key · 无到期时间</span></span>
+              <span class="exp-tag none">长期</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head" style="margin-bottom:4px">
+            <div>
+              <div class="card-title">时延与健康</div>
+              <div class="card-sub">最近 30 天 · 模型响应</div>
+            </div>
+            <span class="health-badge">需关注</span>
+          </div>
+          <div class="health-metrics">
+            <div class="hm"><b>10.8s</b><span>首字 P50</span></div>
+            <div class="hm warn"><b>52.7s</b><span>首字 P95</span></div>
+            <div class="hm"><b>9.5</b><span>输出 tok/s</span></div>
+          </div>
+          <div class="health-note">
+            <span class="spark-dot"></span>
+            <span><b>19.4%</b> 的请求超过 30 秒，最长 350 秒；建议检查 gpt-6-luna 的思考深度与超时设置。</span>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="foot">
+      <span>数据来自本机 OpenCode 数据库 · 最后同步 <b>2026-11-06 21:22:08</b> · 仅存本机</span>
+      <span class="foot-links"><span class="accent">导出 CSV</span><span>监控设置</span><span>快捷键 ⌥U</span></span>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const days = [
+  ["10-07", 456, 35733], ["10-08", 2774628, 240645], ["10-09", 4145118, 121525],
+  ["10-10", 1603521, 65393], ["10-11", 4949197, 435197], ["10-12", 8242515, 437657],
+  ["10-13", 4047272, 230313], ["10-14", 1181365, 168769], ["10-15", 5841798, 222818],
+  ["10-16", 2184014, 316314], ["10-17", 2512323, 83779], ["10-18", 164643, 11594],
+  ["10-19", 6220519, 501316], ["10-20", 7116289, 645182], ["10-21", 7323322, 598600],
+  ["10-22", 12565350, 714789], ["10-23", 1276753, 64148], ["10-25", 908184, 54136],
+  ["10-26", 777738, 30666], ["10-27", 933571, 114874], ["10-28", 130433, 9173],
+  ["10-29", 2551994, 166507], ["10-30", 3047366, 164872], ["11-01", 1564842, 129542],
+  ["11-02", 11259409, 442979], ["11-03", 3824087, 489287], ["11-04", 2942177, 276063],
+  ["11-05", 31859987, 361170], ["11-06", 10520290, 416763]
+];
+
+const host = document.querySelector("#chart");
+const NS = "http://www.w3.org/2000/svg";
+const W = 610, H = 220, L = 38, R = 4, T = 14, B = 26;
+const max = 35e6;
+const plotW = W - L - R, plotH = H - T - B;
+const step = plotW / days.length;
+const bw = Math.min(15, step * 0.56);
+let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+svg += `<defs><linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8b6cff"/><stop offset="1" stop-color="#6d4aff"/></linearGradient></defs>`;
+for (let i = 0; i <= 3; i++) {
+  const v = i * 10e6;
+  const y = T + plotH * (1 - v / max);
+  svg += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="#ececf2" stroke-width="1" stroke-dasharray="${i === 0 ? "0" : "3 3"}"/>`;
+  svg += `<text x="${L - 7}" y="${y + 3}" text-anchor="end" font-size="8.5" fill="#9a9aa4" font-family="-apple-system, sans-serif">${i === 0 ? "0" : i * 10 + "M"}</text>`;
+}
+const avgY = T + plotH * (1 - 5e6 / max);
+svg += `<line x1="${L}" y1="${avgY}" x2="${W - R}" y2="${avgY}" stroke="#b9a8ff" stroke-width="1" stroke-dasharray="4 4"/>`;
+svg += `<text x="${W - R - 2}" y="${avgY - 5}" text-anchor="end" font-size="8.2" fill="#7c68d8" font-family="-apple-system, sans-serif">日均 5.0M</text>`;
+
+days.forEach((d, i) => {
+  const total = d[1] + d[2];
+  const h = Math.max(total / max * plotH, total > 0 ? 1.2 : 0);
+  const x = L + step * i + (step - bw) / 2;
+  const y = T + plotH - h;
+  const isPeak = d[0] === "11-05";
+  const isLast = i === days.length - 1;
+  svg += `<rect x="${x}" y="${y}" width="${bw}" height="${h}" rx="2" fill="${isPeak ? "#5b3df5" : isLast ? "url(#barGrad)" : "#d9d1ff"}"/>`;
+  if (isPeak) {
+    svg += `<text x="${x + bw / 2}" y="${y - 5}" text-anchor="middle" font-size="8.5" font-weight="600" fill="#5b3df5" font-family="-apple-system, sans-serif">32.2M</text>`;
+  }
+});
+["10-07", "10-14", "10-21", "10-28", "11-04"].forEach((label, i) => {
+  const idx = days.findIndex(d => d[0] === label);
+  if (idx < 0) return;
+  const x = L + step * idx + step / 2;
+  svg += `<text x="${x}" y="${H - 5}" text-anchor="middle" font-size="8.3" fill="#9a9aa4" font-family="-apple-system, sans-serif">${label}</text>`;
+});
+svg += `</svg>`;
+host.innerHTML = svg;
+
+const donut = document.querySelector("#donut");
+const segs = [
+  ["#6d4aff", 49.8], ["#4f8cff", 36.0], ["#14b8a6", 13.3], ["#cbd5e1", 0.9]
+];
+const r = 34, C = 2 * Math.PI * r;
+let off = 0, out = `<circle cx="46" cy="46" r="${r}" fill="none" stroke="#f1f1f5" stroke-width="9"/>`;
+segs.forEach(([color, pct]) => {
+  const len = C * pct / 100;
+  out += `<circle cx="46" cy="46" r="${r}" fill="none" stroke="${color}" stroke-width="9" stroke-linecap="butt" stroke-dasharray="${Math.max(len - 1.5, 0)} ${C - Math.max(len - 1.5, 0)}" stroke-dashoffset="${-off}"/>`;
+  off += len;
+});
+donut.innerHTML = out;
+</script>
+</body>
+</html>

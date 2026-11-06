@@ -1,0 +1,63 @@
+name: Publish to npm
+
+# Trusted Publishing:
+#   https://www.npmjs.com/package/opencode-usage-center/access
+#   Repository: meiyx7/opencode-usage-center
+#   Workflow:   publish.yml
+#
+# OIDC cannot create a package's first version. The first 0.1.0 publish must
+# be done once with a logged-in npm CLI (or a one-time publish token); after
+# that, tag pushes use the trusted publisher and no token is stored here.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "Tag v$tag does not match package.json $version" >&2
+            exit 1
+          fi
+
+      - name: Use npm with Trusted Publishing support
+        run: npm install -g npm@latest
+
+      - name: Remove deprecated always-auth setting
+        run: npm config delete always-auth || true
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish
+        run: npm publish --access public --provenance

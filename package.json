@@ -1,0 +1,63 @@
+{
+  "name": "opencode-usage-center",
+  "version": "0.1.0",
+  "description": "Usage, quota and latency dashboard for OpenCode: token/cost trends, OpenCode Go quota, credential expiry and local-first monitoring.",
+  "type": "module",
+  "license": "MIT",
+  "author": "meiyx7",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meiyx7/opencode-usage-center.git"
+  },
+  "homepage": "https://github.com/meiyx7/opencode-usage-center#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "usage",
+    "quota",
+    "tokens",
+    "cost",
+    "monitor"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./gui-experimental": "./dist/gui-experimental.cjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.5"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "effect": "4.0.6",
+    "esbuild": "^0.28.2",
+    "solid-js": "^1.9.5",
+    "typescript": "^5.7.0",
+    "vite": "^7.1.0",
+    "vite-plugin-solid": "^2.11.0"
+  },
+  "scripts": {
+    "build": "vite build && esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode/plugin --external:@opencode/plugin/rpc --external:effect --external:bun:sqlite --outfile=dist/index.js",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit",
+    "test:data": "bun scripts/check-data.ts",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  }
+}

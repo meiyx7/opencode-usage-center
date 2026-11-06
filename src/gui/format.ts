@@ -1,0 +1,114 @@
+const MONEY = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+export function compact(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0"
+  if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`
+  return `${Math.round(value)}`
+}
+
+export function money(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00"
+  return `$${MONEY.format(value)}`
+}
+
+export function percent(value: number, digits = 0): string {
+  if (!Number.isFinite(value)) return "0%"
+  return `${value.toFixed(digits)}%`
+}
+
+export function duration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—"
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = Math.round(seconds % 60)
+  return `${minutes}m ${rest}s`
+}
+
+export function resetLabel(at: number): string {
+  if (!at) return "重置时间未知"
+  const delta = at - Date.now()
+  if (delta <= 0) return "即将重置"
+  if (delta < 3_600_000) return `${Math.max(1, Math.round(delta / 60_000))} 分钟后重置`
+  if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)} 小时后重置`
+  const date = new Date(at)
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes(),
+  ).padStart(2, "0")} 重置`
+}
+
+export function expiryLabel(expires: number | undefined): { text: string; tone: "ok" | "warn" | "danger" | "none" } {
+  if (!expires) return { text: "长期", tone: "none" }
+  const days = (expires - Date.now()) / 86_400_000
+  if (days < 0) return { text: "已过期", tone: "danger" }
+  if (days < 1) return { text: "今天", tone: "danger" }
+  if (days <= 3) return { text: `${Math.ceil(days)} 天`, tone: "danger" }
+  if (days <= 14) return { text: `${Math.ceil(days)} 天`, tone: "warn" }
+  return { text: `${Math.ceil(days)} 天`, tone: "ok" }
+}
+
+export function dateText(ms: number): string {
+  if (!ms) return "—"
+  const date = new Date(ms)
+  return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes(),
+  ).padStart(2, "0")}`
+}
+
+export function relativeTime(ms: number): string {
+  const delta = Date.now() - ms
+  if (!Number.isFinite(delta) || delta < 0) return "刚刚"
+  if (delta < 60_000) return "刚刚"
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
+  if (delta < 7 * 86_400_000) return `${Math.floor(delta / 86_400_000)} 天前`
+  return dateText(ms)
+}
+
+export function providerName(id: string): string {
+  const names: Record<string, string> = {
+    opencode: "OpenCode",
+    "opencode-go": "OpenCode Go",
+    "trae-cn": "Trae CN",
+    qoder: "Qoder CN",
+    deepseek: "DeepSeek",
+    openrouter: "OpenRouter",
+    "zai-coding-plan": "Z.ai",
+    gmicloud: "GMI",
+    agnes: "Agnes",
+    unknown: "未知",
+  }
+  return names[id] ?? id
+}
+
+export function modelInitial(id: string): string {
+  const base = id.split("/").pop() ?? id
+  return (base.replace(/^opencode[-_]?/i, "").slice(0, 1) || "?").toUpperCase()
+}
+
+export function shortModel(id: string): string {
+  return id.length > 32 ? `${id.slice(0, 31)}…` : id
+}
+
+export type RangeKind = "today" | "7d" | "30d" | "all"
+
+export const RANGES: { id: RangeKind; label: string }[] = [
+  { id: "today", label: "今日" },
+  { id: "7d", label: "7 天" },
+  { id: "30d", label: "30 天" },
+  { id: "all", label: "全部" },
+]
+
+export function rangeBounds(kind: RangeKind): { from: number; to: number } {
+  const now = Date.now()
+  if (kind === "today") {
+    const start = new Date()
+    start.setHours(0, 0, 0, 0)
+    return { from: start.getTime(), to: now }
+  }
+  if (kind === "7d") return { from: now - 7 * 86_400_000, to: now }
+  if (kind === "30d") return { from: now - 30 * 86_400_000, to: now }
+  return { from: 0, to: now }
+}
