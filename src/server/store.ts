@@ -267,17 +267,18 @@ function toolOutput(state: Record<string, unknown> | undefined): { text: string;
     }
     chunks.push(`[${text(part.type) || "内容"}]`)
   }
-  if (chunks.length === 0) {
+  let value = chunks.join("\n").trim()
+  if (!value) {
     const metadata = asRecord(state.metadata)
     for (const key of ["output", "preview", "diff", "filediff"]) {
-      const value = metadata?.[key]
-      if (typeof value === "string" && value.trim()) {
-        chunks.push(value)
+      const candidate = metadata?.[key]
+      if (typeof candidate === "string" && candidate.trim()) {
+        value = candidate
         break
       }
     }
   }
-  return clip(chunks.join("\n").trim(), PREVIEW.output)
+  return clip(value, PREVIEW.output)
 }
 
 function sumTokens(requests: readonly SessionRequest[]): MutableTokens {

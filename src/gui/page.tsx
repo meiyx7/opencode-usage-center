@@ -1444,6 +1444,9 @@ const CSS = `
 .uc-updating i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: uc-pulse 1s ease-in-out infinite; }
 @keyframes uc-shimmer { to { background-position: -200% 0; } }
 @keyframes uc-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .uc-sk-line, .uc-sk-chart, .uc-updating i, .uc-spinner { animation: none; }
+}
 
 /* states */
 .uc-empty-line { color: var(--uc-faint); font-size: 10px; padding: 12px 0; }

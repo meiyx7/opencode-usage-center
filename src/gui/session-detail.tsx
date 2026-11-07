@@ -65,26 +65,33 @@ function previewLine(value: string): string {
   return line.length > 150 ? `${line.slice(0, 149)}…` : line
 }
 
+const SEARCH_INDEX = new WeakMap<SessionTurn, string>()
+
+/** Build the lowercased search blob once per turn, not on every keystroke. */
+function turnSearchText(turn: SessionTurn): string {
+  const cached = SEARCH_INDEX.get(turn)
+  if (cached !== undefined) return cached
+  const parts: string[] = [turn.prompt, ...turn.files, ...turn.agents]
+  for (const request of turn.requests) {
+    parts.push(
+      request.modelID,
+      request.providerID,
+      request.agent,
+      request.text,
+      request.reasoning,
+      request.error,
+    )
+    for (const tool of request.tools) {
+      parts.push(tool.name, tool.summary, tool.input, tool.output, tool.error)
+    }
+  }
+  const value = parts.join("\n").toLowerCase()
+  SEARCH_INDEX.set(turn, value)
+  return value
+}
+
 function matchesTurn(turn: SessionTurn, query: string): boolean {
-  const includes = (value: string) => value.toLowerCase().includes(query)
-  if (includes(turn.prompt) || turn.files.some(includes) || turn.agents.some(includes)) return true
-  return turn.requests.some(
-    (request) =>
-      includes(request.modelID) ||
-      includes(request.providerID) ||
-      includes(request.agent) ||
-      includes(request.text) ||
-      includes(request.reasoning) ||
-      includes(request.error) ||
-      request.tools.some(
-        (tool) =>
-          includes(tool.name) ||
-          includes(tool.summary) ||
-          includes(tool.input) ||
-          includes(tool.output) ||
-          includes(tool.error),
-      ),
-  )
+  return turnSearchText(turn).includes(query)
 }
 
 function statusLabel(status: string): string {
