@@ -19,7 +19,7 @@ import type {
 type Row = Record<string, string | number | null>
 
 const DAY = 86_400_000
-const CACHE_MS = 15_000
+const CACHE_MS = 60_000
 const QUOTA_CACHE_MS = 60_000
 const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 
@@ -216,105 +216,114 @@ export class UsageStore {
       ? `SELECT count(*) AS n ${joined} WHERE m.type = 'user' AND m.time_created >= ? AND m.time_created < ? AND s.project_id = ?`
       : `SELECT count(*) AS n ${joined} WHERE m.type = 'user' AND m.time_created >= ? AND m.time_created < ?`
 
-    const totalsRow = db
-      .query<Row>(
-        `SELECT
-           count(*) AS requests,
-           count(DISTINCT m.session_id) AS sessions,
-           coalesce(sum(json_extract(m.data, '$.cost')), 0) AS cost,
-           coalesce(sum(json_extract(m.data, '$.tokens.input')), 0) AS input,
-           coalesce(sum(json_extract(m.data, '$.tokens.output')), 0) AS output,
-           coalesce(sum(json_extract(m.data, '$.tokens.reasoning')), 0) AS reasoning,
-           coalesce(sum(json_extract(m.data, '$.tokens.cache.read')), 0) AS cacheRead,
-           coalesce(sum(json_extract(m.data, '$.tokens.cache.write')), 0) AS cacheWrite
-         ${joined} WHERE ${where}`,
-      )
-      .get(...params)
-
     const promptRow = db
       .query<Row>(prompts)
       .get(...(project ? [input.from, input.to, project] : [input.from, input.to]))
 
     const totalParams = project ? [input.from, input.to, project] : [input.from, input.to]
-    const seriesRows = db
+    // One scan, one JSON extraction set. The previous version scanned the same
+    // messages four times (totals, series, models, latency), which dominated the
+    // cold-load cost on a multi-hundred-megabyte database.
+    const messageRows = db
       .query<Row>(
         `SELECT
-           date(m.time_created / 1000, 'unixepoch', 'localtime') AS date,
-           count(*) AS requests,
-           coalesce(sum(json_extract(m.data, '$.cost')), 0) AS cost,
-           coalesce(sum(json_extract(m.data, '$.tokens.input')), 0) AS input,
-           coalesce(sum(json_extract(m.data, '$.tokens.output')), 0) AS output,
-           coalesce(sum(json_extract(m.data, '$.tokens.cache.read')), 0) AS cacheRead
-         ${joined} WHERE ${where}
-         GROUP BY date ORDER BY date`,
-      )
-      .all(...totalParams)
-
-    const series: SeriesPoint[] = seriesRows.map((row) => ({
-      date: text(row.date),
-      requests: num(row.requests),
-      cost: num(row.cost),
-      input: num(row.input),
-      output: num(row.output),
-      cacheRead: num(row.cacheRead),
-    }))
-
-    const modelRows = db
-      .query<Row>(
-        `SELECT
+           m.session_id AS sessionID,
+           m.time_created AS timeCreated,
            coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
            coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
-           count(*) AS requests,
-           coalesce(sum(json_extract(m.data, '$.cost')), 0) AS cost,
-           coalesce(sum(json_extract(m.data, '$.tokens.input')), 0) AS input,
-           coalesce(sum(json_extract(m.data, '$.tokens.output')), 0) AS output,
-           coalesce(sum(json_extract(m.data, '$.tokens.cache.read')), 0) AS cacheRead,
-           coalesce(sum(json_extract(m.data, '$.tokens.cache.write')), 0) AS cacheWrite
-         ${joined} WHERE ${where}
-         GROUP BY providerID, modelID
-         ORDER BY (sum(json_extract(m.data, '$.tokens.input')) + sum(json_extract(m.data, '$.tokens.output'))) DESC`,
-      )
-      .all(...totalParams)
-
-    const models: ModelRow[] = modelRows.map((row) => ({
-      providerID: text(row.providerID) || "unknown",
-      modelID: text(row.modelID) || "unknown",
-      requests: num(row.requests),
-      cost: num(row.cost),
-      input: num(row.input),
-      output: num(row.output),
-      cacheRead: num(row.cacheRead),
-      cacheWrite: num(row.cacheWrite),
-    }))
-
-    const latencyRows = db
-      .query<Row>(
-        `SELECT
-           coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
-           coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
+           coalesce(json_extract(m.data, '$.cost'), 0) AS cost,
+           coalesce(json_extract(m.data, '$.tokens.input'), 0) AS input,
+           coalesce(json_extract(m.data, '$.tokens.output'), 0) AS output,
+           coalesce(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning,
+           coalesce(json_extract(m.data, '$.tokens.cache.read'), 0) AS cacheRead,
+           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0) AS cacheWrite,
            (json_extract(m.data, '$.time.streamed') - json_extract(m.data, '$.time.created')) / 1000.0 AS ttft,
-           (json_extract(m.data, '$.time.completed') - json_extract(m.data, '$.time.created')) / 1000.0 AS total,
-           coalesce(json_extract(m.data, '$.tokens.output'), 0) AS output
-         ${joined} WHERE ${where}
-           AND json_extract(m.data, '$.time.completed') IS NOT NULL`,
+           (json_extract(m.data, '$.time.completed') - json_extract(m.data, '$.time.created')) / 1000.0 AS elapsed
+         ${joined} WHERE ${where}`,
       )
       .all(...totalParams)
 
-    const latencySamples: LatencySample[] = latencyRows.map((row) => ({
-      ttft: num(row.ttft),
-      total: num(row.total),
-      output: num(row.output),
-    }))
-    const latency = latencyStats(latencySamples)
+    type SeriesAgg = {
+      date: string
+      requests: number
+      cost: number
+      input: number
+      output: number
+      cacheRead: number
+    }
+    type ModelAgg = {
+      providerID: string
+      modelID: string
+      requests: number
+      cost: number
+      input: number
+      output: number
+      cacheRead: number
+      cacheWrite: number
+    }
+
+    const sessionSet = new Set<string>()
+    const seriesMap = new Map<string, SeriesAgg>()
+    const modelMap = new Map<string, ModelAgg>()
+    const latencySamples: LatencySample[] = []
     const latencyGroups = new Map<string, { providerID: string; modelID: string; rows: LatencySample[] }>()
-    for (const [index, row] of latencyRows.entries()) {
+    const tokenTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
+    let totalCost = 0
+
+    for (const row of messageRows) {
       const providerID = text(row.providerID) || "unknown"
       const modelID = text(row.modelID) || "unknown"
-      const key = `${providerID}\u0000${modelID}`
-      const group = latencyGroups.get(key) ?? { providerID, modelID, rows: [] }
-      group.rows.push(latencySamples[index]!)
-      latencyGroups.set(key, group)
+      const cost = num(row.cost)
+      const input = num(row.input)
+      const output = num(row.output)
+      const reasoning = num(row.reasoning)
+      const cacheRead = num(row.cacheRead)
+      const cacheWrite = num(row.cacheWrite)
+
+      sessionSet.add(text(row.sessionID))
+      totalCost += cost
+      tokenTotals.input += input
+      tokenTotals.output += output
+      tokenTotals.reasoning += reasoning
+      tokenTotals.cacheRead += cacheRead
+      tokenTotals.cacheWrite += cacheWrite
+
+      const date = localDate(num(row.timeCreated))
+      const point = seriesMap.get(date) ?? { date, requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0 }
+      point.requests += 1
+      point.cost += cost
+      point.input += input
+      point.output += output
+      point.cacheRead += cacheRead
+      seriesMap.set(date, point)
+
+      const modelKey = `${providerID}\u0000${modelID}`
+      const model =
+        modelMap.get(modelKey) ??
+        { providerID, modelID, requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      model.requests += 1
+      model.cost += cost
+      model.input += input
+      model.output += output
+      model.cacheRead += cacheRead
+      model.cacheWrite += cacheWrite
+      modelMap.set(modelKey, model)
+
+      const elapsed = num(row.elapsed)
+      if (elapsed >= 0.05) {
+        const sample: LatencySample = { ttft: num(row.ttft), total: elapsed, output }
+        latencySamples.push(sample)
+        const group = latencyGroups.get(modelKey) ?? { providerID, modelID, rows: [] }
+        group.rows.push(sample)
+        latencyGroups.set(modelKey, group)
+      }
     }
+
+    const series: SeriesPoint[] = [...seriesMap.values()].sort((a, b) => a.date.localeCompare(b.date))
+    const models: ModelRow[] = [...modelMap.values()].sort(
+      (a, b) => b.input + b.output - (a.input + a.output),
+    )
+    const latency = latencyStats(latencySamples)
     const latencyModels: LatencyModelRow[] = [...latencyGroups.values()]
       .map((group) => {
         const { maxTotal: _maxTotal, ...stats } = latencyStats(group.rows)
@@ -362,19 +371,13 @@ export class UsageStore {
       range: { from: input.from, to: input.to },
       database: this.fileInfo(),
       totals: {
-        requests: num(totalsRow?.requests),
-        sessions: num(totalsRow?.sessions),
+        requests: messageRows.length,
+        sessions: sessionSet.size,
         prompts: num(promptRow?.n),
         activeDays: days.length,
         streak: activeStreak(days, localDate(Date.now())),
-        cost: num(totalsRow?.cost),
-        tokens: {
-          input: num(totalsRow?.input),
-          output: num(totalsRow?.output),
-          reasoning: num(totalsRow?.reasoning),
-          cacheRead: num(totalsRow?.cacheRead),
-          cacheWrite: num(totalsRow?.cacheWrite),
-        },
+        cost: totalCost,
+        tokens: tokenTotals,
       },
       series: filled,
       models,

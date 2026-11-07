@@ -29,6 +29,15 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "sessions", label: "会话明细" },
 ]
 
+type CachedView = { snapshot: Snapshot; quota?: Quota; at: number }
+const VIEW_CACHE = new Map<string, CachedView>()
+const VIEW_CACHE_LIMIT = 12
+
+/** Cache key uses the range preset and resolved project id, not `Date.now()`. */
+function viewKey(range: RangeKind, projectID?: string): string {
+  return `${range}|${projectID ?? "all"}`
+}
+
 const CHART_COLORS = ["#6d4aff", "#4f8cff", "#14b8a6", "#cbd5e1"]
 
 function readableError(error: unknown): string {
@@ -452,6 +461,49 @@ function HealthCard(props: { latency: Snapshot["latency"]; insight?: { model: st
 
 function EmptyState(props: { text: string }) {
   return <div class="uc-empty-state">{props.text}</div>
+}
+
+function SkeletonDashboard() {
+  return (
+    <>
+      <div class="uc-kpis">
+        <For each={[0, 1, 2, 3]}>
+          {() => (
+            <div class="uc-kpi uc-skeleton">
+              <span class="uc-sk-line" style={{ width: "38%" }} />
+              <span class="uc-sk-line uc-sk-value" style={{ width: "58%" }} />
+              <span class="uc-sk-line" style={{ width: "72%" }} />
+            </div>
+          )}
+        </For>
+      </div>
+      <div class="uc-body">
+        <div class="uc-left">
+          <div class="uc-card uc-skeleton-card uc-sk-trend">
+            <span class="uc-sk-line" style={{ width: "28%" }} />
+            <div class="uc-sk-chart" />
+          </div>
+          <div class="uc-card uc-skeleton-card uc-sk-models">
+            <span class="uc-sk-line" style={{ width: "24%" }} />
+            <For each={[0, 1, 2, 3]}>
+              {() => <span class="uc-sk-line uc-sk-row" />}
+            </For>
+          </div>
+        </div>
+        <div class="uc-right">
+          <For each={[0, 1, 2]}>
+            {(index) => (
+              <div classList={{ "uc-card uc-skeleton-card uc-sk-side": true, "uc-sk-short": index > 0 }}>
+                <span class="uc-sk-line" style={{ width: "38%" }} />
+                <span class="uc-sk-line" style={{ width: "72%" }} />
+                <span class="uc-sk-line" style={{ width: "54%" }} />
+              </div>
+            )}
+          </For>
+        </div>
+      </div>
+    </>
+  )
 }
 
 function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow[]; onRetry: () => void; id?: string; expiryID?: string }) {
@@ -1318,6 +1370,34 @@ const CSS = `
 .uc-lat-model b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
 .uc-lat-model small { display: block; color: var(--uc-faint); font-size: 8.5px; }
 
+/* loading + skeleton */
+.uc-first-load { display: flex; flex-direction: column; gap: 12px; }
+.uc-loading-note { display: flex; align-items: center; gap: 8px; color: var(--uc-faint); font-size: 10.5px; }
+.uc-skeleton { min-height: 94px; display: flex; flex-direction: column; gap: 10px; }
+.uc-skeleton-card { min-height: 190px; gap: 12px; }
+.uc-sk-line {
+  display: block;
+  height: 10px;
+  border-radius: 6px;
+  background: linear-gradient(90deg,
+    var(--uc-track) 0%,
+    color-mix(in srgb, var(--uc-faint) 16%, var(--uc-track)) 50%,
+    var(--uc-track) 100%);
+  background-size: 200% 100%;
+  animation: uc-shimmer 1.2s linear infinite;
+}
+.uc-sk-value { height: 21px; margin-top: 1px; }
+.uc-sk-chart { height: 178px; border-radius: 8px; background: var(--uc-track); opacity: 0.65; animation: uc-shimmer 1.2s linear infinite; background-size: 200% 100%; }
+.uc-sk-row { height: 32px; margin-top: 0; }
+.uc-sk-trend { min-height: 318px; }
+.uc-sk-models { min-height: 254px; }
+.uc-sk-side { min-height: 190px; display: flex; flex-direction: column; gap: 10px; }
+.uc-sk-short { min-height: 150px; }
+.uc-updating { display: inline-flex; align-items: center; gap: 4px; margin-right: 8px; color: var(--uc-accent); font-size: 9.5px; }
+.uc-updating i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: uc-pulse 1s ease-in-out infinite; }
+@keyframes uc-shimmer { to { background-position: -200% 0; } }
+@keyframes uc-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
 /* states */
 .uc-empty-line { color: var(--uc-faint); font-size: 10px; padding: 12px 0; }
 .uc-empty-state, .uc-empty-chart { display: grid; place-items: center; min-height: 120px; color: var(--uc-faint); font-size: 10.5px; }
@@ -1400,6 +1480,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const expiryID = `uc-expiry-${uid}`
   let request = 0
   let timer: number | undefined
+  let lastEventRefresh = 0
 
   const projects = createMemo(() => snapshot()?.projects ?? [])
   const currentProject = createMemo(() => projects().find((project) => project.id === currentID()))
@@ -1409,6 +1490,29 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       : scope() === "current"
         ? (currentID() ?? projects()[0]?.id)
         : scope()
+
+  const cacheKey = () => viewKey(range(), projectID())
+
+  function hydrate(nextRange: RangeKind, nextScope: string): boolean {
+    const nextID =
+      nextScope === "all" ? undefined : nextScope === "current" ? (currentID() ?? projects()[0]?.id) : nextScope
+    const cached = VIEW_CACHE.get(viewKey(nextRange, nextID))
+    if (!cached) return false
+    setSnapshot(cached.snapshot)
+    if (cached.quota) setQuota(cached.quota)
+    setLoading(false)
+    return true
+  }
+
+  function remember(next: Snapshot, nextQuota: Quota | undefined) {
+    const key = cacheKey()
+    VIEW_CACHE.delete(key)
+    VIEW_CACHE.set(key, { snapshot: next, quota: nextQuota, at: Date.now() })
+    if (VIEW_CACHE.size > VIEW_CACHE_LIMIT) {
+      const oldest = VIEW_CACHE.keys().next().value
+      if (oldest) VIEW_CACHE.delete(oldest)
+    }
+  }
 
   async function load(force = false, quiet = false) {
     const id = ++request
@@ -1428,6 +1532,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       if (id !== request) return
       setSnapshot(next)
       if (nextQuota) setQuota(nextQuota)
+      remember(next, nextQuota)
     } catch (cause) {
       if (id !== request) return
       setError(readableError(cause))
@@ -1441,10 +1546,18 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
 
   function schedule() {
     if (timer) window.clearTimeout(timer)
-    timer = window.setTimeout(() => void load(true, true), 1800)
+    timer = window.setTimeout(() => {
+      // Streaming can emit several usage events close together. Coalesce them
+      // and refresh at most once every 15 seconds; manual refresh stays forced.
+      const force = Date.now() - lastEventRefresh > 15_000
+      lastEventRefresh = Date.now()
+      void load(force, true)
+    }, 1800)
   }
 
   onMount(() => {
+    // Paint a cached view immediately, then revalidate in the background.
+    hydrate("30d", "all")
     void (async () => {
       try {
         const location = await props.ctx.client.location.get()
@@ -1452,7 +1565,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       } catch {
         // Keep "全部项目" usable even when the host has no active location.
       } finally {
-        await load(true)
+        await load(false)
       }
     })()
   })
@@ -1607,16 +1720,16 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           </Show>
           <p class="uc-sub">把每一次模型调用都算清楚：Token、费用、时延与订阅额度。</p>
           <div class="uc-hero-meta">
-            <span>
-              本范围 <b>{totals()?.sessions ?? 0}</b> 个会话
-            </span>
-            <span class="uc-sep" />
-            <span>
-              <b>{models().length}</b> 个模型
-            </span>
-            <span class="uc-sep" />
-            <span>数据仅存本机</span>
-            <Show when={snapshot()}>
+            <Show when={snapshot()} fallback={<span>正在读取本机用量…</span>}>
+              <span>
+                本范围 <b>{totals()?.sessions ?? 0}</b> 个会话
+              </span>
+              <span class="uc-sep" />
+              <span>
+                <b>{models().length}</b> 个模型
+              </span>
+              <span class="uc-sep" />
+              <span>数据仅存本机</span>
               <span class="uc-sep" />
               <span>{rangeLabel()} · {scopeLabel()}</span>
             </Show>
@@ -1633,7 +1746,11 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                     onClick={() => {
                       if (range() === item.id) return
                       setRange(item.id)
-                      void load(true)
+                      if (!hydrate(item.id, scope())) {
+                        setSnapshot(undefined)
+                        setLoading(true)
+                      }
+                      void load(false)
                     }}
                   >
                     {item.label}
@@ -1660,8 +1777,15 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                 aria-label="统计范围"
                 value={scope()}
                 onChange={(event) => {
-                  setScope(event.currentTarget.value)
-                  void load(true)
+                  {
+                    const value = event.currentTarget.value
+                    setScope(value)
+                    if (!hydrate(range(), value)) {
+                      setSnapshot(undefined)
+                      setLoading(true)
+                    }
+                    void load(false)
+                  }
                 }}
               >
                 <option value="all">全部项目</option>
@@ -1705,7 +1829,12 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           )}
         </For>
         <span class="uc-spacer" />
-        <span class="uc-tabs-scope">{rangeLabel()} · {scopeLabel()}</span>
+        <span class="uc-tabs-scope">
+          <Show when={refreshing() && snapshot()}>
+            <span class="uc-updating"><i />更新中</span>
+          </Show>
+          {rangeLabel()} · {scopeLabel()}
+        </span>
       </nav>
 
       <Show when={alert()}>
@@ -1738,9 +1867,12 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       <Show
         when={snapshot()}
         fallback={
-          <div class="uc-loading">
-            <span class="uc-spinner" />
-            <span>{loading() ? "正在读取本机用量…" : "没有可用数据"}</span>
+          <div class="uc-first-load">
+            <div class="uc-loading-note">
+              <span class="uc-spinner" />
+              <span>{loading() ? "首次读取本机用量，通常不到 1 秒…" : "没有可用数据"}</span>
+            </div>
+            <SkeletonDashboard />
           </div>
         }
       >
