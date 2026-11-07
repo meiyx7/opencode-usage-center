@@ -1,7 +1,7 @@
 {
   "name": "opencode-usage-center",
   "version": "0.1.0",
-  "description": "Usage, quota and latency dashboard for OpenCode: token/cost trends, OpenCode Go quota, credential expiry and local-first monitoring.",
+  "description": "Usage, quota, latency and session replay dashboard for OpenCode: token/cost trends, OpenCode Go quota, credential expiry and local-first monitoring.",
   "type": "module",
   "license": "MIT",
   "author": "meiyx7",

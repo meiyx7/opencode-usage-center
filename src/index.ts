@@ -27,6 +27,7 @@ export default Plugin.define({
     const registration = await ctx.rpc.register(Usage, {
       snapshot: async (input) => wire(store.snapshot(input)),
       quota: async (input) => wire(await store.quota(Boolean(input.force))),
+      sessionDetail: async (input) => wire(store.sessionDetail(input)),
     })
 
     return async () => {

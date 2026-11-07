@@ -85,6 +85,111 @@ export const SessionRow = Schema.Struct({
   timeUpdated: Schema.Number,
 })
 
+export const SessionToolCall = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  /** `completed`, `error` or `running`. */
+  status: Schema.String,
+  /** Tool execution time in seconds. */
+  duration: Schema.Number,
+  /** One-line input preview for the collapsed row. */
+  summary: Schema.String,
+  /** Truncated JSON input, enough to inspect the call without loading huge payloads. */
+  input: Schema.String,
+  /** Truncated tool output; may be empty for tools that only mutate state. */
+  output: Schema.String,
+  outputTruncated: Schema.Boolean,
+  error: Schema.String,
+  exitCode: Schema.optional(Schema.Number),
+})
+
+export const SessionRequest = Schema.Struct({
+  id: Schema.String,
+  seq: Schema.Number,
+  /** Request start, milliseconds since epoch. */
+  time: Schema.Number,
+  agent: Schema.String,
+  providerID: Schema.String,
+  modelID: Schema.String,
+  variant: Schema.String,
+  finish: Schema.String,
+  cost: Schema.Number,
+  tokens: TokenTotals,
+  /** Time to first streamed byte, in seconds. */
+  ttft: Schema.Number,
+  /** Request start to completion, in seconds. */
+  total: Schema.Number,
+  error: Schema.String,
+  text: Schema.String,
+  textTruncated: Schema.Boolean,
+  reasoning: Schema.String,
+  reasoningTruncated: Schema.Boolean,
+  tools: Schema.Array(SessionToolCall),
+})
+
+export const SessionTurn = Schema.Struct({
+  /** 1-based prompt order inside the session. */
+  index: Schema.Number,
+  seq: Schema.Number,
+  time: Schema.Number,
+  prompt: Schema.String,
+  promptTruncated: Schema.Boolean,
+  files: Schema.Array(Schema.String),
+  agents: Schema.Array(Schema.String),
+  requests: Schema.Array(SessionRequest),
+  cost: Schema.Number,
+  tokens: TokenTotals,
+  toolCount: Schema.Number,
+  errorCount: Schema.Number,
+  /** Prompt start to the last request completion, in seconds. */
+  duration: Schema.Number,
+  /** Average time to first token across this turn's requests. */
+  ttft: Schema.Number,
+  /** Cache reads divided by cache reads plus uncached input, 0..1. */
+  cacheHit: Schema.Number,
+})
+
+export const SessionDetail = Schema.Struct({
+  found: Schema.Boolean,
+  id: Schema.String,
+  title: Schema.String,
+  projectID: Schema.String,
+  projectName: Schema.String,
+  directory: Schema.String,
+  providerID: Schema.String,
+  modelID: Schema.String,
+  agent: Schema.String,
+  timeCreated: Schema.Number,
+  timeUpdated: Schema.Number,
+  cost: Schema.Number,
+  tokens: TokenTotals,
+  turns: Schema.Array(SessionTurn),
+  totalTurns: Schema.Number,
+  hasMore: Schema.Boolean,
+  /** Pass as `beforeTurn` to load the previous page; 0 when there is no more. */
+  nextBefore: Schema.Number,
+  promptCount: Schema.Number,
+  requestCount: Schema.Number,
+  toolCount: Schema.Number,
+  errorCount: Schema.Number,
+  ttftP50: Schema.Number,
+  ttftP95: Schema.Number,
+  totalP50: Schema.Number,
+  totalP95: Schema.Number,
+  slowRate: Schema.Number,
+  cacheHit: Schema.Number,
+  generatedAt: Schema.Number,
+})
+
+export const SessionDetailInput = Schema.Struct({
+  sessionID: Schema.String,
+  /** Load only turns before this 1-based index. Omit for the latest page. */
+  beforeTurn: Schema.optional(Schema.Number),
+  /** Page size in turns; defaults to 40. */
+  limit: Schema.optional(Schema.Number),
+  force: Schema.optional(Schema.Boolean),
+})
+
 export const CredentialRow = Schema.Struct({
   id: Schema.String,
   provider: Schema.String,
@@ -167,12 +272,15 @@ const portableInput = Schema.toStandardSchemaV1(SnapshotInput)
 const portableSnapshot = Schema.toStandardSchemaV1(Snapshot)
 const portableQuotaInput = Schema.toStandardSchemaV1(QuotaInput)
 const portableQuota = Schema.toStandardSchemaV1(Quota)
+const portableSessionDetailInput = Schema.toStandardSchemaV1(SessionDetailInput)
+const portableSessionDetail = Schema.toStandardSchemaV1(SessionDetail)
 
 export const Usage = Rpc.define({
   id: "usage-center",
   methods: {
     snapshot: { input: portableInput, output: portableSnapshot },
     quota: { input: portableQuotaInput, output: portableQuota },
+    sessionDetail: { input: portableSessionDetailInput, output: portableSessionDetail },
   },
   events: {},
 })
@@ -187,4 +295,9 @@ export type Latency = typeof Latency.Type
 export type LatencyModelRow = typeof LatencyModelRow.Type
 export type ProjectRow = typeof ProjectRow.Type
 export type SessionRow = typeof SessionRow.Type
+export type SessionToolCall = typeof SessionToolCall.Type
+export type SessionRequest = typeof SessionRequest.Type
+export type SessionTurn = typeof SessionTurn.Type
+export type SessionDetail = typeof SessionDetail.Type
+export type SessionDetailInput = typeof SessionDetailInput.Type
 export type CredentialRow = typeof CredentialRow.Type

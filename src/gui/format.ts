@@ -1,5 +1,16 @@
 const MONEY = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
+export function readableError(error: unknown): string {
+  const value = error instanceof Error ? error.message : String(error)
+  if (/SchemaError|Missing key at/i.test(value)) {
+    return "插件窗口与后台服务版本不一致。请完全退出 OpenCode 后重新打开，或重载插件。"
+  }
+  if (/unknown method|not implemented|no such method|method.*not.*found/i.test(value)) {
+    return "后台服务还没有加载「模型用量」的新版本。请重载插件后再试。"
+  }
+  return value
+}
+
 export function compact(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0"
   if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`

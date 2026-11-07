@@ -13,11 +13,13 @@ import {
   providerName,
   rangeBounds,
   RANGES,
+  readableError,
   relativeTime,
   resetLabel,
   shortModel,
   type RangeKind,
 } from "./format"
+import { SessionDetailView } from "./session-detail"
 
 type Alert = { title: string; detail: string; action: string; target: string }
 type Tab = "overview" | "quota" | "latency" | "sessions"
@@ -39,17 +41,6 @@ function viewKey(range: RangeKind, projectID?: string): string {
 }
 
 const CHART_COLORS = ["#6d4aff", "#4f8cff", "#14b8a6", "#cbd5e1"]
-
-function readableError(error: unknown): string {
-  const value = error instanceof Error ? error.message : String(error)
-  if (/SchemaError|Missing key at/i.test(value)) {
-    return "插件窗口与后台服务版本不一致。请完全退出 OpenCode 后重新打开，或重载插件。"
-  }
-  if (/unknown method|not implemented|no such method|method.*not.*found/i.test(value)) {
-    return "后台服务还没有加载「模型用量」的新版本。请重载插件后再试。"
-  }
-  return value
-}
 
 function niceMax(value: number): { top: number; step: number } {
   if (!Number.isFinite(value) || value <= 0) return { top: 1, step: 0.25 }
@@ -717,7 +708,14 @@ function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly Late
   )
 }
 
-function SessionsTab(props: { sessions: readonly SessionRow[]; projects: readonly ProjectRow[] }) {
+function SessionsTab(props: {
+  ctx: Context
+  sessions: readonly SessionRow[]
+  projects: readonly ProjectRow[]
+  selected?: SessionRow
+  onSelect: (session: SessionRow) => void
+  onClose: () => void
+}) {
   const [query, setQuery] = createSignal("")
   const projectName = (id: string) => props.projects.find((project) => project.id === id)?.name ?? "未命名项目"
   const filtered = createMemo(() => {
@@ -761,11 +759,14 @@ function SessionsTab(props: { sessions: readonly SessionRow[]; projects: readonl
   }
 
   return (
-    <section class="uc-card uc-sessions-page">
+    <Show
+      when={props.selected}
+      fallback={
+        <section class="uc-card uc-sessions-page">
       <div class="uc-card-head">
         <div>
           <div class="uc-card-title">会话明细</div>
-          <div class="uc-card-sub">按最后活动时间排序 · 最多 50 条 · 当前范围 {props.sessions.length} 条</div>
+          <div class="uc-card-sub">按最后活动时间排序 · 最多 50 条 · 点击会话查看每一轮请求、工具调用与缓存</div>
         </div>
         <button type="button" class="uc-export" onClick={exportCsv}>导出 CSV</button>
       </div>
@@ -793,7 +794,18 @@ function SessionsTab(props: { sessions: readonly SessionRow[]; projects: readonl
         <div class="uc-session-list">
           <For each={filtered()}>
             {(session) => (
-              <div class="uc-session-row">
+              <div
+                class="uc-session-row"
+                role="button"
+                tabIndex={0}
+                onClick={() => props.onSelect(session)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    props.onSelect(session)
+                  }
+                }}
+              >
                 <span class="uc-session-title" title={session.title}>{session.title}</span>
                 <span class="uc-session-project" title={projectName(session.projectID)}>{projectName(session.projectID)}</span>
                 <span class="uc-session-model" title={`${providerName(session.providerID)} / ${session.modelID}`}>
@@ -802,13 +814,29 @@ function SessionsTab(props: { sessions: readonly SessionRow[]; projects: readonl
                 </span>
                 <span>{compact(session.input + session.output)}</span>
                 <span>{session.cost > 0 ? money(session.cost) : <span class="uc-zero">$0</span>}</span>
-                <span class="uc-session-time">{relativeTime(session.timeUpdated)}</span>
+                <span class="uc-session-time">
+                  {relativeTime(session.timeUpdated)}
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                    <path d="M4.5 2.5 8 6l-3.5 3.5" />
+                  </svg>
+                </span>
               </div>
             )}
           </For>
         </div>
       </Show>
-    </section>
+        </section>
+      }
+    >
+      {(session) => (
+        <SessionDetailView
+          ctx={props.ctx}
+          session={session()}
+          projectName={projectName(session().projectID)}
+          onBack={props.onClose}
+        />
+      )}
+    </Show>
   )
 }
 
@@ -1300,19 +1328,23 @@ const CSS = `
 }
 .uc-session-head, .uc-session-row {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) 110px 150px 64px 54px 76px;
+  grid-template-columns: minmax(0, 2fr) 110px 150px 64px 54px 88px;
   align-items: center;
   gap: 8px;
 }
 .uc-session-head { color: var(--uc-faint); font-size: 9px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
 .uc-session-head > span:nth-child(n+4), .uc-session-row > span:nth-child(n+4) { text-align: right; }
-.uc-session-row { min-height: 34px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10.3px; font-variant-numeric: tabular-nums; }
+.uc-session-row { min-height: 34px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10.3px; font-variant-numeric: tabular-nums; cursor: default; }
 .uc-session-row:last-child { border-bottom: 0; }
+.uc-session-row:hover { background: color-mix(in srgb, var(--uc-accent) 4%, transparent); }
+.uc-session-row:focus-visible { outline: 2px solid color-mix(in srgb, var(--uc-accent) 45%, transparent); outline-offset: -2px; border-radius: 5px; }
 .uc-session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-strong); font-weight: 540; }
 .uc-session-project { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-faint); font-size: 9.5px; }
 .uc-session-model { display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--uc-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uc-session-model i { width: 18px; height: 18px; border-radius: 5px; display: grid; place-items: center; flex: 0 0 auto; background: color-mix(in srgb, var(--uc-accent) 9%, transparent); color: var(--uc-accent); font-size: 8px; font-weight: 750; font-style: normal; }
-.uc-session-time { color: var(--uc-faint); }
+.uc-session-time { color: var(--uc-faint); display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.uc-session-time svg { width: 10px; height: 10px; opacity: 0; transform: translateX(-2px); transition: opacity 0.12s ease, transform 0.12s ease; }
+.uc-session-row:hover .uc-session-time svg, .uc-session-row:focus-visible .uc-session-time svg { opacity: 1; transform: none; }
 
 /* detail tabs */
 .uc-detail-grid {
@@ -1475,6 +1507,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const [refreshing, setRefreshing] = createSignal(false)
   const [error, setError] = createSignal("")
   const [tab, setTab] = createSignal<Tab>("overview")
+  const [detailSession, setDetailSession] = createSignal<SessionRow>()
   const uid = Math.random().toString(36).slice(2, 8)
   const quotaID = `uc-quota-${uid}`
   const expiryID = `uc-expiry-${uid}`
@@ -1745,6 +1778,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                     classList={{ "uc-seg-on": range() === item.id }}
                     onClick={() => {
                       if (range() === item.id) return
+                      setDetailSession(undefined)
                       setRange(item.id)
                       if (!hydrate(item.id, scope())) {
                         setSnapshot(undefined)
@@ -1779,6 +1813,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                 onChange={(event) => {
                   {
                     const value = event.currentTarget.value
+                    setDetailSession(undefined)
                     setScope(value)
                     if (!hydrate(range(), value)) {
                       setSnapshot(undefined)
@@ -2056,7 +2091,14 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
         </Show>
 
         <Show when={tab() === "sessions"}>
-          <SessionsTab sessions={sessions()} projects={projects()} />
+          <SessionsTab
+            ctx={props.ctx}
+            sessions={sessions()}
+            projects={projects()}
+            selected={detailSession()}
+            onSelect={setDetailSession}
+            onClose={() => setDetailSession(undefined)}
+          />
         </Show>
       </Show>
 

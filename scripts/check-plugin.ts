@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import plugin from "../dist/index.js"
-import { Quota, Snapshot } from "../src/contract.ts"
+import { Quota, SessionDetail, Snapshot } from "../src/contract.ts"
 
 const handlers: Record<string, (input: any) => Promise<any>> = {}
 const ctx = {
@@ -17,6 +17,10 @@ await (plugin as any).setup(ctx)
 const now = Date.now()
 const snapshot = await handlers.snapshot!({ from: now - 30 * 86_400_000, to: now, force: true })
 const quota = await handlers.quota!({ force: true })
+const session = await handlers.sessionDetail!({
+  sessionID: snapshot.sessions[0]?.id ?? "ses_missing",
+  force: true,
+})
 
 function invalid(value: unknown, path: string, out: string[]): void {
   if (value === undefined) {
@@ -43,6 +47,7 @@ function invalid(value: unknown, path: string, out: string[]): void {
 const bad: string[] = []
 invalid(snapshot, "snapshot", bad)
 invalid(quota, "quota", bad)
+invalid(session, "session", bad)
 if (bad.length) {
   console.error("JSON problems:", bad)
   process.exit(1)
@@ -52,6 +57,7 @@ if (bad.length) {
 // an explicit undefined in an optional field made the whole response invalid.
 Schema.encodeSync(Snapshot)(snapshot)
 Schema.encodeSync(Quota)(quota)
+Schema.encodeSync(SessionDetail)(session)
 
 console.log(
   "snapshot",
@@ -64,4 +70,13 @@ console.log(
   snapshot.credentials.length,
 )
 console.log("quota", quota.available, quota.monthly?.percent, quota.error)
+console.log(
+  "session",
+  session.found,
+  session.title.slice(0, 20),
+  session.turns.length,
+  session.requestCount,
+  session.toolCount,
+  session.cacheHit.toFixed(3),
+)
 console.log("wire ok")
