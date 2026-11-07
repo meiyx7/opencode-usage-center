@@ -17,10 +17,12 @@ await (plugin as any).setup(ctx)
 const now = Date.now()
 const snapshot = await handlers.snapshot!({ from: now - 30 * 86_400_000, to: now, force: true })
 const quota = await handlers.quota!({ force: true })
-const session = await handlers.sessionDetail!({
-  sessionID: snapshot.sessions[0]?.id ?? "ses_missing",
-  force: true,
-})
+const sessionID = snapshot.sessions[0]?.id ?? "ses_missing"
+const session = await handlers.sessionDetail!({ sessionID, force: true })
+const sessionPage = await handlers.sessionDetail!({ sessionID, limit: 5 })
+const olderPage = sessionPage.hasMore
+  ? await handlers.sessionDetail!({ sessionID, limit: 5, beforeTurn: sessionPage.nextBefore })
+  : undefined
 
 function invalid(value: unknown, path: string, out: string[]): void {
   if (value === undefined) {
@@ -48,6 +50,8 @@ const bad: string[] = []
 invalid(snapshot, "snapshot", bad)
 invalid(quota, "quota", bad)
 invalid(session, "session", bad)
+invalid(sessionPage, "sessionPage", bad)
+if (olderPage) invalid(olderPage, "olderPage", bad)
 if (bad.length) {
   console.error("JSON problems:", bad)
   process.exit(1)
@@ -58,6 +62,8 @@ if (bad.length) {
 Schema.encodeSync(Snapshot)(snapshot)
 Schema.encodeSync(Quota)(quota)
 Schema.encodeSync(SessionDetail)(session)
+Schema.encodeSync(SessionDetail)(sessionPage)
+if (olderPage) Schema.encodeSync(SessionDetail)(olderPage)
 
 console.log(
   "snapshot",
@@ -78,5 +84,12 @@ console.log(
   session.requestCount,
   session.toolCount,
   session.cacheHit.toFixed(3),
+)
+console.log(
+  "session page",
+  sessionPage.turns.length,
+  sessionPage.hasMore,
+  sessionPage.nextBefore,
+  olderPage ? `${olderPage.turns.length} older` : "no older page",
 )
 console.log("wire ok")

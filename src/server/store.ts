@@ -15,7 +15,6 @@ import type {
   SessionRequest,
   SessionRow,
   SessionToolCall,
-  SessionTurn,
   Snapshot,
   SnapshotInput,
   TokenTotals,
@@ -25,9 +24,10 @@ type Row = Record<string, string | number | null>
 
 const DAY = 86_400_000
 const CACHE_MS = 60_000
+const SNAPSHOT_CACHE_LIMIT = 8
 const QUOTA_CACHE_MS = 60_000
 const DETAIL_CACHE_MS = 60_000
-const DETAIL_CACHE_LIMIT = 6
+const DETAIL_CACHE_LIMIT = 4
 const DETAIL_PAGE = 60
 const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 
@@ -230,6 +230,7 @@ function toolSummary(input: unknown): string {
   if (!record) return clip(stringify(input), PREVIEW.summary).text
   for (const key of [
     "command",
+    "code",
     "filePath",
     "filepath",
     "path",
@@ -327,7 +328,7 @@ function blankTurn(
 export class UsageStore {
   private db?: Database
   private dbError = ""
-  private cache?: { key: string; at: number; value: Snapshot }
+  private cache = new Map<string, { at: number; value: Snapshot }>()
   private quotaCache?: { at: number; value: Quota }
   private sessionCache = new Map<string, { at: number; value: SessionDetail }>()
 
@@ -339,6 +340,18 @@ export class UsageStore {
   close(): void {
     this.db?.close()
     this.db = undefined
+    this.cache.clear()
+    this.quotaCache = undefined
+    this.sessionCache.clear()
+  }
+
+  private rememberSnapshot(key: string, value: Snapshot): void {
+    this.cache.delete(key)
+    this.cache.set(key, { at: Date.now(), value })
+    while (this.cache.size > SNAPSHOT_CACHE_LIMIT) {
+      const oldest = this.cache.keys().next().value
+      if (oldest) this.cache.delete(oldest)
+    }
   }
 
   private database(): Database | undefined {
@@ -370,14 +383,15 @@ export class UsageStore {
 
   snapshot(input: SnapshotInput): Snapshot {
     const key = `${Math.floor(input.from / 60_000)}|${Math.floor(input.to / 60_000)}|${input.projectID ?? ""}`
-    if (!input.force && this.cache && this.cache.key === key && Date.now() - this.cache.at < CACHE_MS) {
-      return this.cache.value
+    const cached = this.cache.get(key)
+    if (!input.force && cached && Date.now() - cached.at < CACHE_MS) {
+      return cached.value
     }
 
     const db = this.database()
     if (!db) {
       const value = this.emptySnapshot(input)
-      this.cache = { key, at: Date.now(), value }
+      this.rememberSnapshot(key, value)
       return value
     }
 
@@ -440,7 +454,18 @@ export class UsageStore {
       cacheWrite: number
     }
 
+    type SessionAgg = {
+      requests: number
+      cost: number
+      input: number
+      output: number
+      cacheRead: number
+      providerID: string
+      modelID: string
+    }
+
     const sessionSet = new Set<string>()
+    const sessionUsage = new Map<string, SessionAgg>()
     const seriesMap = new Map<string, SeriesAgg>()
     const modelMap = new Map<string, ModelAgg>()
     const latencySamples: LatencySample[] = []
@@ -458,7 +483,27 @@ export class UsageStore {
       const cacheRead = num(row.cacheRead)
       const cacheWrite = num(row.cacheWrite)
 
-      sessionSet.add(text(row.sessionID))
+      const sessionID = text(row.sessionID)
+      sessionSet.add(sessionID)
+      const usage = sessionUsage.get(sessionID) ?? {
+        requests: 0,
+        cost: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        providerID: "unknown",
+        modelID: "unknown",
+      }
+      usage.requests += 1
+      usage.cost += cost
+      usage.input += input
+      usage.output += output
+      usage.cacheRead += cacheRead
+      if (modelID !== "unknown") {
+        usage.providerID = providerID
+        usage.modelID = modelID
+      }
+      sessionUsage.set(sessionID, usage)
       totalCost += cost
       tokenTotals.input += input
       tokenTotals.output += output
@@ -519,22 +564,25 @@ export class UsageStore {
                 time_created, time_updated
          FROM session_v2
          WHERE time_updated >= ? AND time_updated <= ?${project ? " AND project_id = ?" : ""}
-         ORDER BY time_updated DESC LIMIT 50`,
+         ORDER BY time_updated DESC LIMIT 500`,
       )
       .all(...(project ? [input.from, input.to, project] : [input.from, input.to]))
 
     const sessions: SessionRow[] = sessionRows.map((row) => {
       const model = row.model ? parseJSON(String(row.model)) : undefined
+      // session_v2 stores lifetime totals. The list is filtered to the selected
+      // time range, so use the aggregate of messages that actually fall inside it.
+      const usage = sessionUsage.get(text(row.id))
       return {
         id: text(row.id),
         title: text(row.title) || "未命名会话",
         projectID: text(row.project_id),
-        modelID: text(model?.id) || "unknown",
-        providerID: text(model?.providerID) || "unknown",
-        cost: num(row.cost),
-        input: num(row.tokens_input),
-        output: num(row.tokens_output),
-        cacheRead: num(row.tokens_cache_read),
+        modelID: text(model?.id) || usage?.modelID || "unknown",
+        providerID: text(model?.providerID) || usage?.providerID || "unknown",
+        cost: usage?.cost ?? 0,
+        input: usage?.input ?? 0,
+        output: usage?.output ?? 0,
+        cacheRead: usage?.cacheRead ?? 0,
         timeCreated: num(row.time_created),
         timeUpdated: num(row.time_updated),
       }
@@ -565,7 +613,7 @@ export class UsageStore {
       sessions,
       credentials,
     }
-    this.cache = { key, at: Date.now(), value }
+    this.rememberSnapshot(key, value)
     return value
   }
 
@@ -634,8 +682,10 @@ export class UsageStore {
   }
 
   private sliceSessionDetail(full: SessionDetail, input: SessionDetailInput): SessionDetail {
-    const limit = Math.min(200, Math.max(1, Math.round(input.limit ?? DETAIL_PAGE)))
-    const before = input.beforeTurn && input.beforeTurn > 0 ? input.beforeTurn : full.turns.length + 1
+    const wanted = input.limit
+    const limit = Math.min(200, Math.max(1, Math.round(Number.isFinite(wanted) ? wanted! : DETAIL_PAGE)))
+    const before =
+      Number.isFinite(input.beforeTurn) && input.beforeTurn! > 0 ? input.beforeTurn! : full.turns.length + 1
     const eligible = full.turns.filter((turn) => turn.index < before)
     const start = Math.max(0, eligible.length - limit)
     const turns = eligible.slice(start)
@@ -822,8 +872,8 @@ export class UsageStore {
         summary: toolSummary(state?.input),
         input: clip(stringify(state?.input), PREVIEW.input).text,
         output: output.text,
-        outputTruncated: output.truncated,
-        error: errorText(state?.error),
+        outputTruncated: output.truncated || metadata?.truncated === true,
+        error: clip(errorText(state?.error), 800).text,
         ...(typeof exit === "number" && Number.isFinite(exit) ? { exitCode: exit } : {}),
       })
     }
@@ -851,7 +901,7 @@ export class UsageStore {
       tokens: tokenValue,
       ttft: Math.max(0, (streamed - created) / 1000),
       total: Math.max(0, (completed - created) / 1000),
-      error: errorText(data?.error),
+      error: clip(errorText(data?.error), 800).text,
       text: textValue.text,
       textTruncated: textValue.truncated,
       reasoning: reasoningValue.text,

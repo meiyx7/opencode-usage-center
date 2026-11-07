@@ -185,7 +185,7 @@ export const SessionDetailInput = Schema.Struct({
   sessionID: Schema.String,
   /** Load only turns before this 1-based index. Omit for the latest page. */
   beforeTurn: Schema.optional(Schema.Number),
-  /** Page size in turns; defaults to 40. */
+  /** Page size in turns; defaults to 60. */
   limit: Schema.optional(Schema.Number),
   force: Schema.optional(Schema.Boolean),
 })

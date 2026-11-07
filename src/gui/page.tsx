@@ -4,6 +4,7 @@ import { Usage } from "../contract"
 import type { CredentialRow, LatencyModelRow, ModelRow, ProjectRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
 import {
   compact,
+  csvCell,
   dateText,
   duration,
   expiryLabel,
@@ -277,7 +278,9 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
         </div>
         <Show
           when={props.quota?.available}
-          fallback={<span class="uc-badge uc-badge-muted">未连接</span>}
+          fallback={
+            <span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>
+          }
         >
           <span class="uc-live"><i />LIVE</span>
         </Show>
@@ -450,10 +453,6 @@ function HealthCard(props: { latency: Snapshot["latency"]; insight?: { model: st
   )
 }
 
-function EmptyState(props: { text: string }) {
-  return <div class="uc-empty-state">{props.text}</div>
-}
-
 function SkeletonDashboard() {
   return (
     <>
@@ -513,7 +512,9 @@ function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow
           </div>
           <Show
             when={props.quota?.available}
-            fallback={<span class="uc-badge uc-badge-muted">未连接</span>}
+            fallback={
+              <span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>
+            }
           >
             <span class="uc-live"><i />LIVE</span>
           </Show>
@@ -717,6 +718,7 @@ function SessionsTab(props: {
   onClose: () => void
 }) {
   const [query, setQuery] = createSignal("")
+  let listScroll = 0
   const projectName = (id: string) => props.projects.find((project) => project.id === id)?.name ?? "未命名项目"
   const filtered = createMemo(() => {
     const value = query().trim().toLowerCase()
@@ -729,10 +731,15 @@ function SessionsTab(props: {
     )
   })
 
+  function openSession(session: SessionRow, event: MouseEvent | KeyboardEvent) {
+    const list = (event.currentTarget as HTMLElement | null)?.closest(".uc-session-list")
+    listScroll = list instanceof HTMLElement ? list.scrollTop : 0
+    props.onSelect(session)
+  }
+
   function exportCsv() {
     const rows = filtered()
     if (rows.length === 0) return
-    const quote = (value: unknown) => `"${String(value).replace(/"/g, '""')}"`
     const csv = [
       ["会话", "项目", "供应商", "模型", "输入", "输出", "缓存读取", "费用", "最后活动"],
       ...rows.map((session) => [
@@ -747,7 +754,7 @@ function SessionsTab(props: {
         new Date(session.timeUpdated).toISOString(),
       ]),
     ]
-      .map((row) => row.map(quote).join(","))
+      .map((row) => row.map(csvCell).join(","))
       .join("\n")
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })
     const url = URL.createObjectURL(blob)
@@ -766,9 +773,9 @@ function SessionsTab(props: {
       <div class="uc-card-head">
         <div>
           <div class="uc-card-title">会话明细</div>
-          <div class="uc-card-sub">按最后活动时间排序 · 最多 50 条 · 点击会话查看每一轮请求、工具调用与缓存</div>
+          <div class="uc-card-sub">按最后活动时间排序 · 最多 500 条 · 点击会话查看每一轮请求、工具调用与缓存</div>
         </div>
-        <button type="button" class="uc-export" onClick={exportCsv}>导出 CSV</button>
+        <button type="button" class="uc-export" title="导出当前筛选结果" onClick={exportCsv}>导出 CSV</button>
       </div>
       <div class="uc-sessions-tools">
         <label class="uc-search">
@@ -791,18 +798,25 @@ function SessionsTab(props: {
         <div class="uc-session-head">
           <span>会话</span><span>项目</span><span>模型</span><span>Token</span><span>费用</span><span>最近活动</span>
         </div>
-        <div class="uc-session-list">
+        <div
+          class="uc-session-list"
+          ref={(element) => {
+            queueMicrotask(() => {
+              element.scrollTop = listScroll
+            })
+          }}
+        >
           <For each={filtered()}>
             {(session) => (
               <div
                 class="uc-session-row"
                 role="button"
                 tabIndex={0}
-                onClick={() => props.onSelect(session)}
+                onClick={(event) => openSession(session, event)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault()
-                    props.onSelect(session)
+                    openSession(session, event)
                   }
                 }}
               >
@@ -1333,6 +1347,7 @@ const CSS = `
   gap: 8px;
 }
 .uc-session-head { color: var(--uc-faint); font-size: 9px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
+.uc-session-list { max-height: 540px; overflow: auto; overscroll-behavior: contain; }
 .uc-session-head > span:nth-child(n+4), .uc-session-row > span:nth-child(n+4) { text-align: right; }
 .uc-session-row { min-height: 34px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10.3px; font-variant-numeric: tabular-nums; cursor: default; }
 .uc-session-row:last-child { border-bottom: 0; }
@@ -1432,7 +1447,7 @@ const CSS = `
 
 /* states */
 .uc-empty-line { color: var(--uc-faint); font-size: 10px; padding: 12px 0; }
-.uc-empty-state, .uc-empty-chart { display: grid; place-items: center; min-height: 120px; color: var(--uc-faint); font-size: 10.5px; }
+.uc-empty-chart { display: grid; place-items: center; min-height: 120px; color: var(--uc-faint); font-size: 10.5px; }
 .uc-loading { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 300px; color: var(--uc-faint); font-size: 11px; }
 .uc-spinner { width: 16px; height: 16px; border: 2px solid var(--uc-track); border-top-color: var(--uc-accent); border-radius: 50%; animation: uc-spin 0.8s linear infinite; }
 @keyframes uc-spin { to { transform: rotate(360deg); } }
@@ -1512,6 +1527,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const quotaID = `uc-quota-${uid}`
   const expiryID = `uc-expiry-${uid}`
   let request = 0
+  let quotaRequest = 0
   let timer: number | undefined
   let lastEventRefresh = 0
 
@@ -1547,25 +1563,45 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     }
   }
 
-  async function load(force = false, quiet = false) {
+  /**
+   * Quota goes through a remote endpoint with an 8s timeout. It must never
+   * block the local database snapshot from painting; the two run independently.
+   */
+  async function loadQuota(force = false) {
+    const id = ++quotaRequest
+    try {
+      const next = await api.quota({ force })
+      if (id !== quotaRequest) return
+      setQuota(next)
+      const current = snapshot()
+      if (current && VIEW_CACHE.get(cacheKey())?.snapshot === current) remember(current, next)
+    } catch {
+      if (id !== quotaRequest) return
+      const next: Quota = {
+        available: false,
+        source: "none",
+        error: "额度接口暂不可用",
+      }
+      setQuota(next)
+      const current = snapshot()
+      if (current && VIEW_CACHE.get(cacheKey())?.snapshot === current) remember(current, next)
+    }
+  }
+
+  async function load(force = false, quiet = false, refreshQuota = force) {
     const id = ++request
     if (!quiet) setRefreshing(true)
     if (!snapshot()) setLoading(true)
     setError("")
     const bounds = rangeBounds(range())
+    // Usage events refresh the DB frequently; do not bypass the quota cache
+    // for each one or the remote endpoint becomes the bottleneck.
+    void loadQuota(refreshQuota)
     try {
-      const [next, nextQuota] = await Promise.all([
-        api.snapshot({ ...bounds, projectID: projectID(), force }),
-        api.quota({ force }).catch(() => ({
-          available: false,
-          source: "none",
-          error: "额度接口暂不可用",
-        })),
-      ])
+      const next = await api.snapshot({ ...bounds, projectID: projectID(), force })
       if (id !== request) return
       setSnapshot(next)
-      if (nextQuota) setQuota(nextQuota)
-      remember(next, nextQuota)
+      remember(next, quota())
     } catch (cause) {
       if (id !== request) return
       setError(readableError(cause))
@@ -1584,21 +1620,25 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       // and refresh at most once every 15 seconds; manual refresh stays forced.
       const force = Date.now() - lastEventRefresh > 15_000
       lastEventRefresh = Date.now()
-      void load(force, true)
+      void load(force, true, false)
     }, 1800)
   }
 
   onMount(() => {
     // Paint a cached view immediately, then revalidate in the background.
     hydrate("30d", "all")
+    // The default scope is "all projects", so loading the snapshot does not
+    // need to wait for the host location RPC.
+    void load(false)
     void (async () => {
       try {
         const location = await props.ctx.client.location.get()
         setCurrentID(location.project.id)
+        // If the user picked "current project" before the host responded,
+        // refresh once with the now-known project id.
+        if (scope() === "current") void load(false)
       } catch {
         // Keep "全部项目" usable even when the host has no active location.
-      } finally {
-        await load(false)
       }
     })()
   })
@@ -1902,13 +1942,17 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       <Show
         when={snapshot()}
         fallback={
-          <div class="uc-first-load">
-            <div class="uc-loading-note">
-              <span class="uc-spinner" />
-              <span>{loading() ? "首次读取本机用量，通常不到 1 秒…" : "没有可用数据"}</span>
+          error() ? (
+            <div class="uc-empty-line">暂时无法读取本机用量。请重试，或检查 OpenCode 数据库是否存在。</div>
+          ) : (
+            <div class="uc-first-load">
+              <div class="uc-loading-note">
+                <span class="uc-spinner" />
+                <span>{loading() ? "首次读取本机用量，通常不到 1 秒…" : "没有可用数据"}</span>
+              </div>
+              <SkeletonDashboard />
             </div>
-            <SkeletonDashboard />
-          </div>
+          )
         }
       >
         <Show when={tab() === "overview"}>
@@ -2072,7 +2116,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           </div>
 
           <div class="uc-right">
-            <QuotaCard quota={quota()} onRetry={() => void load(true)} id={quotaID} />
+            <QuotaCard quota={quota()} onRetry={() => void loadQuota(true)} id={quotaID} />
             <section id={expiryID}>
               <ExpiryCard credentials={credentials()} />
             </section>
@@ -2083,7 +2127,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
         </Show>
 
         <Show when={tab() === "quota"}>
-          <QuotaDetail quota={quota()} credentials={credentials()} onRetry={() => void load(true)} id={quotaID} expiryID={expiryID} />
+          <QuotaDetail quota={quota()} credentials={credentials()} onRetry={() => void loadQuota(true)} id={quotaID} expiryID={expiryID} />
         </Show>
 
         <Show when={tab() === "latency"}>

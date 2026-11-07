@@ -1,9 +1,10 @@
-import { createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import { Usage } from "../contract"
 import type { SessionDetail, SessionRequest, SessionRow, SessionToolCall, SessionTurn } from "../contract"
 import {
   compact,
+  csvCell,
   dateText,
   duration,
   modelInitial,
@@ -14,12 +15,15 @@ import {
   shortModel,
 } from "./format"
 
-const DETAIL_CACHE = new Map<string, SessionDetail>()
-const DETAIL_CACHE_LIMIT = 8
+type CachedDetail = { value: SessionDetail; at: number }
+
+const DETAIL_CACHE = new Map<string, CachedDetail>()
+const DETAIL_CACHE_LIMIT = 4
+const DETAIL_FRESH_MS = 120_000
 
 function remember(detail: SessionDetail) {
   DETAIL_CACHE.delete(detail.id)
-  DETAIL_CACHE.set(detail.id, detail)
+  DETAIL_CACHE.set(detail.id, { value: detail, at: Date.now() })
   while (DETAIL_CACHE.size > DETAIL_CACHE_LIMIT) {
     const oldest = DETAIL_CACHE.keys().next().value
     if (oldest) DETAIL_CACHE.delete(oldest)
@@ -61,6 +65,28 @@ function previewLine(value: string): string {
   return line.length > 150 ? `${line.slice(0, 149)}…` : line
 }
 
+function matchesTurn(turn: SessionTurn, query: string): boolean {
+  const includes = (value: string) => value.toLowerCase().includes(query)
+  if (includes(turn.prompt) || turn.files.some(includes) || turn.agents.some(includes)) return true
+  return turn.requests.some(
+    (request) =>
+      includes(request.modelID) ||
+      includes(request.providerID) ||
+      includes(request.agent) ||
+      includes(request.text) ||
+      includes(request.reasoning) ||
+      includes(request.error) ||
+      request.tools.some(
+        (tool) =>
+          includes(tool.name) ||
+          includes(tool.summary) ||
+          includes(tool.input) ||
+          includes(tool.output) ||
+          includes(tool.error),
+      ),
+  )
+}
+
 function statusLabel(status: string): string {
   if (status === "completed") return "完成"
   if (status === "error") return "失败"
@@ -95,7 +121,7 @@ function CacheBar(props: { tokens: SessionDetail["tokens"] }) {
       <span class="cache" style={{ width: width(props.tokens.cacheRead) }} title={`缓存读取 ${compact(props.tokens.cacheRead)}`} />
       <span class="input" style={{ width: width(props.tokens.input) }} title={`未缓存输入 ${compact(props.tokens.input)}`} />
       <span class="write" style={{ width: width(props.tokens.cacheWrite) }} title={`缓存写入 ${compact(props.tokens.cacheWrite)}`} />
-      <span class="output" style={{ width: width(props.tokens.output + props.tokens.reasoning) }} title={`输出 ${compact(props.tokens.output + props.tokens.reasoning)}`} />
+      <span class="output" style={{ width: width(props.tokens.output + props.tokens.reasoning) }} title={`输出 + 推理 ${compact(props.tokens.output + props.tokens.reasoning)}`} />
     </div>
   )
 }
@@ -149,6 +175,9 @@ function RequestCard(props: { request: SessionRequest; index: number; initialOpe
         <span class="uc-req-model" title={`${providerName(props.request.providerID)} / ${props.request.modelID}`}>
           <i>{modelInitial(props.request.modelID)}</i>
           <span>{shortModel(props.request.modelID)}</span>
+          <Show when={props.request.variant}>
+            <em>{props.request.variant}</em>
+          </Show>
         </span>
         <span class="uc-req-agent">{props.request.agent}</span>
         <Show when={props.request.tools.length > 0}>
@@ -254,16 +283,19 @@ export function SessionDetailView(props: {
   onBack: () => void
 }) {
   const api = props.ctx.client.rpc(Usage)
-  const cached = DETAIL_CACHE.get(props.session.id)
+  const cachedEntry = DETAIL_CACHE.get(props.session.id)
+  const cached = cachedEntry?.value
+  const cachedFresh = Boolean(cachedEntry && Date.now() - cachedEntry.at < DETAIL_FRESH_MS)
   const [detail, setDetail] = createSignal<SessionDetail | undefined>(cached)
-  const [loading, setLoading] = createSignal(!cached)
   const [refreshing, setRefreshing] = createSignal(false)
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [error, setError] = createSignal("")
+  const [query, setQuery] = createSignal("")
   const [openTurns, setOpenTurns] = createSignal<Set<number>>(
     new Set(cached?.turns[0] ? [cached.turns[0].index] : []),
   )
   let request = 0
+  let loadInFlight = 0
 
   const title = () => detail()?.title || props.session.title
   const projectLabel = () => detail()?.projectName || props.projectName || props.session.projectID || "项目"
@@ -272,6 +304,18 @@ export function SessionDetailView(props: {
     return tokens ? tokenCount(tokens) : 0
   }
   const allRequests = createMemo(() => detail()?.turns.flatMap((turn) => turn.requests) ?? [])
+  const visibleTurns = createMemo(() => {
+    const value = query().trim().toLowerCase()
+    const turns = detail()?.turns ?? []
+    if (!value) return turns
+    return turns.filter((turn) => matchesTurn(turn, value))
+  })
+  createEffect(() => {
+    if (!query().trim()) return
+    const matches = visibleTurns()
+    // Open the first few hits so a content search is visible without extra clicks.
+    setOpenTurns(new Set(matches.slice(0, 3).map((turn) => turn.index)))
+  })
   const throughput = createMemo(() => {
     const rows = allRequests()
     const seconds = rows.reduce((sum, row) => sum + row.total, 0)
@@ -303,26 +347,101 @@ export function SessionDetailView(props: {
   }
 
   function toggleAll(open: boolean) {
-    const rows = detail()?.turns ?? []
-    setOpenTurns(new Set(open ? rows.map((turn) => turn.index) : []))
+    if (!open) {
+      setOpenTurns(new Set<number>())
+      return
+    }
+    setOpenTurns(new Set(visibleTurns().map((turn) => turn.index)))
   }
 
-  function setTurnRequests(turnIndex: number, open: boolean) {
-    const root = document.querySelector(`[data-uc-turn="${turnIndex}"]`)
+  function setTurnRequests(turnIndex: number, open: boolean, event: MouseEvent) {
+    const clicked = event.currentTarget as HTMLElement | null
+    const root = clicked?.closest(`[data-uc-turn="${turnIndex}"]`)
     root?.querySelectorAll<HTMLDetailsElement>(".uc-req").forEach((element) => {
       element.open = open
     })
   }
 
+  function exportCsv() {
+    const rows = visibleTurns()
+    if (rows.length === 0) return
+    const lines: unknown[][] = [
+      [
+        "回合",
+        "时间",
+        "请求序号",
+        "模型",
+        "供应商",
+        "Agent",
+        "输入",
+        "缓存读取",
+        "缓存写入",
+        "输出",
+        "推理",
+        "费用",
+        "首字秒",
+        "总时延秒",
+        "工具数",
+        "工具错误",
+        "结束原因",
+        "提示词",
+      ],
+    ]
+    for (const turn of rows) {
+      const prompt = turn.prompt.replace(/\s+/g, " ").slice(0, 300)
+      if (turn.requests.length === 0) {
+        lines.push([turn.index, new Date(turn.time).toISOString(), "", "", "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", prompt])
+        continue
+      }
+      turn.requests.forEach((request, index) => {
+        lines.push([
+          turn.index,
+          new Date(request.time).toISOString(),
+          index + 1,
+          request.modelID,
+          request.providerID,
+          request.agent,
+          request.tokens.input,
+          request.tokens.cacheRead,
+          request.tokens.cacheWrite,
+          request.tokens.output,
+          request.tokens.reasoning,
+          request.cost,
+          request.ttft,
+          request.total,
+          request.tools.length,
+          request.tools.filter((tool) => tool.status === "error" || tool.error).length,
+          request.finish,
+          prompt,
+        ])
+      })
+    }
+    const csv = lines.map((line) => line.map(csvCell).join(",")).join("\n")
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement("a")
+    anchor.href = url
+    anchor.download = `opencode-session-${props.session.id.slice(-8)}-${new Date().toISOString().slice(0, 10)}.csv`
+    anchor.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
   async function load(force = false, quiet = false) {
     const id = ++request
+    loadInFlight += 1
     if (!quiet) setRefreshing(true)
-    if (!detail()) setLoading(true)
     setError("")
     try {
       const next = await api.sessionDetail({ sessionID: props.session.id, force })
       if (id !== request) return
-      const merged = withTurns(next, mergeTurns(detail()?.turns ?? [], next.turns))
+      const previous = detail()
+      const previousTurns = previous?.id === next.id ? previous.turns : []
+      // Keep older loaded pages, but replace the whole range covered by the
+      // fresh latest page. This drops turns that disappeared after a revert.
+      const firstIncoming = next.turns[0]?.index ?? Number.POSITIVE_INFINITY
+      const olderTurns = previousTurns.filter((turn) => turn.index < firstIncoming)
+      const merged =
+        next.turns.length === 0 ? next : withTurns(next, mergeTurns(olderTurns, next.turns))
       setDetail(merged)
       remember(merged)
       if (openTurns().size === 0 && merged.turns[0]) {
@@ -332,8 +451,8 @@ export function SessionDetailView(props: {
       if (id !== request) return
       setError(readableError(cause))
     } finally {
+      loadInFlight = Math.max(0, loadInFlight - 1)
       if (id === request) {
-        setLoading(false)
         setRefreshing(false)
       }
     }
@@ -341,7 +460,8 @@ export function SessionDetailView(props: {
 
   async function loadMore() {
     const current = detail()
-    if (!current?.hasMore || loadingMore()) return
+    if (!current?.hasMore || loadingMore() || refreshing() || loadInFlight > 0) return
+    const id = request
     setLoadingMore(true)
     setError("")
     try {
@@ -349,8 +469,11 @@ export function SessionDetailView(props: {
         sessionID: props.session.id,
         beforeTurn: current.nextBefore,
       })
+      if (id !== request) return
       if (!next.turns.length) {
-        setDetail({ ...current, hasMore: false, nextBefore: 0 })
+        const empty = { ...current, hasMore: false, nextBefore: 0 }
+        setDetail(empty)
+        remember(empty)
         return
       }
       const merged = withTurns(next, mergeTurns(next.turns, current.turns))
@@ -372,7 +495,9 @@ export function SessionDetailView(props: {
   }
 
   onMount(() => {
-    // A cached session paints instantly; the background call revalidates it.
+    // Fresh cache paints instantly and avoids resetting expanded requests.
+    // Stale cache still paints instantly, then revalidates in the background.
+    if (cachedFresh) return
     void load(false, Boolean(cached))
   })
 
@@ -388,16 +513,24 @@ export function SessionDetailView(props: {
         </button>
         <div class="uc-sd-title">
           <b title={title()}>{title()}</b>
-          <span>
-            {projectLabel()} · {dateText(detail()?.timeCreated || props.session.timeCreated)} ·{" "}
+          <span title={detail()?.directory}>
+            {projectLabel()} · 完整会话 · {dateText(detail()?.timeCreated || props.session.timeCreated)} ·{" "}
             {providerName(detail()?.providerID || props.session.providerID)} /{" "}
             {shortModel(detail()?.modelID || props.session.modelID)}
           </span>
         </div>
         <div class="uc-sd-actions">
           <Show when={detail()}>
-            <button type="button" class="uc-sd-mini" onClick={() => toggleAll(true)}>展开全部</button>
-            <button type="button" class="uc-sd-mini" onClick={() => toggleAll(false)}>收起</button>
+            <button
+              type="button"
+              class="uc-sd-mini"
+              title={query() ? "导出当前搜索匹配的已加载回合" : "导出已加载的回合"}
+              onClick={exportCsv}
+            >
+              导出 CSV
+            </button>
+            <button type="button" class="uc-sd-mini" onClick={() => toggleAll(true)}>全部展开</button>
+            <button type="button" class="uc-sd-mini" onClick={() => toggleAll(false)}>全部收起</button>
           </Show>
           <button type="button" class="uc-export" onClick={() => void load(true)} disabled={refreshing()}>
             {refreshing() ? "刷新中…" : "刷新"}
@@ -413,7 +546,19 @@ export function SessionDetailView(props: {
         </div>
       </Show>
 
-      <Show when={detail()} fallback={<DetailSkeleton />}>
+      <Show
+        when={detail()}
+        fallback={
+          error() ? (
+            <div class="uc-sd-empty">
+              <b>暂时无法读取会话</b>
+              <span>请重试，或完全重启 OpenCode 后再打开。</span>
+            </div>
+          ) : (
+            <DetailSkeleton />
+          )
+        }
+      >
         {(value) => (
           <Show
             when={value().found}
@@ -427,8 +572,8 @@ export function SessionDetailView(props: {
             <div class="uc-sd-kpis">
               <div class="uc-sd-kpi">
                 <span>回合</span>
-                <b>{value().promptCount}</b>
-                <small>用户提问</small>
+                <b>{value().totalTurns}</b>
+                <small>{value().promptCount} 个用户提问</small>
               </div>
               <div class="uc-sd-kpi">
                 <span>请求</span>
@@ -439,7 +584,7 @@ export function SessionDetailView(props: {
                 <span>工具</span>
                 <b>{value().toolCount}</b>
                 <small classList={{ "uc-danger": value().errorCount > 0 }}>
-                  {value().errorCount > 0 ? `${value().errorCount} 个错误` : "全部完成"}
+                  {value().errorCount > 0 ? `${value().errorCount} 个异常` : "全部完成"}
                 </small>
               </div>
               <div class="uc-sd-kpi">
@@ -455,7 +600,7 @@ export function SessionDetailView(props: {
               <div class="uc-sd-kpi">
                 <span>费用</span>
                 <b>{money(value().cost)}</b>
-                <small>{value().slowRate > 0 ? `${percent(value().slowRate * 100, 1)} 慢请求` : "本地账本"}</small>
+                <small>本地估算</small>
               </div>
             </div>
 
@@ -470,7 +615,7 @@ export function SessionDetailView(props: {
                   <span><i class="cache" />缓存读取 <b>{compact(value().tokens.cacheRead)}</b></span>
                   <span><i class="input" />输入 <b>{compact(value().tokens.input)}</b></span>
                   <span><i class="write" />缓存写入 <b>{compact(value().tokens.cacheWrite)}</b></span>
-                  <span><i class="output" />输出 <b>{compact(value().tokens.output + value().tokens.reasoning)}</b></span>
+                  <span><i class="output" />输出 + 推理 <b>{compact(value().tokens.output + value().tokens.reasoning)}</b></span>
                 </div>
               </div>
               <div class="uc-sd-panel">
@@ -481,6 +626,7 @@ export function SessionDetailView(props: {
                   <span><b>{duration(value().totalP50)}</b><small>总时延 P50</small></span>
                   <span><b>{duration(value().totalP95)}</b><small>总时延 P95</small></span>
                   <span><b>{throughput().toFixed(1)}</b><small>输出 tok/s</small></span>
+                  <span><b>{percent(value().slowRate * 100, 1)}</b><small>慢请求</small></span>
                 </div>
               </div>
               <div class="uc-sd-panel">
@@ -504,12 +650,16 @@ export function SessionDetailView(props: {
                     }}
                   </For>
                 </div>
-                <div class="uc-sd-strip-note">按时间顺序 · 柱高为 Token · 绿色代表缓存命中高</div>
+                <div class="uc-sd-strip-note">按时间顺序 · 柱高为 Token · 绿色命中高，红色命中低</div>
               </div>
               <div class="uc-sd-panel">
                 <div class="uc-sd-panel-title">
                   工具分布
-                  <span>{value().toolCount} 次调用</span>
+                  <span>
+                    {value().turns.length < value().totalTurns
+                      ? `已加载 ${value().turns.length} 回合`
+                      : `${value().toolCount} 次调用`}
+                  </span>
                 </div>
                 <Show
                   when={toolStats().length > 0}
@@ -518,7 +668,10 @@ export function SessionDetailView(props: {
                   <div class="uc-toolstats">
                     <For each={toolStats()}>
                       {(tool) => (
-                        <div class="uc-toolstat">
+                        <div
+                          class="uc-toolstat"
+                          title={`${tool.name} · ${tool.count} 次 · 平均 ${duration(tool.duration / Math.max(1, tool.count))}`}
+                        >
                           <span class="uc-toolstat-name" title={tool.name}>{tool.name}</span>
                           <span class="uc-toolstat-bar">
                             <i style={{ width: `${(tool.count / maxToolCount()) * 100}%` }} />
@@ -543,21 +696,65 @@ export function SessionDetailView(props: {
               </button>
             </Show>
 
+            <div class="uc-sd-filter">
+              <label class="uc-search">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                  <circle cx="7" cy="7" r="4.2" />
+                  <path d="M10.2 10.2 14 14" />
+                </svg>
+                <input
+                  id="uc-session-detail-search"
+                  name="uc-session-detail-search"
+                  aria-label="搜索当前会话"
+                  placeholder="搜索回合、提示词、模型、工具或输出"
+                  value={query()}
+                  onInput={(event) => setQuery(event.currentTarget.value)}
+                />
+              </label>
+              <Show when={query()}>
+                <button type="button" class="uc-sd-mini" onClick={() => setQuery("")}>清除</button>
+                <span class="uc-sd-filter-note">
+                  匹配 {visibleTurns().length} / 已加载 {value().turns.length} 个回合
+                </span>
+              </Show>
+            </div>
+
+            <Show
+              when={visibleTurns().length > 0}
+              fallback={
+                <div class="uc-sd-empty">
+                  <b>{query() ? "没有匹配的回合" : "这个会话还没有可回放的回合"}</b>
+                  <span>
+                    {query()
+                      ? "试试模型名、工具名或提示词里的关键词。"
+                      : "可能只有会话元数据，消息还没有写入本机数据库。"}
+                  </span>
+                </div>
+              }
+            >
             <div class="uc-sd-timeline">
-              <For each={value().turns}>
+              <For each={visibleTurns()}>
                 {(turn) => (
                   <article
                     class="uc-turn"
                     classList={{ "uc-turn-open": openTurns().has(turn.index) }}
                     data-uc-turn={turn.index}
                   >
-                    <button type="button" class="uc-turn-head" onClick={() => toggleTurn(turn.index)}>
+                    <button
+                      type="button"
+                      class="uc-turn-head"
+                      aria-expanded={openTurns().has(turn.index)}
+                      onClick={() => toggleTurn(turn.index)}
+                    >
                       <span class="uc-turn-order">#{turn.index}</span>
                       <span class="uc-turn-main">
                         <span class="uc-turn-preview">{previewLine(turn.prompt)}</span>
                         <span class="uc-turn-meta">
                           {dateText(turn.time)} · {turn.requests.length} 请求 · {turn.toolCount} 工具 ·{" "}
                           {compact(tokenCount(turn.tokens))} token · 缓存 {percent(turn.cacheHit * 100, 1)}
+                          <Show when={turn.ttft > 0}>
+                            {" · "}平均首字 {duration(turn.ttft)}
+                          </Show>
                           <Show when={turn.errorCount > 0}>
                             <em class="uc-turn-error">{turn.errorCount} 错误</em>
                           </Show>
@@ -591,10 +788,18 @@ export function SessionDetailView(props: {
                         <Show when={turn.requests.length > 1}>
                           <div class="uc-turn-actions">
                             <span>{turn.requests.length} 次模型请求</span>
-                            <button type="button" class="uc-sd-mini" onClick={() => setTurnRequests(turn.index, true)}>
+                            <button
+                              type="button"
+                              class="uc-sd-mini"
+                              onClick={(event) => setTurnRequests(turn.index, true, event)}
+                            >
                               展开全部请求
                             </button>
-                            <button type="button" class="uc-sd-mini" onClick={() => setTurnRequests(turn.index, false)}>
+                            <button
+                              type="button"
+                              class="uc-sd-mini"
+                              onClick={(event) => setTurnRequests(turn.index, false, event)}
+                            >
                               收起请求
                             </button>
                           </div>
@@ -614,6 +819,7 @@ export function SessionDetailView(props: {
                 )}
               </For>
             </div>
+            </Show>
           </Show>
         )}
       </Show>
@@ -622,7 +828,7 @@ export function SessionDetailView(props: {
 }
 
 const DETAIL_CSS = `
-.uc-sd { display: flex; flex-direction: column; gap: 10px; min-height: 460px; }
+.uc-sd { display: flex; flex-direction: column; gap: 10px; min-height: 460px; container-type: inline-size; }
 .uc-sd-head { display: flex; align-items: center; gap: 10px; padding-bottom: 9px; border-bottom: 1px solid var(--uc-border); }
 .uc-sd-back, .uc-sd-mini, .uc-sd-more {
   border: 1px solid var(--uc-border);
@@ -645,7 +851,7 @@ const DETAIL_CSS = `
 .uc-sd-title { flex: 1; min-width: 0; }
 .uc-sd-title b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-strong); font-size: 12.5px; font-weight: 650; }
 .uc-sd-title span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-faint); font-size: 9.5px; margin-top: 2px; }
-.uc-sd-actions { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.uc-sd-actions { display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex: 0 1 auto; flex-wrap: wrap; }
 .uc-sd-actions .uc-export { height: 27px; }
 .uc-sd-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
 .uc-sd-kpi { min-width: 0; padding: 8px 9px 7px; border: 1px solid var(--uc-border); border-radius: 9px; background: var(--uc-card); display: flex; flex-direction: column; gap: 2px; }
@@ -671,7 +877,7 @@ const DETAIL_CSS = `
 .uc-sd-legend i.write { background: #8b5cf6; }
 .uc-sd-legend i.output { background: #f59e0b; }
 .uc-sd-legend b { color: var(--uc-muted); font-weight: 620; font-variant-numeric: tabular-nums; }
-.uc-sd-latency { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+.uc-sd-latency { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
 .uc-sd-latency span { min-width: 0; padding: 5px 3px; border-radius: 6px; background: var(--uc-card); text-align: center; }
 .uc-sd-latency b { display: block; color: var(--uc-strong); font-size: 11.5px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .uc-sd-latency small { display: block; color: var(--uc-faint); font-size: 8px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -687,6 +893,9 @@ const DETAIL_CSS = `
 .uc-toolstat-bar i { display: block; height: 100%; border-radius: inherit; background: color-mix(in srgb, var(--uc-accent) 68%, var(--uc-card)); }
 .uc-toolstat-count { color: var(--uc-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .uc-toolstat-count em { font-style: normal; color: var(--uc-red); }
+.uc-sd-filter { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.uc-sd-filter .uc-search { max-width: 440px; }
+.uc-sd-filter-note { color: var(--uc-faint); font-size: 9px; }
 .uc-sd-more { align-self: center; height: 28px; }
 .uc-sd-more:disabled { opacity: 0.55; }
 .uc-sd-timeline { display: flex; flex-direction: column; gap: 7px; }
@@ -729,6 +938,7 @@ const DETAIL_CSS = `
 .uc-req-model { display: flex; align-items: center; gap: 4px; min-width: 0; flex: 1; overflow: hidden; color: var(--uc-muted); white-space: nowrap; }
 .uc-req-model i { width: 16px; height: 16px; border-radius: 4px; display: grid; place-items: center; flex: 0 0 auto; background: color-mix(in srgb, var(--uc-accent) 9%, transparent); color: var(--uc-accent); font-size: 7.5px; font-weight: 750; font-style: normal; }
 .uc-req-model span { overflow: hidden; text-overflow: ellipsis; }
+.uc-req-model em { flex: 0 0 auto; font-style: normal; font-size: 8px; color: var(--uc-faint); background: var(--uc-layer-2); padding: 0 3px; border-radius: 3px; }
 .uc-req-agent { flex: 0 0 auto; color: var(--uc-faint); font-size: 8.6px; }
 .uc-req-tools { flex: 0 0 auto; color: var(--uc-faint); font-size: 8.6px; }
 .uc-turn-actions { display: flex; align-items: center; gap: 6px; margin-top: -2px; }
@@ -797,6 +1007,11 @@ const DETAIL_CSS = `
 .uc-sd-skeleton-card { border: 1px solid var(--uc-border); border-radius: 9px; background: var(--uc-card); padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 130px; }
 .uc-sd-skeleton-card.uc-skeleton { min-height: 130px; }
 .uc-sd .uc-skeleton { border: 1px solid var(--uc-border); background: var(--uc-card); }
+@container (max-width: 900px) {
+  .uc-sd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .uc-req-lat, .uc-req-agent { display: none; }
+  .uc-turn-bar { display: none; }
+}
 @media (max-width: 900px) {
   .uc-sd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .uc-req-lat, .uc-req-agent { display: none; }

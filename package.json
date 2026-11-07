@@ -17,6 +17,8 @@
     "quota",
     "tokens",
     "cost",
+    "latency",
+    "session",
     "monitor"
   ],
   "main": "./dist/index.js",
@@ -58,6 +60,7 @@
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "test:data": "bun scripts/check-data.ts",
+    "test:plugin": "bun scripts/check-plugin.ts",
     "prepublishOnly": "npm run typecheck && npm run build"
   }
 }

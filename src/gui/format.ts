@@ -1,5 +1,12 @@
 const MONEY = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
+/** CSV cell with quote escaping and spreadsheet formula-injection protection. */
+export function csvCell(value: unknown): string {
+  const raw = String(value ?? "")
+  const safe = typeof value === "string" && /^[=+\-@]/.test(raw.trimStart()) ? `'${raw}` : raw
+  return `"${safe.replace(/"/g, '""')}"`
+}
+
 export function readableError(error: unknown): string {
   const value = error instanceof Error ? error.message : String(error)
   if (/SchemaError|Missing key at/i.test(value)) {
