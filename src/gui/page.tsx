@@ -2168,7 +2168,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
             USAGE MONITOR
           </div>
           <Show when={!props.embedded}>
-            <h1>模型用量</h1>
+            <h1>用量中心</h1>
           </Show>
           <p class="uc-sub">把每一次模型调用都算清楚：Token、费用、时延与订阅额度。</p>
           <div class="uc-hero-meta">
@@ -2569,7 +2569,7 @@ export function UsageDialog(props: { ctx: Context; onClose: () => void }) {
   }
   return (
     <ui.Dialog
-      title="模型用量"
+      title="用量中心"
       size="x-large"
       footer={
         <div class="uc-dialog-footer">

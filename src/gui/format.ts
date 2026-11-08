@@ -13,7 +13,7 @@ export function readableError(error: unknown): string {
     return "插件窗口与后台服务版本不一致。请完全退出 OpenCode 后重新打开，或重载插件。"
   }
   if (/unknown method|not implemented|no such method|method.*not.*found/i.test(value)) {
-    return "后台服务还没有加载「模型用量」的新版本。请重载插件后再试。"
+    return "后台服务还没有加载「用量中心」的新版本。请重载插件后再试。"
   }
   return value
 }

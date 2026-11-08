@@ -61,14 +61,14 @@ export default Plugin.define({
 
     ctx.add(SettingsPage, {
       id: "usage-center",
-      title: "模型用量",
+      title: "用量中心",
       icon: "window-analytics",
       entries: [
         {
           id: "usage-center",
-          title: "模型用量",
+          title: "用量中心",
           description: "Token、费用、OpenCode Go 额度、凭据时效与响应时延",
-          keywords: "usage token cost quota subscription latency expiry 用量 费用 额度 时延",
+          keywords: "usage token cost quota subscription latency expiry 用量 用量中心 费用 额度 时延",
         },
       ],
       render: () => <UsagePage ctx={ctx} />,
@@ -78,17 +78,17 @@ export default Plugin.define({
     // and shortcut are the always-available ways back to the dashboard.
     ctx.add(TitlebarItem, (): TitlebarItem => ({
       id: "usage",
-      label: "用量",
-      title: "打开模型用量",
+      label: "用量中心",
+      title: "打开用量中心",
       icon: "window-analytics",
       run: open,
     }))
 
     ctx.add(Command, (): Command => ({
       id: "open",
-      title: "模型用量",
+      title: "用量中心",
       description: "查看 Token、费用、订阅额度与响应时延",
-      keywords: "usage token cost quota subscription latency expiry 用量 费用 额度 时延",
+      keywords: "usage token cost quota subscription latency expiry 用量 用量中心 费用 额度 时延",
       group: "设置",
       section: "navigation",
       bind: "mod+alt+u",
