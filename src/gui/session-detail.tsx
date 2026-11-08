@@ -298,9 +298,7 @@ export function SessionDetailView(props: {
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [error, setError] = createSignal("")
   const [query, setQuery] = createSignal("")
-  const [openTurns, setOpenTurns] = createSignal<Set<number>>(
-    new Set(cached?.turns[0] ? [cached.turns[0].index] : []),
-  )
+  const [openTurns, setOpenTurns] = createSignal<Set<number>>(new Set())
   let request = 0
   let loadInFlight = 0
 
@@ -451,9 +449,6 @@ export function SessionDetailView(props: {
         next.turns.length === 0 ? next : withTurns(next, mergeTurns(olderTurns, next.turns))
       setDetail(merged)
       remember(merged)
-      if (openTurns().size === 0 && merged.turns[0]) {
-        setOpenTurns(new Set([merged.turns[0].index]))
-      }
     } catch (cause) {
       if (id !== request) return
       setError(readableError(cause))
@@ -486,14 +481,6 @@ export function SessionDetailView(props: {
       const merged = withTurns(next, mergeTurns(next.turns, current.turns))
       setDetail(merged)
       remember(merged)
-      const first = next.turns[0]
-      if (first) {
-        setOpenTurns((previous) => {
-          const open = new Set(previous)
-          open.add(first.index)
-          return open
-        })
-      }
     } catch (cause) {
       setError(readableError(cause))
     } finally {
@@ -747,6 +734,9 @@ export function SessionDetailView(props: {
                     classList={{ "uc-turn-open": openTurns().has(turn.index) }}
                     data-uc-turn={turn.index}
                   >
+                    <span class="uc-turn-rail" aria-hidden="true">
+                      <i class="uc-turn-node" data-tone={turn.errorCount > 0 ? "danger" : cacheTone(turn.cacheHit)} />
+                    </span>
                     <button
                       type="button"
                       class="uc-turn-head"
@@ -754,10 +744,11 @@ export function SessionDetailView(props: {
                       onClick={() => toggleTurn(turn.index)}
                     >
                       <span class="uc-turn-order">#{turn.index}</span>
+                      <span class="uc-turn-time">{dateText(turn.time)}</span>
                       <span class="uc-turn-main">
                         <span class="uc-turn-preview">{previewLine(turn.prompt)}</span>
                         <span class="uc-turn-meta">
-                          {dateText(turn.time)} · {turn.requests.length} 请求 · {turn.toolCount} 工具 ·{" "}
+                          {turn.requests.length} 请求 · {turn.toolCount} 工具 ·{" "}
                           {compact(tokenCount(turn.tokens))} token · 缓存 {percent(turn.cacheHit * 100, 1)}
                           <Show when={turn.ttft > 0}>
                             {" · "}平均首字 {duration(turn.ttft)}
@@ -905,11 +896,45 @@ const DETAIL_CSS = `
 .uc-sd-filter-note { color: var(--uc-faint); font-size: 9px; }
 .uc-sd-more { align-self: center; height: 28px; }
 .uc-sd-more:disabled { opacity: 0.55; }
-.uc-sd-timeline { display: flex; flex-direction: column; gap: 7px; }
-.uc-turn { border: 1px solid var(--uc-border); border-radius: 10px; background: var(--uc-card); overflow: hidden; }
-.uc-turn-head { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 0; background: transparent; color: inherit; text-align: left; font: inherit; cursor: default; }
+.uc-sd-timeline { position: relative; display: flex; flex-direction: column; gap: 6px; padding-left: 26px; }
+.uc-sd-timeline::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 14px;
+  bottom: 14px;
+  width: 1.5px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--uc-accent) 30%, transparent), color-mix(in srgb, var(--uc-border) 80%, transparent));
+}
+.uc-turn { position: relative; border: 1px solid var(--uc-border); border-radius: 10px; background: var(--uc-card); overflow: hidden; }
+.uc-turn-rail {
+  position: absolute;
+  left: -25px;
+  top: 0;
+  bottom: 0;
+  width: 25px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15px;
+  pointer-events: none;
+}
+.uc-turn-node {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--uc-green);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--uc-green) 16%, transparent);
+}
+.uc-turn-node[data-tone="warn"] { background: var(--uc-amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--uc-amber) 16%, transparent); }
+.uc-turn-node[data-tone="low"] { background: var(--uc-red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--uc-red) 16%, transparent); }
+.uc-turn-node[data-tone="danger"] { background: var(--uc-red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--uc-red) 20%, transparent); }
+.uc-turn-open > .uc-turn-rail .uc-turn-node { box-shadow: 0 0 0 4px color-mix(in srgb, var(--uc-accent) 22%, transparent); }
+.uc-turn-head { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 0; background: transparent; color: inherit; text-align: left; font: inherit; cursor: default; }
 .uc-turn-head:hover { background: color-mix(in srgb, var(--uc-accent) 4%, transparent); }
 .uc-turn-order { flex: 0 0 auto; min-width: 24px; color: var(--uc-accent); font-size: 10px; font-weight: 720; font-variant-numeric: tabular-nums; }
+.uc-turn-time { flex: 0 0 auto; color: var(--uc-faint); font-size: 8.8px; font-variant-numeric: tabular-nums; }
 .uc-turn-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .uc-turn-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-strong); font-size: 10.5px; font-weight: 560; }
 .uc-turn-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-faint); font-size: 8.8px; font-variant-numeric: tabular-nums; }
@@ -1018,6 +1043,9 @@ const DETAIL_CSS = `
   .uc-sd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .uc-req-lat, .uc-req-agent { display: none; }
   .uc-turn-bar { display: none; }
+  .uc-turn-time { display: none; }
+  .uc-sd-timeline { padding-left: 20px; }
+  .uc-turn-rail { left: -19px; width: 19px; }
 }
 @media (max-width: 900px) {
   .uc-sd-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
