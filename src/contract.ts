@@ -201,28 +201,53 @@ export const CredentialRow = Schema.Struct({
   active: Schema.Boolean,
 })
 
-export const Bucket = Schema.Struct({
+/**
+ * One quota window. Providers differ wildly: OpenCode Go has three windows
+ * (rolling / weekly / monthly), Trae has one credit pool, Qoder has a plan
+ * allowance plus an add-on pool. The GUI renders whatever meters arrive, so a
+ * new provider only has to build meters rather than reshape the schema.
+ */
+export const Meter = Schema.Struct({
+  /** Stable within a provider: `rolling`, `weekly`, `monthly`, `credits`, `addOnQuota`. */
+  id: Schema.String,
+  label: Schema.String,
+  /** Used share, 0–100. */
   percent: Schema.Number,
-  limited: Schema.Boolean,
-  resetsAt: Schema.Number,
+  /** Absolute amount consumed, when the provider exposes it. */
+  used: Schema.optional(Schema.Number),
+  /** Absolute allowance, when the provider exposes it. */
+  limit: Schema.optional(Schema.Number),
+  /** `credits`, `usd`, `requests`, `percent`. */
+  unit: Schema.optional(Schema.String),
+  /** Milliseconds since epoch. Absent when the provider exposes no reset. */
+  resetsAt: Schema.optional(Schema.Number),
+  /** Provider-reported throttle / exhaustion. */
+  limited: Schema.optional(Schema.Boolean),
+})
+
+export const QuotaProvider = Schema.Struct({
+  /** Credential `integration_id`: `opencode-go`, `trae-cn`, `trae-cn-ent`, `qoder`. */
+  id: Schema.String,
+  /** Display name. */
+  name: Schema.String,
+  /** `zen/go`, `trae`, `qoder`, `none`. */
+  source: Schema.String,
+  available: Schema.Boolean,
+  /** Empty on success. */
+  error: Schema.String,
+  /** Plan label as the provider names it: `Credits`, `Free`, `personal_standard`. */
+  plan: Schema.optional(Schema.String),
+  /** Shown in place of meters when the account exposes no numbers (e.g. enterprise tenants). */
+  note: Schema.optional(Schema.String),
+  meters: Schema.Array(Meter),
 })
 
 export const Quota = Schema.Struct({
+  /** True when at least one provider returned live data. */
   available: Schema.Boolean,
-  /** `zen/go`, `console` or `none`. */
-  source: Schema.String,
-  /** Empty on success. */
+  /** Empty when any provider is live; otherwise why nothing could be read. */
   error: Schema.String,
-  workspace: Schema.optional(
-    Schema.Struct({
-      id: Schema.String,
-      name: Schema.optional(Schema.String),
-      usageURL: Schema.optional(Schema.String),
-    }),
-  ),
-  rolling: Schema.optional(Bucket),
-  weekly: Schema.optional(Bucket),
-  monthly: Schema.optional(Bucket),
+  providers: Schema.Array(QuotaProvider),
 })
 
 export const DatabaseInfo = Schema.Struct({
@@ -287,6 +312,8 @@ export const Usage = Rpc.define({
 
 export type Snapshot = typeof Snapshot.Type
 export type SnapshotInput = typeof SnapshotInput.Type
+export type Meter = typeof Meter.Type
+export type QuotaProvider = typeof QuotaProvider.Type
 export type Quota = typeof Quota.Type
 export type TokenTotals = typeof TokenTotals.Type
 export type SeriesPoint = typeof SeriesPoint.Type

@@ -90,6 +90,7 @@ export function providerName(id: string): string {
     opencode: "OpenCode",
     "opencode-go": "OpenCode Go",
     "trae-cn": "Trae CN",
+    "trae-cn-ent": "Trae CN 企业版",
     qoder: "Qoder CN",
     deepseek: "DeepSeek",
     openrouter: "OpenRouter",
@@ -99,6 +100,20 @@ export function providerName(id: string): string {
     unknown: "未知",
   }
   return names[id] ?? id
+}
+
+/** `497.73 / 2300 credits` when the provider exposes amounts, otherwise blank. */
+export function meterAmount(used: number | undefined, limit: number | undefined, unit: string | undefined): string {
+  if (used === undefined && limit === undefined) return ""
+  const suffix = unit && unit !== "percent" ? ` ${unit}` : ""
+  if (limit === undefined) return `${formatAmount(used ?? 0)}${suffix}`
+  return `${formatAmount(used ?? 0)} / ${formatAmount(limit)}${suffix}`
+}
+
+function formatAmount(value: number): string {
+  if (!Number.isFinite(value)) return "0"
+  if (value >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 0 })
+  return `${Math.round(value * 100) / 100}`
 }
 
 export function modelInitial(id: string): string {

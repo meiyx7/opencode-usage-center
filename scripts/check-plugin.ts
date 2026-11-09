@@ -75,7 +75,7 @@ console.log(
   snapshot.database.ok,
   snapshot.credentials.length,
 )
-console.log("quota", quota.available, quota.monthly?.percent, quota.error)
+console.log("quota", quota.available, quota.providers.map((p) => `${p.id}:${p.meters.length}`).join(","), quota.error)
 console.log(
   "session",
   session.found,

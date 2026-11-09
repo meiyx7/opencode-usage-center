@@ -1,13 +1,14 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import { Usage } from "../contract"
-import type { CredentialRow, LatencyModelRow, ModelRow, ProjectRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
+import type { CredentialRow, LatencyModelRow, Meter, ModelRow, ProjectRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
 import {
   compact,
   csvCell,
   dateText,
   duration,
   expiryLabel,
+  meterAmount,
   modelInitial,
   money,
   percent,
@@ -262,39 +263,35 @@ function CostDonut(props: { models: readonly ModelRow[]; total: number }) {
 }
 
 function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
-  const monthly = () => props.quota?.monthly
-  const ringPercent = () => Math.max(0, Math.min(100, monthly()?.percent ?? 0))
+  const providers = () => props.quota?.providers ?? []
+  const liveProviders = createMemo(() => providers().filter((provider) => provider.available && provider.meters.length > 0))
+  /** The most-consumed window across every provider drives the ring and the warning tone. */
+  const primary = createMemo<Meter | undefined>(() => {
+    const all = providers().flatMap((provider) => provider.meters)
+    if (all.length === 0) return undefined
+    return all.reduce((worst, meter) => (meter.percent > worst.percent ? meter : worst), all[0]!)
+  })
+  const ringPercent = () => Math.max(0, Math.min(100, primary()?.percent ?? 0))
   const ringColor = () => (ringPercent() >= 90 ? "var(--uc-red)" : ringPercent() >= 70 ? "var(--uc-amber)" : "var(--uc-accent)")
   const circumference = 2 * Math.PI * 36
-  const meters = createMemo(() =>
-    [
-      ["滚动 5 小时", props.quota?.rolling, "var(--uc-blue)"],
-      ["本周", props.quota?.weekly, "var(--uc-accent)"],
-      ["本月", props.quota?.monthly, "var(--uc-red)"],
-    ] as const,
-  )
+  const meterColor = (meter: Meter) => (meter.percent >= 90 ? "var(--uc-red)" : meter.percent >= 70 ? "var(--uc-amber)" : "var(--uc-accent)")
   return (
     <section class="uc-card uc-quota" id={props.id}>
       <div class="uc-card-head">
         <div>
-          <div class="uc-card-title">OpenCode Go</div>
-          <div class="uc-card-sub">订阅额度 · 实时</div>
+          <div class="uc-card-title">订阅额度</div>
+          <div class="uc-card-sub">多供应商 · 实时</div>
         </div>
         <Show
           when={props.quota?.available}
-          fallback={
-            <span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>
-          }
+          fallback={<span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>}
         >
           <span class="uc-live"><i />LIVE</span>
         </Show>
       </div>
-      <Show
-        when={props.quota}
-        fallback={<div class="uc-empty-line">正在读取额度…</div>}
-      >
+      <Show when={props.quota} fallback={<div class="uc-empty-line">正在读取额度…</div>}>
         <Show
-          when={props.quota!.available}
+          when={providers().length > 0}
           fallback={
             <div class="uc-quota-error">
               <span>{props.quota!.error || "额度接口暂不可用"}</span>
@@ -304,61 +301,82 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
             </div>
           }
         >
-          <div class="uc-quota-top">
-            <div class="uc-quota-donut">
-              <svg viewBox="0 0 96 96" aria-hidden="true">
-                <circle cx="48" cy="48" r="36" fill="none" stroke="var(--uc-track)" stroke-width="9" />
-                <circle
-                  cx="48"
-                  cy="48"
-                  r="36"
-                  fill="none"
-                  stroke={ringColor()}
-                  stroke-width="9"
-                  stroke-linecap="round"
-                  stroke-dasharray={`${(circumference * ringPercent()) / 100} ${circumference}`}
-                  transform="rotate(-90 48 48)"
-                />
-              </svg>
-              <div class="uc-quota-center">
-                <b style={{ color: ringColor() }}>{Math.round(ringPercent())}%</b>
-                <span>本月已用</span>
+          <Show when={primary()}>
+            {(worst) => (
+              <div class="uc-quota-top">
+                <div class="uc-quota-donut">
+                  <svg viewBox="0 0 96 96" aria-hidden="true">
+                    <circle cx="48" cy="48" r="36" fill="none" stroke="var(--uc-track)" stroke-width="9" />
+                    <circle
+                      cx="48"
+                      cy="48"
+                      r="36"
+                      fill="none"
+                      stroke={ringColor()}
+                      stroke-width="9"
+                      stroke-linecap="round"
+                      stroke-dasharray={`${(circumference * ringPercent()) / 100} ${circumference}`}
+                      transform="rotate(-90 48 48)"
+                    />
+                  </svg>
+                  <div class="uc-quota-center">
+                    <b style={{ color: ringColor() }}>{Math.round(ringPercent())}%</b>
+                    <span>{worst().label}</span>
+                  </div>
+                </div>
+                <div class="uc-meters">
+                  <For each={liveProviders()}>
+                    {(provider) => (
+                      <div class="uc-quota-provider">
+                        <div class="uc-quota-provider-head">
+                          <span>{provider.name}</span>
+                          <Show when={provider.plan}>
+                            <small>{provider.plan}</small>
+                          </Show>
+                        </div>
+                        <For each={provider.meters}>
+                          {(meter) => (
+                            <div class="uc-meter-row">
+                              <div class="uc-meter-top">
+                                <span>
+                                  {meter.label}
+                                  <small>{meter.resetsAt ? resetLabel(meter.resetsAt) : meterAmount(meter.used, meter.limit, meter.unit)}</small>
+                                </span>
+                                <b style={{ color: meter.percent >= 90 ? "var(--uc-red)" : undefined }}>{percent(meter.percent)}</b>
+                              </div>
+                              <div class="uc-meter">
+                                <i style={{ width: `${Math.max(1, Math.min(100, meter.percent))}%`, background: meterColor(meter) }} />
+                              </div>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    )}
+                  </For>
+                </div>
               </div>
-            </div>
-            <div class="uc-meters">
-              <For each={meters()}>
-                {([label, bucket, color]) => (
-                  <Show when={bucket}>
-                    <div class="uc-meter-row">
-                      <div class="uc-meter-top">
-                        <span>
-                          {label}
-                          <small>{resetLabel(bucket!.resetsAt)}</small>
-                        </span>
-                        <b style={{ color: bucket!.percent >= 90 ? "var(--uc-red)" : undefined }}>
-                          {percent(bucket!.percent)}
-                        </b>
-                      </div>
-                      <div class="uc-meter">
-                        <i
-                          style={{
-                            width: `${Math.max(1, Math.min(100, bucket!.percent))}%`,
-                            background: bucket!.percent >= 90 ? "var(--uc-red)" : color,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </Show>
+            )}
+          </Show>
+          <Show when={liveProviders().length === 0}>
+            <div class="uc-quota-notes">
+              <For each={providers()}>
+                {(provider) => (
+                  <div class="uc-quota-note" data-tone="muted">
+                    <i />
+                    {provider.name}：{provider.note || provider.error || "未暴露额度"}
+                  </div>
                 )}
               </For>
             </div>
-          </div>
-          <div class="uc-quota-note" data-tone={ringPercent() >= 90 ? "danger" : "muted"}>
-            <i />
-            {ringPercent() >= 90
-              ? "额度即将用完 · 重置前建议切换到按量模型"
-              : `本月额度已用 ${percent(ringPercent())} · ${monthly()?.resetsAt ? resetLabel(monthly()!.resetsAt) : "等待重置时间"}`}
-          </div>
+          </Show>
+          <Show when={liveProviders().length > 0}>
+            <div class="uc-quota-note" data-tone={ringPercent() >= 90 ? "danger" : "muted"}>
+              <i />
+              {ringPercent() >= 90
+                ? "额度即将用完 · 重置前建议切换到按量模型"
+                : `${primary()!.label}已用 ${percent(ringPercent())} · 覆盖 ${liveProviders().length} 个供应商`}
+            </div>
+          </Show>
         </Show>
       </Show>
     </section>
@@ -501,34 +519,25 @@ function SkeletonDashboard() {
 }
 
 function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow[]; onRetry: () => void; id?: string; expiryID?: string }) {
-  const buckets = createMemo(() => [
-    { label: "滚动 5 小时", bucket: props.quota?.rolling, color: "var(--uc-blue)" },
-    { label: "本周", bucket: props.quota?.weekly, color: "var(--uc-accent)" },
-    { label: "本月", bucket: props.quota?.monthly, color: "var(--uc-red)" },
-  ])
+  const providers = () => props.quota?.providers ?? []
   return (
     <div class="uc-detail-grid uc-quota-page">
       <section class="uc-card uc-quota-detail" id={props.id}>
         <div class="uc-card-head">
           <div>
-            <div class="uc-card-title">OpenCode Go 额度</div>
-            <div class="uc-card-sub">滚动窗口、周额度、月额度 · 重置时间按本机时区显示</div>
+            <div class="uc-card-title">订阅额度</div>
+            <div class="uc-card-sub">OpenCode Go · Trae · Qoder · 重置时间按本机时区显示</div>
           </div>
           <Show
             when={props.quota?.available}
-            fallback={
-              <span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>
-            }
+            fallback={<span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>}
           >
             <span class="uc-live"><i />LIVE</span>
           </Show>
         </div>
-        <Show
-          when={props.quota}
-          fallback={<div class="uc-empty-line">正在读取额度…</div>}
-        >
+        <Show when={props.quota} fallback={<div class="uc-empty-line">正在读取额度…</div>}>
           <Show
-            when={props.quota!.available}
+            when={providers().length > 0}
             fallback={
               <div class="uc-quota-error">
                 <span>{props.quota!.error || "额度接口暂不可用"}</span>
@@ -538,37 +547,52 @@ function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow
               </div>
             }
           >
-            <div class="uc-quota-stats">
-              <For each={buckets()}>
-                {(item) => (
-                  <Show when={item.bucket}>
-                    <div
-                      class="uc-quota-stat"
-                      data-tone={item.bucket!.percent >= 90 ? "danger" : item.bucket!.percent >= 70 ? "warn" : "ok"}
-                    >
-                      <div class="uc-quota-stat-head">
-                        <span>{item.label}</span>
-                        <b>{percent(item.bucket!.percent)}</b>
-                      </div>
-                      <div class="uc-meter uc-meter-lg">
-                        <i
-                          style={{
-                            width: `${Math.max(1, Math.min(100, item.bucket!.percent))}%`,
-                            background: item.bucket!.percent >= 90 ? "var(--uc-red)" : item.color,
-                          }}
-                        />
-                      </div>
-                      <div class="uc-quota-stat-foot">
-                        <span>{item.bucket!.limited ? "已限流" : "正常"}</span>
-                        <span>{resetLabel(item.bucket!.resetsAt)}</span>
-                      </div>
+            <For each={providers()}>
+              {(provider) => (
+                <div class="uc-quota-block">
+                  <div class="uc-quota-block-head">
+                    <span>{provider.name}</span>
+                    <Show when={provider.plan}>
+                      <span class="uc-quota-plan">{provider.plan}</span>
+                    </Show>
+                    <Show when={!provider.available}>
+                      <span class="uc-badge uc-badge-muted">未连接</span>
+                    </Show>
+                  </div>
+                  <Show when={provider.meters.length > 0} fallback={<div class="uc-quota-block-note">{provider.note || provider.error || "未暴露额度"}</div>}>
+                    <div class="uc-quota-stats" style={{ "grid-template-columns": `repeat(${Math.min(provider.meters.length, 3)}, minmax(0, 1fr))` }}>
+                      <For each={provider.meters}>
+                        {(meter) => (
+                          <div
+                            class="uc-quota-stat"
+                            data-tone={meter.percent >= 90 ? "danger" : meter.percent >= 70 ? "warn" : "ok"}
+                          >
+                            <div class="uc-quota-stat-head">
+                              <span>{meter.label}</span>
+                              <b>{percent(meter.percent)}</b>
+                            </div>
+                            <div class="uc-meter uc-meter-lg">
+                              <i
+                                style={{
+                                  width: `${Math.max(1, Math.min(100, meter.percent))}%`,
+                                  background: meter.percent >= 90 ? "var(--uc-red)" : meter.percent >= 70 ? "var(--uc-amber)" : "var(--uc-accent)",
+                                }}
+                              />
+                            </div>
+                            <div class="uc-quota-stat-foot">
+                              <span>{meterAmount(meter.used, meter.limit, meter.unit) || (meter.limited ? "已限流" : "正常")}</span>
+                              <span>{meter.resetsAt ? resetLabel(meter.resetsAt) : "无重置时间"}</span>
+                            </div>
+                          </div>
+                        )}
+                      </For>
                     </div>
                   </Show>
-                )}
-              </For>
-            </div>
+                </div>
+              )}
+            </For>
             <div class="uc-detail-note">
-              额度来自 OpenCode Go 实时接口；这里只读取额度百分比和重置时间，不读取会话内容。
+              额度来自各供应商的实时接口；这里只读取额度百分比、用量和重置时间，不读取会话内容。凭据过期时请先在对应插件里重新登录。
             </div>
           </Show>
         </Show>
@@ -1253,6 +1277,11 @@ const CSS = `
 .uc-quota-center b { font-size: 22px; font-weight: 700; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
 .uc-quota-center span { color: var(--uc-faint); font-size: 9px; margin-top: 1px; }
 .uc-meters { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 9px; }
+.uc-quota-provider { display: flex; flex-direction: column; gap: 6px; }
+.uc-quota-provider + .uc-quota-provider { border-top: 1px dashed var(--uc-border); padding-top: 8px; }
+.uc-quota-provider-head { display: flex; align-items: baseline; gap: 6px; color: var(--uc-strong); font-size: 9.8px; font-weight: 650; }
+.uc-quota-provider-head small { color: var(--uc-faint); font-size: 8.4px; font-weight: 500; }
+.uc-quota-notes { display: flex; flex-direction: column; gap: 6px; min-height: 130px; justify-content: center; }
 .uc-meter-row { min-width: 0; }
 .uc-meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--uc-muted); font-size: 9.5px; }
 .uc-meter-top span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1374,6 +1403,10 @@ const CSS = `
 }
 .uc-quota-page { grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr); }
 .uc-quota-detail { min-height: 0; }
+.uc-quota-block + .uc-quota-block { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--uc-border); }
+.uc-quota-block-head { display: flex; align-items: center; gap: 8px; color: var(--uc-strong); font-size: 11px; font-weight: 650; }
+.uc-quota-plan { color: var(--uc-faint); font-size: 9px; font-weight: 500; padding: 1px 6px; border-radius: 4px; background: var(--uc-layer-2); }
+.uc-quota-block-note { margin-top: 8px; color: var(--uc-faint); font-size: 9.5px; }
 .uc-quota-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
 .uc-quota-stat { padding: 12px; border: 1px solid var(--uc-border); border-radius: 9px; background: var(--uc-layer); }
 .uc-quota-stat[data-tone="danger"] { border-color: color-mix(in srgb, var(--uc-red) 26%, transparent); background: color-mix(in srgb, var(--uc-red) 5%, var(--uc-card)); }
@@ -1942,8 +1975,8 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       if (id !== quotaRequest) return
       const next: Quota = {
         available: false,
-        source: "none",
         error: "额度接口暂不可用",
+        providers: [],
       }
       setQuota(next)
       const current = snapshot()
@@ -2110,19 +2143,15 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const alert = createMemo<Alert | undefined>(() => {
     const current = quota()
     if (current?.available) {
-      const monthly = current.monthly
-      if (monthly && monthly.percent >= 90) {
+      // Warn on whichever provider window is closest to exhaustion.
+      const hot = current.providers
+        .flatMap((provider) => provider.meters.map((meter) => ({ provider, meter })))
+        .filter((entry) => entry.meter.percent >= 90)
+        .sort((a, b) => b.meter.percent - a.meter.percent)[0]
+      if (hot) {
         return {
-          title: `月度额度仅剩 ${Math.max(0, Math.round(100 - monthly.percent))}%`,
-          detail: `OpenCode Go 本月已用 ${percent(monthly.percent)}，${resetLabel(monthly.resetsAt)}。`,
-          action: "查看额度",
-          target: "uc-quota",
-        }
-      }
-      if (current.weekly && current.weekly.percent >= 90) {
-        return {
-          title: "本周额度即将用完",
-          detail: `OpenCode Go 本周已用 ${percent(current.weekly.percent)}，${resetLabel(current.weekly.resetsAt)}。`,
+          title: `${hot.provider.name} ${hot.meter.label}仅剩 ${Math.max(0, Math.round(100 - hot.meter.percent))}%`,
+          detail: `${hot.provider.name} ${hot.meter.label}已用 ${percent(hot.meter.percent)}${hot.meter.resetsAt ? `，${resetLabel(hot.meter.resetsAt)}` : ""}。`,
           action: "查看额度",
           target: "uc-quota",
         }

@@ -6,9 +6,11 @@ import type {
   CredentialRow,
   Latency,
   LatencyModelRow,
+  Meter,
   ModelRow,
   ProjectRow,
   Quota,
+  QuotaProvider,
   SeriesPoint,
   SessionDetail,
   SessionDetailInput,
@@ -30,6 +32,18 @@ const DETAIL_CACHE_MS = 60_000
 const DETAIL_CACHE_LIMIT = 4
 const DETAIL_PAGE = 60
 const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+/**
+ * Trae CN serves the account's credit usage on its own API host. The
+ * enterprise tenant host answers 405 for this path, so both the personal and
+ * enterprise credentials post here with their own Cloud-IDE-JWT.
+ */
+const TRAE_USAGE_URL = "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage"
+const TRAE_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+/** Qoder asks its OpenAPI host for the device account's allowance. */
+const QODER_OPENAPI: Record<string, string> = {
+  cn: "https://openapi.qoder.com.cn",
+  global: "https://openapi.qoder.sh",
+}
 
 /** Keep RPC payloads small. Full session data stays in the local database. */
 const PREVIEW = {
@@ -195,6 +209,266 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/** Build a meter without putting explicit `undefined` on the wire (RPC encodes JSON). */
+function meterOf(
+  id: string,
+  label: string,
+  percent: number,
+  extra: { used?: number; limit?: number; unit?: string; resetsAt?: number; limited?: boolean } = {},
+): Meter {
+  return {
+    id,
+    label,
+    percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0,
+    ...(extra.used !== undefined ? { used: round2(extra.used) } : {}),
+    ...(extra.limit !== undefined ? { limit: round2(extra.limit) } : {}),
+    ...(extra.unit ? { unit: extra.unit } : {}),
+    ...(extra.resetsAt ? { resetsAt: extra.resetsAt } : {}),
+    ...(extra.limited ? { limited: true } : {}),
+  }
+}
+
+/** Trae pack times are seconds since epoch; ISO strings and milliseconds also appear. */
+function traeTime(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value < 1e12 ? value * 1000 : value
+  }
+  if (typeof value === "string" && value) {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return 0
+}
+
+/**
+ * Sum a Trae account's entitlement packs the way the Trae auth plugin does:
+ * every pack's `quota.credits_limit` adds to the allowance (a `-1` means
+ * unlimited), every pack's `usage.credits_amount` adds to the spend, and the
+ * soonest pack expiry is the reset.
+ */
+function traeCredits(body: Record<string, unknown>): { limit: number; used: number; unlimited: boolean; until: number } {
+  let limit = 0
+  let used = 0
+  let unlimited = false
+  let until = 0
+  const packs = Array.isArray(body.user_entitlement_pack_list) ? body.user_entitlement_pack_list : []
+  for (const raw of packs) {
+    const pack = asRecord(raw)
+    if (!pack) continue
+    const base = asRecord(pack.entitlement_base_info) ?? {}
+    const quota = asRecord(base.quota) ?? {}
+    const creditsLimit = Number(quota.credits_limit)
+    if (Number.isFinite(creditsLimit)) {
+      if (creditsLimit === -1) unlimited = true
+      else if (creditsLimit >= 0) limit += creditsLimit
+    }
+    const usage = asRecord(pack.usage) ?? {}
+    const amount = Number(usage.credits_amount)
+    if (Number.isFinite(amount) && amount > 0) used += amount
+    const end = traeTime(base.end_time ?? base.expire_time ?? pack.end_time)
+    if (end && (!until || end < until)) until = end
+  }
+  if (limit <= 0 && !unlimited) {
+    // Some tenants only fill `usage_summary`; fall back to it.
+    const summary = asRecord(body.usage_summary) ?? {}
+    const total = Number(summary.total_amount)
+    const consumed = Number(summary.consumed_amount)
+    if (Number.isFinite(total) && total > 0) {
+      limit = total
+      used = Number.isFinite(consumed) ? consumed : 0
+    }
+  }
+  return { limit, used, unlimited, until }
+}
+
+async function goQuota(value: Record<string, unknown>): Promise<QuotaProvider> {
+  const base = { id: "opencode-go", name: "OpenCode Go", source: "zen/go" }
+  const secret =
+    value.type === "oauth"
+      ? text(value.access)
+      : value.type === "key"
+        ? text(value.key)
+        : text(value.access) || text(value.key)
+  if (!secret) return { ...base, available: false, error: "未找到 OpenCode Go 凭据", meters: [] }
+  try {
+    const response = await fetch(GO_USAGE_URL, {
+      headers: { authorization: `Bearer ${secret}`, accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
+    })
+    if (!response.ok) {
+      return { ...base, available: false, error: `OpenCode Go 额度暂不可用（HTTP ${response.status}）`, meters: [] }
+    }
+    const body = (await response.json()) as {
+      usage?: Record<string, { status?: string; percent?: number; resetsAt?: string }>
+    }
+    const labels: Record<string, string> = { rolling: "滚动 5 小时", weekly: "本周", monthly: "本月" }
+    const meters: Meter[] = []
+    for (const key of ["rolling", "weekly", "monthly"]) {
+      const entry = body.usage?.[key]
+      if (!entry) continue
+      const resetsAt = entry.resetsAt ? Date.parse(entry.resetsAt) : 0
+      meters.push(
+        meterOf(key, labels[key]!, num(entry.percent), {
+          ...(Number.isFinite(resetsAt) && resetsAt > 0 ? { resetsAt } : {}),
+          limited: entry.status !== "ok" || num(entry.percent) >= 100,
+        }),
+      )
+    }
+    return { ...base, available: true, error: "", meters }
+  } catch {
+    return { ...base, available: false, error: "无法连接 OpenCode Go 额度接口", meters: [] }
+  }
+}
+
+async function traeQuota(id: string, name: string, value: Record<string, unknown>): Promise<QuotaProvider> {
+  const base = { id, name, source: "trae" }
+  const metadata = asRecord(value.metadata)
+  const v1 = metadata ? asRecord(metadata.v1) : undefined
+  const token = v1 ? text(v1.access) : ""
+  if (!token) return { ...base, available: false, error: "凭据里没有 Trae 访问令牌，请重新登录", meters: [] }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    Authorization: `Cloud-IDE-JWT ${token}`,
+    "X-Cloudide-Token": token,
+    "x-ide-token": token,
+    "x-uid": v1 ? text(v1.uid) : "",
+    "x-app-id": TRAE_APP_ID,
+    "x-device-id": v1 ? text(v1.deviceId) : "",
+    "x-machine-id": v1 ? text(v1.machineId) : "",
+    "x-app-version": "0.1.69",
+    "x-app-version-code": "20260917",
+    "x-ide-version": "0.1.69",
+    "x-ide-version-code": "20260917",
+    "x-ide-version-type": "stable",
+    "x-device-type": "windows",
+    "x-system-type": "Windows",
+  }
+  try {
+    const response = await fetch(TRAE_USAGE_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ require_usage: true, req_source: 0 }),
+      signal: AbortSignal.timeout(8_000),
+    })
+    if (response.status === 401) {
+      return { ...base, available: false, error: "Trae 登录已过期，请在插件里重新登录一次", meters: [] }
+    }
+    if (!response.ok) {
+      return { ...base, available: false, error: `Trae 额度暂不可用（HTTP ${response.status}）`, meters: [] }
+    }
+    const body = asRecord(await response.json())
+    if (!body) return { ...base, available: false, error: "Trae 额度返回无法解析", meters: [] }
+    const code = Number(body.code)
+    if (Number.isFinite(code) && code !== 0) {
+      return {
+        ...base,
+        available: false,
+        error: code === 1001 ? "Trae 登录需要刷新，请在插件里重新登录一次" : text(body.message) || "Trae 额度暂不可用",
+        meters: [],
+      }
+    }
+    const credits = traeCredits(body)
+    const plan = body.is_credits_billing ? "Credits" : "Free"
+    if (credits.unlimited) {
+      return {
+        ...base,
+        available: true,
+        error: "",
+        plan,
+        note: "额度不限量",
+        meters: [meterOf("credits", "Credits", 0, { unit: "credits", ...(credits.until ? { resetsAt: credits.until } : {}) })],
+      }
+    }
+    if (credits.limit <= 0) {
+      const note = id === "trae-cn-ent" ? "企业租户未暴露额度" : "该账号未暴露额度明细"
+      return { ...base, available: true, error: "", plan, note, meters: [] }
+    }
+    const percent = (credits.used / credits.limit) * 100
+    return {
+      ...base,
+      available: true,
+      error: "",
+      plan,
+      meters: [
+        meterOf("credits", "Credits", percent, {
+          used: credits.used,
+          limit: credits.limit,
+          unit: "credits",
+          ...(credits.until ? { resetsAt: credits.until } : {}),
+          limited: percent >= 100,
+        }),
+      ],
+    }
+  } catch {
+    return { ...base, available: false, error: "无法连接 Trae 额度接口", meters: [] }
+  }
+}
+
+async function qoderQuota(value: Record<string, unknown>): Promise<QuotaProvider> {
+  const base = { id: "qoder", name: "Qoder CN", source: "qoder" }
+  const token = text(value.access)
+  if (!token) return { ...base, available: false, error: "凭据里没有 Qoder 设备令牌，请重新登录", meters: [] }
+  const metadata = asRecord(value.metadata) ?? {}
+  const region = text(metadata.region) === "global" ? "global" : "cn"
+  const host = QODER_OPENAPI[region] ?? QODER_OPENAPI.cn!
+  try {
+    const response = await fetch(`${host}/sash/api/v2/me/usage`, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+        "Cosy-ClientType": "10",
+        "User-Agent": "Qoder",
+      },
+      signal: AbortSignal.timeout(8_000),
+    })
+    if (response.status === 401) {
+      return { ...base, available: false, error: "Qoder 令牌已过期，请在插件里刷新登录", meters: [] }
+    }
+    if (!response.ok) {
+      return { ...base, available: false, error: `Qoder 额度暂不可用（HTTP ${response.status}）`, meters: [] }
+    }
+    const body = asRecord(await response.json())
+    const usage = body ? asRecord(body.qoderUsage) : undefined
+    if (!usage) return { ...base, available: false, error: text(body?.message) || "Qoder 额度返回无法解析", meters: [] }
+    const exceeded = usage.isQuotaExceeded === true
+    const meters: Meter[] = []
+    const push = (id: string, label: string, raw: unknown) => {
+      const quota = asRecord(raw)
+      if (!quota) return
+      const total = num(quota.total)
+      const used = num(quota.used)
+      if (total <= 0 && used <= 0) return
+      const percent = total > 0 ? (used / total) * 100 : num(quota.percentage) * 100
+      meters.push(
+        meterOf(id, label, percent, {
+          used,
+          ...(total > 0 ? { limit: total } : {}),
+          unit: text(quota.unit) || "credits",
+          limited: exceeded,
+        }),
+      )
+    }
+    push("planQuota", "套餐额度", usage.userQuota)
+    push("addOnQuota", "加油包", usage.addOnQuota)
+    const plan = text(usage.userType)
+    return {
+      ...base,
+      available: true,
+      error: "",
+      ...(plan ? { plan } : {}),
+      ...(meters.length === 0 ? { note: "该账号未暴露额度明细" } : {}),
+      meters,
+    }
+  } catch {
+    return { ...base, available: false, error: "无法连接 Qoder 额度接口", meters: [] }
+  }
 }
 
 function clip(value: string, limit: number): { text: string; truncated: boolean } {
@@ -985,85 +1259,47 @@ export class UsageStore {
     if (!db) {
       return {
         available: false,
-        source: "none",
         error: this.dbError || "数据库不可用",
+        providers: [],
       }
     }
-    const row = db
+    const rows = db
       .query<Row>(
-        "SELECT value FROM credential WHERE integration_id = 'opencode-go' ORDER BY active DESC, time_updated DESC LIMIT 1",
+        "SELECT integration_id, value FROM credential WHERE integration_id IN ('opencode-go', 'trae-cn', 'trae-cn-ent', 'qoder') ORDER BY active DESC, time_updated DESC",
       )
-      .get()
-    const value = row?.value ? parseJSON(String(row.value)) : undefined
-    const secret =
-      value?.type === "oauth"
-        ? text(value.access)
-        : value?.type === "key"
-          ? text(value.key)
-          : text(value?.access) || text(value?.key)
-    if (!secret) {
-      const value: Quota = {
-        available: false,
-        source: "none",
-        error: "未找到 OpenCode Go 凭据",
-      }
-      this.quotaCache = { at: Date.now(), value }
-      return value
+      .all()
+    // Keep only the newest active credential per provider (the query is
+    // already ordered), so a stale duplicate never shadows the live one.
+    const latest = new Map<string, Record<string, unknown>>()
+    for (const row of rows) {
+      const id = text(row.integration_id)
+      if (latest.has(id)) continue
+      const value = parseJSON(text(row.value))
+      if (value) latest.set(id, value)
     }
 
-    try {
-      const response = await fetch(GO_USAGE_URL, {
-        headers: {
-          authorization: `Bearer ${secret}`,
-          accept: "application/json",
-        },
-        signal: AbortSignal.timeout(8_000),
-      })
-      if (!response.ok) {
-        const value: Quota = {
-          available: false,
-          source: "zen/go",
-          error: `OpenCode Go 额度暂不可用（HTTP ${response.status}）`,
-        }
-        this.quotaCache = { at: Date.now(), value }
-        return value
-      }
-      const body = (await response.json()) as {
-        usage?: Record<string, { status?: string; percent?: number; resetsAt?: string }>
-      }
-      const parse = (key: string) => {
-        const entry = body.usage?.[key]
-        if (!entry) return undefined
-        const resetsAt = entry.resetsAt ? Date.parse(entry.resetsAt) : 0
-        return {
-          percent: num(entry.percent),
-          limited: entry.status !== "ok" || num(entry.percent) >= 100,
-          resetsAt: Number.isFinite(resetsAt) ? resetsAt : 0,
-        }
-      }
-      const rolling = parse("rolling")
-      const weekly = parse("weekly")
-      const monthly = parse("monthly")
-      const value: Quota = {
-        available: true,
-        source: "zen/go",
-        error: "",
-        ...(rolling ? { rolling } : {}),
-        ...(weekly ? { weekly } : {}),
-        ...(monthly ? { monthly } : {}),
-      }
-      this.quotaCache = { at: Date.now(), value }
-      return value
-    } catch (error) {
-      this.log("OpenCode Go quota request failed", error instanceof Error ? error.message : String(error))
-      const value: Quota = {
-        available: false,
-        source: "zen/go",
-        error: "无法连接 OpenCode Go 额度接口",
-      }
-      this.quotaCache = { at: Date.now(), value }
-      return value
+    const jobs: Promise<QuotaProvider>[] = []
+    const go = latest.get("opencode-go")
+    if (go) jobs.push(goQuota(go))
+    const personal = latest.get("trae-cn")
+    if (personal) jobs.push(traeQuota("trae-cn", "Trae CN 个人版", personal))
+    const enterprise = latest.get("trae-cn-ent")
+    if (enterprise) jobs.push(traeQuota("trae-cn-ent", "Trae CN 企业版", enterprise))
+    const qoder = latest.get("qoder")
+    if (qoder) jobs.push(qoderQuota(qoder))
+
+    const providers = await Promise.all(jobs)
+    for (const provider of providers) {
+      if (!provider.available && provider.error) this.log(`${provider.name} quota unavailable`, provider.error)
     }
+    const available = providers.some((provider) => provider.available)
+    const error =
+      available || providers.length === 0
+        ? ""
+        : providers.map((provider) => provider.error).find((message) => message) || "额度接口暂不可用"
+    const value: Quota = { available, error, providers }
+    this.quotaCache = { at: Date.now(), value }
+    return value
   }
 }
 

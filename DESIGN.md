@@ -12,7 +12,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 用量汇总 | Token、费用、请求数、缓存命中，按时间 / 模型 / 供应商 / 项目 / 会话聚合 |
-| 订阅量监控 | OpenCode Go 的滚动 5 小时、本周、本月额度；Console 预算；其他订阅可手动配置额度 |
+| 订阅量监控 | OpenCode Go 的滚动 5 小时、本周、本月额度；Trae CN（个人 / 企业）Credits；Qoder CN 套餐 + 加油包；统一抽象成 meters 列表 |
 | 时效监控 | 首字时延、总时延、输出速度、慢请求比例；OAuth / API Key 到期倒计时 |
 | 异常提醒 | 额度将尽、凭据将过期、费用异常、时延劣化、限流 / 重试、数据过期 |
 | 本地优先 | 默认只读本机数据，不上传会话内容；导出由用户主动触发 |
@@ -24,7 +24,7 @@
 ```text
 模型用量
 ├── 总览          KPI · Token 趋势 · 费用构成 · 模型分布 · 额度/时效/时延速览
-├── 额度与时效    Go 三档额度 · Console 预算 · 手动订阅 · 凭据到期时间线 · 重置倒计时
+├── 额度与时效    多供应商额度（Go 三档 · Trae Credits · Qoder）· 凭据到期时间线 · 重置倒计时
 ├── 时延          首字/总时延分位 · 模型对比 · 慢请求 · 限流/重试 · 错误率
 ├── 会话明细      按项目/模型/时间筛选 · 单会话展开 · 导出 CSV / JSON
 └── 设置          刷新频率 · 告警阈值 · 手动订阅 · 货币 · 数据保留
@@ -74,6 +74,8 @@
 | OpenCode Go 额度 | `ctx.client.experimental.usage.limits()` | 返回 `data.go.rolling / weekly / monthly`，含 percent、limited、resetsAt |
 | Console 预算 | 同上 `data.budgets` | limit / spent / per / models / vendors / resetsAt |
 | Go 额度兜底 | `GET https://opencode.ai/zen/go/v1/usage` | 已用 `opencode-go` 凭据实测 200，返回 rolling / weekly / monthly |
+| Trae 额度 | `POST https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage` | 读 `trae-cn` / `trae-cn-ent` 凭据 `metadata.v1` 的 Cloud-IDE-JWT；个人版返回 Credits 池，企业版返回空额度 |
+| Qoder 额度 | `GET https://openapi.qoder.com.cn/sash/api/v2/me/usage` | 读 `qoder` 凭据的 `access` 设备令牌；返回套餐额度与加油包 |
 | 凭据到期 | `ctx.client.credential.list()` | OAuth 的 `value.expires`；API Key 无到期时间 |
 | 实时时延 / 限流 | 服务端 `session.http.response` hook | 可读响应头、状态码；按请求配对 `http.request` 计算耗时 |
 | 历史时延 | 本地 `session_message` 的 `time.created / streamed / completed` | 公开 API 暂无历史分位；可选只读 DB 扫描 |
@@ -92,7 +94,9 @@
    - DB 扫描必须带 `time_created` 索引并缓存。
 4. 不同供应商的额度暴露程度不同。
    - OpenAI / Anthropic / OpenRouter 可尝试从 `x-ratelimit-*`、`anthropic-ratelimit-*`、`retry-after` 响应头读取。
-   - Trae / Qoder 等没有统一额度接口的，走“手动订阅 + 本地用量估算”。
+   - OpenCode Go（滚动 5 小时 / 本周 / 本月）、Trae CN（Credits 池）、Qoder CN（套餐 + 加油包）都有实测可用的额度接口，统一抽象成 `QuotaProvider.meters` 列表渲染。
+   - 企业版 Trae 只返回空额度，用 `note` 说明「企业租户未暴露额度」，不伪装成 Free。
+   - 凭据只读数据库、不实现刷新；token 失效时提示到对应插件里重新登录。
 
 ---
 
@@ -169,7 +173,7 @@ Server（Plugin.define）
 ### P0 · 已实现（0.1.0）
 
 - 总览：KPI、Token 趋势、模型分布、费用构成
-- 额度与时效：OpenCode Go 三档额度 + 重置倒计时、凭据到期列表
+- 额度与时效：OpenCode Go 三档额度、Trae CN（个人 / 企业）Credits、Qoder CN 套餐 + 加油包，多供应商 meters 列表 + 重置倒计时、凭据到期列表
 - 时延：首字 / 总时延分位、按模型 P95 对比、慢请求、输出速度
 - 会话明细：500 条、搜索、项目列、CSV 导出
 - 会话回放：按回合展开用户提示、模型请求、思考 / 回复、工具调用与缓存 / 时延 / 费用；长会话分页，支持会话内搜索与 CSV 导出
