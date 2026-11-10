@@ -1,5 +1,8 @@
 name: Publish to npm
 
+# Releases ship only from GitHub Actions: bump the version and push a `v*` tag.
+# `prepublishOnly` blocks local `npm publish`, so this workflow is the only path.
+#
 # Trusted Publishing:
 #   https://www.npmjs.com/package/opencode-usage-center/access
 #   Repository: meiyx7/opencode-usage-center
