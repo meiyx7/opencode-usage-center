@@ -278,6 +278,10 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
     if (all.length === 0) return undefined
     return all.reduce((worst, meter) => (meter.percent > worst.percent ? meter : worst), all[0]!)
   })
+  /** 大环展示的是“占用最高的那个窗口”，必须注明它属于哪家供应商。 */
+  const primaryOwner = createMemo(() =>
+    providers().find((provider) => provider.meters.some((meter) => meter === primary())),
+  )
   const ringPercent = () => Math.max(0, Math.min(100, primary()?.percent ?? 0))
   const ringColor = () => (ringPercent() >= 90 ? "var(--uc-red)" : ringPercent() >= 70 ? "var(--uc-amber)" : "var(--uc-accent)")
   const circumference = 2 * Math.PI * 36
@@ -287,13 +291,13 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
       <div class="uc-card-head">
         <div>
           <div class="uc-card-title">订阅额度</div>
-          <div class="uc-card-sub">多供应商 · 实时</div>
+          <div class="uc-card-sub">多供应商 · 供应商接口返回的当前用量</div>
         </div>
         <Show
           when={props.quota?.available}
           fallback={<span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>}
         >
-          <span class="uc-live"><i />LIVE</span>
+          <span class="uc-card-sub" style={{ "padding-top": "2px" }}>数据来自供应商接口</span>
         </Show>
       </div>
       <Show when={props.quota} fallback={<div class="uc-empty-line">正在读取额度…</div>}>
@@ -332,6 +336,10 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
                   </div>
                 </div>
                 <div class="uc-meters">
+                  <div class="uc-quota-ring-owner">
+                    占用最高的窗口：{primaryOwner()?.name ?? "未知供应商"}
+                    <Show when={primaryOwner()?.plan}> · {primaryOwner()!.plan}</Show>
+                  </div>
                   <For each={liveProviders()}>
                     {(provider) => (
                       <div class="uc-quota-provider">
@@ -380,8 +388,8 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
             <div class="uc-quota-note" data-tone={ringPercent() >= 90 ? "danger" : "muted"}>
               <i />
               {ringPercent() >= 90
-                ? "额度即将用完 · 重置前建议切换到按量模型"
-                : `${primary()!.label}已用 ${percent(ringPercent())} · 覆盖 ${liveProviders().length} 个供应商`}
+                ? `${primaryOwner()?.name ?? "该供应商"} ${primary()!.label}即将用完 · 重置前建议切换到按量模型`
+                : `${primaryOwner()?.name ?? ""} ${primary()!.label}已用 ${percent(ringPercent())} · 下方按供应商列出各自额度`}
             </div>
           </Show>
         </Show>
@@ -400,8 +408,8 @@ function ExpiryCard(props: { credentials: readonly CredentialRow[]; limit?: numb
     <section class="uc-card uc-expiry">
       <div class="uc-card-head">
         <div>
-          <div class="uc-card-title">订阅时效</div>
-          <div class="uc-card-sub">OAuth 与 API Key 到期时间</div>
+          <div class="uc-card-title">凭据有效期</div>
+          <div class="uc-card-sub">OAuth 登录与 API Key 的到期时间 · 不代表套餐到期</div>
         </div>
         <Show
           when={soon()}
@@ -552,7 +560,7 @@ function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow
             when={props.quota?.available}
             fallback={<span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>}
           >
-            <span class="uc-live"><i />LIVE</span>
+            <span class="uc-card-sub" style={{ "padding-top": "2px" }}>数据来自供应商接口</span>
           </Show>
         </div>
         <Show when={props.quota} fallback={<div class="uc-empty-line">正在读取额度…</div>}>
@@ -761,6 +769,8 @@ function SessionsTab(props: {
   ctx: Context
   sessions: readonly SessionRow[]
   projects: readonly ProjectRow[]
+  /** 当前统计范围的人类可读名称，用于说明搜索覆盖的会话集合。 */
+  rangeLabel: string
   selected?: SessionRow
   onSelect: (session: SessionRow) => void
   onClose: () => void
@@ -829,7 +839,9 @@ function SessionsTab(props: {
       <div class="uc-card-head">
         <div>
           <div class="uc-card-title">会话明细</div>
-          <div class="uc-card-sub">按最后活动时间排序 · 最多 500 条 · 点击会话查看每一轮请求、工具调用与缓存</div>
+          <div class="uc-card-sub">
+            按最后活动时间排序 · 搜索仅覆盖已载入的 {props.sessions.length} 条（统计范围：{props.rangeLabel}）· 点击会话查看完整历史
+          </div>
         </div>
         <button type="button" class="uc-export" title="导出当前筛选结果" onClick={exportCsv}>导出 CSV</button>
       </div>
@@ -883,7 +895,14 @@ function SessionsTab(props: {
                   {shortModel(session.modelID)}
                 </span>
                 <span>{compact(session.input + session.output)}</span>
-                <span>{session.cost > 0 ? money(session.cost) : <span class="uc-zero">$0</span>}</span>
+                <span>
+                  {session.cost > 0 ? (
+                    money(session.cost)
+                  ) : (
+                    /* $0 有多种可能：订阅内调用、免费模型或价格未记录——不给结论，只提示悬停说明。 */
+                    <span class="uc-zero" title="$0：可能是订阅内调用、免费模型，或该请求未记录价格。可在回放里看单次请求的计费说明。">$0</span>
+                  )}
+                </span>
                 <span class="uc-session-time">
                   {relativeTime(session.timeUpdated)}
                   <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
@@ -1358,6 +1377,7 @@ const CSS = `
 .uc-quota-provider + .uc-quota-provider { border-top: 1px dashed var(--uc-border); padding-top: 8px; }
 .uc-quota-provider-head { display: flex; align-items: baseline; gap: 6px; color: var(--uc-strong); font-size: 9.8px; font-weight: 650; }
 .uc-quota-provider-head small { color: var(--uc-faint); font-size: 9.5px; font-weight: 500; }
+.uc-quota-ring-owner { color: var(--uc-muted); font-size: 9.8px; font-weight: 600; margin-bottom: 6px; }
 .uc-quota-notes { display: flex; flex-direction: column; gap: 6px; min-height: 130px; justify-content: center; }
 .uc-meter-row { min-width: 0; }
 .uc-meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--uc-muted); font-size: 9.5px; }
@@ -2006,26 +2026,32 @@ function OverviewPanels(props: {
   onRetryQuota: () => void
   /** 「模型分布 → 全部 N 个」跳转模型页签。 */
   onOpenModels: () => void
-  /** 总览右栏「订阅时效」卡片的跳转目标。 */
+  /** 总览右栏「凭据有效期」卡片的跳转目标。 */
   onOpenQuota: () => void
 }) {
+  // 趋势图最多绘制最近 30 个数据点：范围更大时必须写明，不能让图和标题各说各的。
+  const trendScopeNote = () => {
+    const count = props.snapshot.series?.length ?? 0
+    if (count > 30) return `${props.rangeLabel}中，图示为最近 30 天`
+    return props.rangeLabel
+  }
   return (
     <>
         <div class="uc-kpis">
           <div class="uc-kpi">
-            <div class="uc-kpi-label"><i />总 Token</div>
+            <div class="uc-kpi-label"><i />输入输出 Token</div>
             <div class="uc-kpi-value">
               {compact(props.tokens)}
               <Show when={props.delta((point) => point.input + point.output)}>
                 {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                  <span class="uc-delta" title="与上一个等长周期对比" data-tone={value() >= 0 ? "up" : "down"}>
                     {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
                   </span>
                 )}
               </Show>
             </div>
             <div class="uc-kpi-sub">
-              输入 {compact(props.totals?.tokens.input ?? 0)} · 输出 {compact(props.totals?.tokens.output ?? 0)}
+              不含缓存读写 · 输入 {compact(props.totals?.tokens.input ?? 0)} · 输出 {compact(props.totals?.tokens.output ?? 0)}
             </div>
             <Sparkline
               values={(props.snapshot.series ?? []).map((point) => point.input + point.output)}
@@ -2040,7 +2066,7 @@ function OverviewPanels(props: {
                 {(value) => (
                   <span
                     class="uc-delta"
-                    title="与所选范围前半段对比 · 费用下降为好消息"
+                    title="与上一个等长周期对比 · 费用下降为好消息"
                     data-tone={value() > 0 ? "warn" : "down"}
                   >
                     {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(0)}%
@@ -2048,7 +2074,7 @@ function OverviewPanels(props: {
                 )}
               </Show>
             </div>
-            <div class="uc-kpi-sub">按量计费 · 不含订阅内调用</div>
+            <div class="uc-kpi-sub">按量计费 · 不含订阅内调用与未记录价格的请求</div>
             <Sparkline values={(props.snapshot.series ?? []).map((point) => point.cost)} color="var(--uc-amber)" />
           </div>
           <div class="uc-kpi">
@@ -2057,7 +2083,7 @@ function OverviewPanels(props: {
               {compact(props.totals?.requests ?? 0)}
               <Show when={props.delta((point) => point.requests)}>
                 {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                  <span class="uc-delta" title="与上一个等长周期对比" data-tone={value() >= 0 ? "up" : "down"}>
                     {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
                   </span>
                 )}
@@ -2074,7 +2100,7 @@ function OverviewPanels(props: {
               {percent(props.cacheHit, 1)}
               <Show when={cacheDeltaOf(props.snapshot.series)}>
                 {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                  <span class="uc-delta" title="与上一个等长周期对比" data-tone={value() >= 0 ? "up" : "down"}>
                     {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}pt
                   </span>
                 )}
@@ -2096,9 +2122,11 @@ function OverviewPanels(props: {
               <div class="uc-card-head">
                 <div>
                   <div class="uc-card-title">Token 趋势</div>
-                  <div class="uc-card-sub">有效 Token（输入 + 输出），不含缓存读取 · {props.rangeLabel}</div>
+                  <div class="uc-card-sub">
+                    输入 + 输出，不含缓存读写 · {trendScopeNote()}
+                  </div>
                 </div>
-                <div class="uc-legend"><i />有效 Token</div>
+                <div class="uc-legend"><i />输入输出 Token</div>
               </div>
               <div class="uc-trend-body">
                 <div class="uc-chart-wrap">
@@ -2163,7 +2191,13 @@ function OverviewPanels(props: {
                         </span>
                         <span>{compact(sumTokens(model))}</span>
                         <span>{compact(model.requests)}</span>
-                        <span>{model.cost > 0 ? money(model.cost) : <span class="uc-zero">$0</span>}</span>
+                        <span>
+                          {model.cost > 0 ? (
+                            money(model.cost)
+                          ) : (
+                            <span class="uc-zero" title="$0：可能是订阅内调用、免费模型，或该模型未记录价格。">$0</span>
+                          )}
+                        </span>
                       </div>
                     )}
                   </For>
@@ -2192,16 +2226,19 @@ function OverviewPanels(props: {
   )
 }
 
-/** 缓存命中率的半程对比，独立出来供 keep-alive 后的 OverviewPanels 使用。 */
+/** 缓存命中率的等长周期对比（上一个完整周期 vs 当前完整周期），与 KPI 的 delta 口径一致。 */
 function cacheDeltaOf(points: readonly SeriesPoint[]): number | undefined {
-  if (points.length < 4) return undefined
-  const mid = Math.floor(points.length / 2)
+  // 最近一个点通常是“今天”，还没结束，不参与比较。
+  const complete = points.slice(0, -1)
+  if (complete.length < 2) return undefined
+  const half = Math.floor(complete.length / 2)
+  if (half < 1) return undefined
   const calc = (list: readonly SeriesPoint[]) => {
     const input = list.reduce((sum, point) => sum + point.input, 0)
     const cache = list.reduce((sum, point) => sum + point.cacheRead, 0)
     return cache + input > 0 ? (cache / (cache + input)) * 100 : 0
   }
-  return calc(points.slice(mid)) - calc(points.slice(0, mid))
+  return calc(complete.slice(complete.length - half)) - calc(complete.slice(0, half))
 }
 
 export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
@@ -2226,6 +2263,9 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const [providerNames, setProviderNames] = createSignal(new Map<string, string>())
   /** 模型页签首次打开才拉 host 的模型/provider 目录，首屏不背这两次 RPC。 */
   const [hostDataDone, setHostDataDone] = createSignal(false)
+  /** 目录拉取状态：只有成功才算完成，失败保留错误并允许就地重试。 */
+  const [hostDataError, setHostDataError] = createSignal("")
+  const [hostDataLoading, setHostDataLoading] = createSignal(false)
   /** providerID:modelID → 最近 30 天真实请求，供模型页的「常用」区。声明顺序必须在 modelUsage 之前：esbuild 压缩后 const 无提升。 */
   const usageModels = () => snapshot()?.models ?? []
   const modelUsage = createMemo(() => {
@@ -2387,6 +2427,26 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     })
   })
 
+  /** 拉取模型/provider 目录；只有成功才标记完成，失败保留错误供就地重试。 */
+  async function loadHostData() {
+    if (hostDataLoading()) return
+    setHostDataLoading(true)
+    try {
+      const [modelList, providerList] = await Promise.all([
+        props.ctx.client.model.list(),
+        props.ctx.client.provider.list(),
+      ])
+      setRemoteModels(modelList.data)
+      setProviderNames(new Map(providerList.data.map((provider) => [provider.id, provider.name])))
+      setHostDataDone(true)
+      setHostDataError("")
+    } catch (cause) {
+      setHostDataError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setHostDataLoading(false)
+    }
+  }
+
   /** 切页签：记录访问过，首次进「模型」页签时才拉 host 的模型目录。 */
   function openTab(next: Tab) {
     if (tab() === next) return
@@ -2397,21 +2457,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       return nextSet
     })
     setTab(next)
-    if (next === "models" && !hostDataDone()) {
-      setHostDataDone(true)
-      void (async () => {
-        try {
-          const [modelList, providerList] = await Promise.all([
-            props.ctx.client.model.list(),
-            props.ctx.client.provider.list(),
-          ])
-          setRemoteModels(modelList.data)
-          setProviderNames(new Map(providerList.data.map((provider) => [provider.id, provider.name])))
-        } catch {
-          // 页签里会再显示具体错误
-        }
-      })()
-    }
+    if (next === "models" && !hostDataDone()) void loadHostData()
   }
 
   const totals = () => snapshot()?.totals
@@ -2437,11 +2483,20 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const maxCostModel = createMemo(() => costModels().find((model) => model.cost > 0))
   const tokenShare = (model: ModelRow) => (tokens() > 0 ? sumTokens(model) / tokens() : 0)
 
+  // 增减幅度与“上一个等长完整周期”比较，而不是把所选区间切成不等长的两半。
+  // 奇数天不再偏向后半段；最后一个数据点（可能是未结束的今天）不参与基期比较。
   const halves = <T,>(values: readonly T[], read: (value: T) => number): { first: number; second: number } | undefined => {
-    if (values.length < 4) return undefined
-    const mid = Math.floor(values.length / 2)
-    const first = values.slice(0, mid).reduce((sum, value) => sum + read(value), 0)
-    const second = values.slice(mid).reduce((sum, value) => sum + read(value), 0)
+    if (values.length < 3) return undefined
+    // 最近一个点通常是“今天”，还没结束，不作为比较对象。
+    const complete = values.slice(0, -1)
+    if (complete.length < 2) return undefined
+    const half = Math.floor(complete.length / 2)
+    if (half < 1) return undefined
+    const current = complete.slice(complete.length - half)
+    const previous = complete.slice(complete.length - half * 2, complete.length - half)
+    if (previous.length < half) return undefined
+    const first = previous.reduce((sum, value) => sum + read(value), 0)
+    const second = current.reduce((sum, value) => sum + read(value), 0)
     if (!Number.isFinite(first) || first <= 0) return undefined
     return { first, second }
   }
@@ -2484,7 +2539,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       return {
         title: `${expiring.provider} 凭据${tag.text === "已过期" ? "已过期" : "即将过期"}`,
         detail: `${expiring.type === "oauth" ? "OAuth" : "API Key"} ${tag.text === "已过期" ? "已经过期" : `${tag.text}后到期`}，建议提前重新登录。`,
-        action: "查看时效",
+        action: "查看凭据",
         target: "uc-expiry",
       }
     }
@@ -2740,6 +2795,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                       ctx={props.ctx}
                       sessions={sessions()}
                       projects={projects()}
+                      rangeLabel={rangeLabel()}
                       selected={detailSession()}
                       onSelect={setDetailSession}
                       onClose={() => setDetailSession(undefined)}
@@ -2749,12 +2805,31 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                     <IntegrationsPage ctx={props.ctx} />
                   </Match>
                   <Match when={item.id === "models"}>
-                    <ModelsExplorer
-                      ctx={props.ctx}
-                      models={remoteModels()}
-                      providerNames={providerNames()}
-                      usage={modelUsage()}
-                    />
+                    <Show
+                      when={!hostDataError()}
+                      fallback={
+                        <section class="uc-card">
+                          <div class="uc-quota-error">
+                            <span>模型目录加载失败：{hostDataError()}</span>
+                            <button
+                              type="button"
+                              class="uc-text-button"
+                              disabled={hostDataLoading()}
+                              onClick={() => void loadHostData()}
+                            >
+                              {hostDataLoading() ? "正在重试…" : "重试"}
+                            </button>
+                          </div>
+                        </section>
+                      }
+                    >
+                      <ModelsExplorer
+                        ctx={props.ctx}
+                        models={remoteModels()}
+                        providerNames={providerNames()}
+                        usage={modelUsage()}
+                      />
+                    </Show>
                   </Match>
                 </Switch>
               </Show>

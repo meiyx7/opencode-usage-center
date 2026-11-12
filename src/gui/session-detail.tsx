@@ -508,7 +508,7 @@ export function SessionDetailView(props: {
         <div class="uc-sd-title">
           <b title={title()}>{title()}</b>
           <span title={detail()?.directory}>
-            {projectLabel()} · 完整会话 · {dateText(detail()?.timeCreated || props.session.timeCreated)} ·{" "}
+            {projectLabel()} · 完整历史（不受统计时间范围限制） · {dateText(detail()?.timeCreated || props.session.timeCreated)} ·{" "}
             {providerName(detail()?.providerID || props.session.providerID)} /{" "}
             {shortModel(detail()?.modelID || props.session.modelID)}
           </span>

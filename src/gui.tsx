@@ -1,13 +1,19 @@
 import { Command, Plugin, SettingsPage, TitlebarItem } from "@opencode/plugin/gui"
+import { onCleanup } from "solid-js"
 import { UsageDialog, UsagePage } from "./gui/page"
 
 /**
  * OpenCode's vertical-tabs layout puts plugin titlebar items in a vertical
  * footer (`data-slot="vertical-tabs-footer"`) as 28px circles. With more than
  * one plugin that becomes a stack of unlabeled icons. The host has no
- * orientation option for TitlebarItem, so make that footer a wrapping row and
- * keep each item's own label visible. This applies to every plugin item in the
- * footer, including the plugin hub's.
+ * orientation option for TitlebarItem, so this shim asks the footer to become
+ * a wrapping row with visible labels.
+ *
+ * 边界（评审 U11）：这是一个兼容层，不是本插件自己的样式——它影响页脚里的
+ * 每一个插件入口，包括其他插件的。因此它：
+ * - 只在 `options.titlebarLayout !== false` 时安装（用户可用配置关闭）；
+ * - 卸载或重载时移除注入的 <style>，不留全局残留；
+ * - 仅读取宿主 data-slot，不改写其他插件自己的 DOM。
  */
 const TITLEBAR_CSS = `
 [data-slot="vertical-tabs-footer"] {
@@ -34,13 +40,18 @@ const TITLEBAR_CSS = `
 }
 `
 
-function installTitlebarLayout() {
+const TITLEBAR_STYLE_ID = "opencode-plugin-titlebar-row"
+
+function installTitlebarLayout(enabled: boolean): void {
   if (typeof document === "undefined") return
-  const id = "opencode-plugin-titlebar-row"
-  let style = document.getElementById(id) as HTMLStyleElement | null
+  let style = document.getElementById(TITLEBAR_STYLE_ID) as HTMLStyleElement | null
+  if (!enabled) {
+    style?.remove()
+    return
+  }
   if (!style) {
     style = document.createElement("style")
-    style.id = id
+    style.id = TITLEBAR_STYLE_ID
     document.head.appendChild(style)
   }
   style.textContent = TITLEBAR_CSS
@@ -48,7 +59,13 @@ function installTitlebarLayout() {
 
 export default Plugin.define({
   setup(ctx) {
-    installTitlebarLayout()
+    // 默认开启以保持现状；用户可在 opencode.json 里用 options.titlebarLayout: false 关闭。
+    const enabled = ctx.options.titlebarLayout !== false
+    installTitlebarLayout(enabled)
+    // 插件卸载/重载时清掉注入的全局样式，别的插件入口回到宿主默认布局。
+    if (enabled) {
+      onCleanup(() => installTitlebarLayout(false))
+    }
 
     // One entry point for the titlebar pill and the global shortcut: a standalone
     // x-large dialog, so the dashboard is not only a tab buried inside Settings.
