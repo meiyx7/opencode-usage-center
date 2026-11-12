@@ -1,7 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import type { ModelInfo } from "@opencode/client/promise"
-import { compact } from "./format"
+import { count } from "./format"
 
 /**
  * 模型浏览页。两个视角：
@@ -178,7 +178,7 @@ export function ModelsExplorer(props: {
                       <span>{props.providerNames.get(model.providerID) ?? model.providerID}</span>
                     </div>
                     <div class="uc-recent-stats">
-                      <b>{compact(requests)}</b>
+                      <b>{count(requests)}</b>
                       <span>次请求</span>
                     </div>
                   </div>
@@ -245,7 +245,7 @@ export function ModelsExplorer(props: {
                             <span class="uc-mp-lv-num" data-expensive={expensive(model) ? "true" : undefined}>
                               {costLabel(model)}
                             </span>
-                            <span class="uc-mp-lv-num">{usage ? `${compact(usage.requests)} 次` : "—"}</span>
+                            <span class="uc-mp-lv-num">{usage ? `${count(usage.requests)} 次` : "—"}</span>
                             <ui.IconButton
                               icon={hidden()[model.id] ? "eye" : "outline-eye-slash"}
                               label={hidden()[model.id] ? "取消隐藏标记" : "隐藏标记"}

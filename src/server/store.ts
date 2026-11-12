@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite"
-import { statSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, join } from "node:path"
 import type {
@@ -31,6 +31,13 @@ const QUOTA_CACHE_MS = 60_000
 const DETAIL_CACHE_MS = 60_000
 const DETAIL_CACHE_LIMIT = 4
 const DETAIL_PAGE = 60
+/**
+ * 逐日聚合缓存（冷启动优化的核心）。历史天的消息不会再变，把每天扫描 +
+ * JSON 提取的结果按天落盘；进程重启后 30 天快照 = 读 30 个小 JSON + 扫「今天」，
+ * 从 ~1.7s 降到几十毫秒。文件放 ~/.cache/opencode/usage-center/days/<scope>/。
+ */
+const DAY_CACHE_LIMIT = 600
+const DAY_FILE_MAX_BYTES = 32 * 1024 * 1024
 const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 /**
  * Trae CN serves the account's credit usage on its own API host. The
@@ -600,17 +607,242 @@ function blankTurn(
   }
 }
 
+/**
+ * 一天的完整聚合结果。快照需要的所有维度都按天预算好：
+ * series 一点、models 各自累计、每会话用量、时延样本。
+ * 时延样本要保留原始值才能跨天合并算 P50/P95，这是文件体积的主体。
+ */
+type DayAgg = {
+  date: string
+  requests: number
+  cost: number
+  tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
+  /** providerID\0modelID → 聚合 */
+  models: Record<string, { providerID: string; modelID: string; requests: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }>
+  /** sessionID → 聚合 */
+  sessions: Record<string, { requests: number; cost: number; input: number; output: number; cacheRead: number; providerID: string; modelID: string }>
+  /** 每个样本 [ttft, total, output]，保留原值供跨天分位数计算 */
+  latency: [number, number, number][]
+  /** 每个模型的时延样本：modelKey → [providerID, modelID, samples[]] */
+  latencyByModel: Record<string, { providerID: string; modelID: string; samples: [number, number, number][] }>
+  prompts: number
+  /** 聚合当天的全类型消息总数，用于回退检测 */
+  baseCount?: number
+}
+
+/** 纯函数：把一天的消息行聚合成 DayAgg。输入输出与数据库解耦，便于缓存。 */
+function aggregateDay(date: string, rows: Row[]): DayAgg {
+  const models: DayAgg["models"] = {}
+  const sessions: DayAgg["sessions"] = {}
+  const latency: [number, number, number][] = []
+  const latencyByModel: DayAgg["latencyByModel"] = {}
+  const tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
+  let cost = 0
+  let requests = 0
+  let prompts = 0
+  for (const row of rows) {
+    const providerID = text(row.providerID) || "unknown"
+    const modelID = text(row.modelID) || "unknown"
+    if (row.type === "user") {
+      // user 行只贡献 prompts 计数；requests/token/模型/会话/时延都只看 assistant。
+      prompts += 1
+      continue
+    }
+    const rowCost = num(row.cost)
+    const input = num(row.input)
+    const output = num(row.output)
+    const reasoning = num(row.reasoning)
+    const cacheRead = num(row.cacheRead)
+    const cacheWrite = num(row.cacheWrite)
+    // 到这里的全是 assistant 行：requests = 模型调用次数（与旧版 KPI 语义一致）。
+    requests += 1
+    cost += rowCost
+    tokens.input += input
+    tokens.output += output
+    tokens.reasoning += reasoning
+    tokens.cacheRead += cacheRead
+    tokens.cacheWrite += cacheWrite
+
+    const sessionID = text(row.sessionID)
+    const usage = sessions[sessionID] ?? {
+      requests: 0,
+      cost: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      providerID: "unknown",
+      modelID: "unknown",
+    }
+    usage.requests += 1
+    usage.cost += rowCost
+    usage.input += input
+    usage.output += output
+    usage.cacheRead += cacheRead
+    if (modelID !== "unknown") {
+      usage.providerID = providerID
+      usage.modelID = modelID
+    }
+    sessions[sessionID] = usage
+
+    const modelKey = `${providerID}\u0000${modelID}`
+    const model = models[modelKey] ?? {
+      providerID,
+      modelID,
+      requests: 0,
+      cost: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    }
+    model.requests += 1
+    model.cost += rowCost
+    model.input += input
+    model.output += output
+    model.cacheRead += cacheRead
+    model.cacheWrite += cacheWrite
+    models[modelKey] = model
+
+    const elapsed = num(row.elapsed)
+    if (row.type === "assistant" && elapsed >= 0.05) {
+      latency.push([num(row.ttft), elapsed, output])
+      const group = latencyByModel[modelKey] ?? { providerID, modelID, samples: [] as [number, number, number][] }
+      group.samples.push([num(row.ttft), elapsed, output])
+      latencyByModel[modelKey] = group
+    }
+  }
+  return { date, requests, cost, tokens, models, sessions, latency, latencyByModel, prompts }
+}
+
+/** 合并多天聚合。modelMap/sessionMap 可为传入的累计对象（增量合并）。 */
+function mergeDays(target: DayAgg, days: readonly DayAgg[]): DayAgg {
+  for (const day of days) {
+    target.requests += day.requests
+    target.cost += day.cost
+    target.prompts += day.prompts
+    target.tokens.input += day.tokens.input
+    target.tokens.output += day.tokens.output
+    target.tokens.reasoning += day.tokens.reasoning
+    target.tokens.cacheRead += day.tokens.cacheRead
+    target.tokens.cacheWrite += day.tokens.cacheWrite
+    for (const [key, model] of Object.entries(day.models)) {
+      const existing = target.models[key]
+      if (existing) {
+        existing.requests += model.requests
+        existing.cost += model.cost
+        existing.input += model.input
+        existing.output += model.output
+        existing.cacheRead += model.cacheRead
+        existing.cacheWrite += model.cacheWrite
+      } else {
+        target.models[key] = { ...model }
+      }
+    }
+    for (const [key, session] of Object.entries(day.sessions)) {
+      const existing = target.sessions[key]
+      if (existing) {
+        existing.requests += session.requests
+        existing.cost += session.cost
+        existing.input += session.input
+        existing.output += session.output
+        existing.cacheRead += session.cacheRead
+        if (session.modelID !== "unknown") {
+          existing.providerID = session.providerID
+          existing.modelID = session.modelID
+        }
+      } else {
+        target.sessions[key] = { ...session }
+      }
+    }
+    target.latency.push(...day.latency)
+    for (const [key, group] of Object.entries(day.latencyByModel)) {
+      const existing = target.latencyByModel[key]
+      if (existing) existing.samples.push(...group.samples)
+      else target.latencyByModel[key] = { providerID: group.providerID, modelID: group.modelID, samples: [...group.samples] }
+    }
+  }
+  return target
+}
+
 export class UsageStore {
   private db?: Database
   private dbError = ""
   private cache = new Map<string, { at: number; value: Snapshot }>()
   private quotaCache?: { at: number; value: Quota }
   private sessionCache = new Map<string, { at: number; value: SessionDetail }>()
+  /** 逐日聚合的内存缓存：scope → (date → DayAgg)。 */
+  private dayMemory = new Map<string, Map<string, DayAgg>>()
 
   constructor(
     readonly path: string,
     private readonly log: (message: string, detail?: unknown) => void = () => {},
   ) {}
+
+  private dayCacheDir(scope: string): string {
+    return join(
+      process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+      "opencode",
+      "usage-center",
+      "days",
+      scope.replace(/[^a-zA-Z0-9_-]/g, "_") || "all",
+    )
+  }
+
+  private dayFilePath(scope: string, date: string): string {
+    return join(this.dayCacheDir(scope), `${date}.json`)
+  }
+
+  /** 读一天的落盘聚合。文件损坏即删除并返回 undefined。 */
+  private readDay(scope: string, date: string): DayAgg | undefined {
+    try {
+      const file = this.dayFilePath(scope, date)
+      if (!existsSync(file)) return undefined
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as DayAgg
+      if (parsed.date !== date || !Array.isArray(parsed.latency)) {
+        unlinkSync(file)
+        return undefined
+      }
+      return parsed
+    } catch {
+      try {
+        unlinkSync(this.dayFilePath(scope, date))
+      } catch {
+        // 读不出来也删不掉就随它去
+      }
+      return undefined
+    }
+  }
+
+  private writeDay(scope: string, day: DayAgg): void {
+    try {
+      const body = JSON.stringify(day)
+      if (body.length > DAY_FILE_MAX_BYTES) return
+      const dir = this.dayCacheDir(scope)
+      mkdirSync(dir, { recursive: true })
+      const file = this.dayFilePath(scope, day.date)
+      // 先写临时文件再同步改名，避免半截 JSON 被下一次冷启动读到。
+      const tmp = `${file}.${process.pid}.tmp`
+      writeFileSync(tmp, body)
+      renameSync(tmp, file)
+    } catch {
+      // 磁盘缓存失败不影响主流程
+    }
+  }
+
+  /** 内存里记一天，超限淘汰最早的日期。 */
+  private rememberDay(scope: string, day: DayAgg): void {
+    let map = this.dayMemory.get(scope)
+    if (!map) {
+      map = new Map()
+      this.dayMemory.set(scope, map)
+    }
+    map.set(day.date, day)
+    while (map.size > DAY_CACHE_LIMIT) {
+      const oldest = map.keys().next().value
+      if (!oldest) break
+      map.delete(oldest)
+    }
+  }
 
   close(): void {
     this.db?.close()
@@ -618,6 +850,7 @@ export class UsageStore {
     this.cache.clear()
     this.quotaCache = undefined
     this.sessionCache.clear()
+    this.dayMemory.clear()
   }
 
   private rememberSnapshot(key: string, value: Snapshot): void {
@@ -656,6 +889,87 @@ export class UsageStore {
     }
   }
 
+  /**
+   * 逐日聚合的查询范围。key 决定缓存命名空间：
+   * 项目的消息挂在 project 维度上，所以 scope = 项目 id 或 "all"。
+   */
+  private scopeOf(projectID?: string): string {
+    const project = projectID?.trim()
+    return project || "all"
+  }
+
+  /** 一天的本地毫秒区间。 */
+  private dayBounds(date: string): { from: number; to: number } {
+    const start = new Date(`${date}T00:00:00`)
+    const from = start.getTime()
+    return { from, to: from + DAY }
+  }
+
+  /** 取一天的聚合：内存 → 磁盘 → 现算。今天总是现算（消息还在增长）。 */
+  private dayAgg(db: Database, scope: string, date: string, today: string): DayAgg {
+    const memory = this.dayMemory.get(scope)?.get(date)
+    if (memory && date !== today) return memory
+    if (date !== today) {
+      const disk = this.readDay(scope, date)
+      if (disk) {
+        // 回退/删会话会减少历史消息；数量对不上就丢弃缓存重算。
+        const count = this.dayCount(db, scope, date)
+        if (disk.baseCount === undefined) disk.baseCount = count
+        if (count === disk.baseCount) {
+          this.rememberDay(scope, disk)
+          return disk
+        }
+        this.log("day cache invalidated (count drift)", `${scope}/${date}: ${disk.baseCount} -> ${count}`)
+      }
+    }
+
+    const { from, to } = this.dayBounds(date)
+    const rows = db
+      .query<Row>(
+        `SELECT
+           m.session_id AS sessionID,
+           m.type AS type,
+           coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
+           coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
+           coalesce(json_extract(m.data, '$.cost'), 0) AS cost,
+           coalesce(json_extract(m.data, '$.tokens.input'), 0) AS input,
+           coalesce(json_extract(m.data, '$.tokens.output'), 0) AS output,
+           coalesce(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning,
+           coalesce(json_extract(m.data, '$.tokens.cache.read'), 0) AS cacheRead,
+           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0) AS cacheWrite,
+           (json_extract(m.data, '$.time.streamed') - json_extract(m.data, '$.time.created')) / 1000.0 AS ttft,
+           (json_extract(m.data, '$.time.completed') - json_extract(m.data, '$.time.created')) / 1000.0 AS elapsed
+         FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+         WHERE m.time_created >= ? AND m.time_created < ?${scope !== "all" ? " AND s.project_id = ?" : ""}
+           AND m.type IN ('assistant', 'user')`,
+      )
+      .all(...(scope !== "all" ? [from, to, scope] : [from, to]))
+    const day = aggregateDay(date, rows)
+    day.baseCount = this.dayCount(db, scope, date)
+    this.rememberDay(scope, day)
+    // 今天的数据还会变，落盘要等它结束；历史天直接落盘。
+    if (date !== today) this.writeDay(scope, day)
+    return day
+  }
+
+  /**
+   * 历史天的缓存可信度校验：回退（revert）会删掉旧消息，让缓存聚合偏大。
+   * 每天只做一次 count(*)（有索引，毫秒级）；数量对不上就作废重算。
+   * count 含全部消息类型，与聚合行的差值在同一天内是稳定的，所以把
+   * 首次聚合时的基准也存进文件里对比。
+   */
+  private dayCount(db: Database, scope: string, date: string): number {
+    const { from, to } = this.dayBounds(date)
+    return num(
+      db
+        .query<Row>(
+          `SELECT count(*) AS n FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+           WHERE m.time_created >= ? AND m.time_created < ?${scope !== "all" ? " AND s.project_id = ?" : ""}`,
+        )
+        .get(...(scope !== "all" ? [from, to, scope] : [from, to]))?.n,
+    )
+  }
+
   snapshot(input: SnapshotInput): Snapshot {
     const key = `${Math.floor(input.from / 60_000)}|${Math.floor(input.to / 60_000)}|${input.projectID ?? ""}`
     const cached = this.cache.get(key)
@@ -670,161 +984,77 @@ export class UsageStore {
       return value
     }
 
-    const params: unknown[] = [input.from, input.to]
-    const project = input.projectID?.trim()
-    let scope = ""
-    if (project) {
-      scope = " AND s.project_id = ?"
-      params.push(project)
-    }
-    const where = `m.type = 'assistant' AND m.time_created >= ? AND m.time_created < ?${scope}`
-    const joined = `FROM session_message m JOIN session_v2 s ON s.id = m.session_id`
-    const prompts = project
-      ? `SELECT count(*) AS n ${joined} WHERE m.type = 'user' AND m.time_created >= ? AND m.time_created < ? AND s.project_id = ?`
-      : `SELECT count(*) AS n ${joined} WHERE m.type = 'user' AND m.time_created >= ? AND m.time_created < ?`
+    const scope = this.scopeOf(input.projectID)
+    const today = localDate(Date.now())
 
-    const promptRow = db
-      .query<Row>(prompts)
-      .get(...(project ? [input.from, input.to, project] : [input.from, input.to]))
-
-    const totalParams = project ? [input.from, input.to, project] : [input.from, input.to]
-    // One scan, one JSON extraction set. The previous version scanned the same
-    // messages four times (totals, series, models, latency), which dominated the
-    // cold-load cost on a multi-hundred-megabyte database.
-    const messageRows = db
-      .query<Row>(
-        `SELECT
-           m.session_id AS sessionID,
-           m.time_created AS timeCreated,
-           coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
-           coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
-           coalesce(json_extract(m.data, '$.cost'), 0) AS cost,
-           coalesce(json_extract(m.data, '$.tokens.input'), 0) AS input,
-           coalesce(json_extract(m.data, '$.tokens.output'), 0) AS output,
-           coalesce(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning,
-           coalesce(json_extract(m.data, '$.tokens.cache.read'), 0) AS cacheRead,
-           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0) AS cacheWrite,
-           (json_extract(m.data, '$.time.streamed') - json_extract(m.data, '$.time.created')) / 1000.0 AS ttft,
-           (json_extract(m.data, '$.time.completed') - json_extract(m.data, '$.time.created')) / 1000.0 AS elapsed
-         ${joined} WHERE ${where}`,
-      )
-      .all(...totalParams)
-
-    type SeriesAgg = {
-      date: string
-      requests: number
-      cost: number
-      input: number
-      output: number
-      cacheRead: number
-    }
-    type ModelAgg = {
-      providerID: string
-      modelID: string
-      requests: number
-      cost: number
-      input: number
-      output: number
-      cacheRead: number
-      cacheWrite: number
+    // 找出范围覆盖的每一天，逐日取聚合（历史天走缓存，只有今天现算）。
+    const firstDay = input.from === 0 ? undefined : localDate(input.from)
+    const lastDay = localDate(Math.min(input.to, Date.now()))
+    const dates: string[] = []
+    if (firstDay) {
+      let cursor = firstDay
+      let guard = 0
+      while (cursor <= lastDay && guard < 400) {
+        dates.push(cursor)
+        cursor = nextDate(cursor)
+        guard += 1
+      }
+    } else {
+      // 「全部」范围没有明确的起点：先查数据库里最早的消息日期。
+      const scopeFilter = scope !== "all" ? " AND s.project_id = ?" : ""
+      const earliest = db
+        .query<Row>(
+          `SELECT min(m.time_created) AS t FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+           WHERE m.type = 'assistant'${scopeFilter}`,
+        )
+        .get(...(scope !== "all" ? [scope] : []))
+      const earliestTime = num(earliest?.t)
+      if (earliestTime > 0) {
+        let cursor = localDate(earliestTime)
+        let guard = 0
+        while (cursor <= lastDay && guard < 400) {
+          dates.push(cursor)
+          cursor = nextDate(cursor)
+          guard += 1
+        }
+      }
     }
 
-    type SessionAgg = {
-      requests: number
-      cost: number
-      input: number
-      output: number
-      cacheRead: number
-      providerID: string
-      modelID: string
-    }
-
-    const sessionSet = new Set<string>()
-    const sessionUsage = new Map<string, SessionAgg>()
-    const seriesMap = new Map<string, SeriesAgg>()
-    const modelMap = new Map<string, ModelAgg>()
-    const latencySamples: LatencySample[] = []
-    const latencyGroups = new Map<string, { providerID: string; modelID: string; rows: LatencySample[] }>()
-    const tokenTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
-    let totalCost = 0
-
-    for (const row of messageRows) {
-      const providerID = text(row.providerID) || "unknown"
-      const modelID = text(row.modelID) || "unknown"
-      const cost = num(row.cost)
-      const input = num(row.input)
-      const output = num(row.output)
-      const reasoning = num(row.reasoning)
-      const cacheRead = num(row.cacheRead)
-      const cacheWrite = num(row.cacheWrite)
-
-      const sessionID = text(row.sessionID)
-      sessionSet.add(sessionID)
-      const usage = sessionUsage.get(sessionID) ?? {
+    const total = mergeDays(
+      {
+        date: `${firstDay ?? "all"}~${lastDay}`,
         requests: 0,
         cost: 0,
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        providerID: "unknown",
-        modelID: "unknown",
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        models: {},
+        sessions: {},
+        latency: [],
+        latencyByModel: {},
+        prompts: 0,
+      },
+      dates.map((date) => this.dayAgg(db, scope, date, today)),
+    )
+
+    const series: SeriesPoint[] = dates.map((date) => {
+      const day = this.dayMemory.get(scope)?.get(date)
+      return {
+        date,
+        requests: day?.requests ?? 0,
+        cost: day?.cost ?? 0,
+        input: day?.tokens.input ?? 0,
+        output: day?.tokens.output ?? 0,
+        cacheRead: day?.tokens.cacheRead ?? 0,
       }
-      usage.requests += 1
-      usage.cost += cost
-      usage.input += input
-      usage.output += output
-      usage.cacheRead += cacheRead
-      if (modelID !== "unknown") {
-        usage.providerID = providerID
-        usage.modelID = modelID
-      }
-      sessionUsage.set(sessionID, usage)
-      totalCost += cost
-      tokenTotals.input += input
-      tokenTotals.output += output
-      tokenTotals.reasoning += reasoning
-      tokenTotals.cacheRead += cacheRead
-      tokenTotals.cacheWrite += cacheWrite
-
-      const date = localDate(num(row.timeCreated))
-      const point = seriesMap.get(date) ?? { date, requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0 }
-      point.requests += 1
-      point.cost += cost
-      point.input += input
-      point.output += output
-      point.cacheRead += cacheRead
-      seriesMap.set(date, point)
-
-      const modelKey = `${providerID}\u0000${modelID}`
-      const model =
-        modelMap.get(modelKey) ??
-        { providerID, modelID, requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-      model.requests += 1
-      model.cost += cost
-      model.input += input
-      model.output += output
-      model.cacheRead += cacheRead
-      model.cacheWrite += cacheWrite
-      modelMap.set(modelKey, model)
-
-      const elapsed = num(row.elapsed)
-      if (elapsed >= 0.05) {
-        const sample: LatencySample = { ttft: num(row.ttft), total: elapsed, output }
-        latencySamples.push(sample)
-        const group = latencyGroups.get(modelKey) ?? { providerID, modelID, rows: [] }
-        group.rows.push(sample)
-        latencyGroups.set(modelKey, group)
-      }
-    }
-
-    const series: SeriesPoint[] = [...seriesMap.values()].sort((a, b) => a.date.localeCompare(b.date))
-    const models: ModelRow[] = [...modelMap.values()].sort(
+    })
+    const models: ModelRow[] = Object.values(total.models).sort(
       (a, b) => b.input + b.output - (a.input + a.output),
     )
-    const latency = latencyStats(latencySamples)
-    const latencyModels: LatencyModelRow[] = [...latencyGroups.values()]
+    const latency = latencyStats(total.latency.map(([ttft, t, output]) => ({ ttft, total: t, output })))
+    const latencyModels: LatencyModelRow[] = Object.values(total.latencyByModel)
       .map((group) => {
-        const { maxTotal: _maxTotal, ...stats } = latencyStats(group.rows)
+        const { maxTotal: _maxTotal, ...stats } = latencyStats(
+          group.samples.map(([ttft, t, output]) => ({ ttft, total: t, output })),
+        )
         return {
           providerID: group.providerID,
           modelID: group.modelID,
@@ -838,16 +1068,16 @@ export class UsageStore {
         `SELECT id, title, project_id, model, cost, tokens_input, tokens_output, tokens_cache_read,
                 time_created, time_updated
          FROM session_v2
-         WHERE time_updated >= ? AND time_updated <= ?${project ? " AND project_id = ?" : ""}
+         WHERE time_updated >= ? AND time_updated <= ?${scope !== "all" ? " AND project_id = ?" : ""}
          ORDER BY time_updated DESC LIMIT 500`,
       )
-      .all(...(project ? [input.from, input.to, project] : [input.from, input.to]))
+      .all(...(scope !== "all" ? [input.from, input.to, scope] : [input.from, input.to]))
 
     const sessions: SessionRow[] = sessionRows.map((row) => {
       const model = row.model ? parseJSON(String(row.model)) : undefined
       // session_v2 stores lifetime totals. The list is filtered to the selected
       // time range, so use the aggregate of messages that actually fall inside it.
-      const usage = sessionUsage.get(text(row.id))
+      const usage = total.sessions[text(row.id)]
       return {
         id: text(row.id),
         title: text(row.title) || "未命名会话",
@@ -872,13 +1102,13 @@ export class UsageStore {
       range: { from: input.from, to: input.to },
       database: this.fileInfo(),
       totals: {
-        requests: messageRows.length,
-        sessions: sessionSet.size,
-        prompts: num(promptRow?.n),
+        requests: total.requests,
+        sessions: Object.keys(total.sessions).length,
+        prompts: total.prompts,
         activeDays: days.length,
-        streak: activeStreak(days, localDate(Date.now())),
-        cost: totalCost,
-        tokens: tokenTotals,
+        streak: activeStreak(days, today),
+        cost: total.cost,
+        tokens: total.tokens,
       },
       series: filled,
       models,

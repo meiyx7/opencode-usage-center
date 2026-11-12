@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, Switch, Match } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import { Usage } from "../contract"
 import type { CredentialRow, LatencyModelRow, Meter, ModelRow, ProjectRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
@@ -36,6 +36,13 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "integrations", label: "凭据" },
   { id: "models", label: "模型" },
 ]
+
+/** What each tab badge means, in plain words. Shown as the tab's title tooltip. */
+function tabHint(id: Tab, quotaAlert: boolean, latencyAlert: boolean): string {
+  if (id === "quota" && quotaAlert) return "额度与时效 · 红点：某项订阅额度已用 ≥90%"
+  if (id === "latency" && latencyAlert) return "时延 · 黄点：首字 P95 超过 30 秒，值得留意"
+  return TABS.find((tab) => tab.id === id)?.label ?? ""
+}
 
 type CachedView = { snapshot: Snapshot; quota?: Quota; at: number }
 const VIEW_CACHE = new Map<string, CachedView>()
@@ -383,8 +390,12 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
   )
 }
 
-function ExpiryCard(props: { credentials: readonly CredentialRow[]; limit?: number }) {
+function ExpiryCard(props: { credentials: readonly CredentialRow[]; limit?: number; onOpenQuota?: () => void }) {
   const rows = createMemo(() => props.credentials.slice(0, props.limit ?? 3))
+  /** 首行快要过期时卡片给出醒目提示，平时是安静的辅助文案。 */
+  const soon = createMemo(() =>
+    rows().find((credential) => credential.expires && credential.expires - Date.now() < 14 * 86_400_000),
+  )
   return (
     <section class="uc-card uc-expiry">
       <div class="uc-card-head">
@@ -392,7 +403,16 @@ function ExpiryCard(props: { credentials: readonly CredentialRow[]; limit?: numb
           <div class="uc-card-title">订阅时效</div>
           <div class="uc-card-sub">OAuth 与 API Key 到期时间</div>
         </div>
-        <span class="uc-card-link">自动检查</span>
+        <Show
+          when={soon()}
+          fallback={<span class="uc-card-sub" style={{ "padding-top": "2px" }}>{rows().length} 个凭据</span>}
+        >
+          {(credential) => (
+            <button type="button" class="uc-card-link" data-tone="warn" onClick={props.onOpenQuota} title="查看全部凭据与登录状态">
+              {expiryLabel(credential().expires).text}内到期 <span>→</span>
+            </button>
+          )}
+        </Show>
       </div>
       <Show when={rows().length > 0} fallback={<div class="uc-empty-line">未发现可监控的凭据</div>}>
         <div class="uc-exp-list">
@@ -746,6 +766,8 @@ function SessionsTab(props: {
   onClose: () => void
 }) {
   const [query, setQuery] = createSignal("")
+  /** 一次只渲染一部分行：500 行 DOM 一次性挂上会拖慢首次切到本页签的速度。 */
+  const [visibleCount, setVisibleCount] = createSignal(80)
   let listScroll = 0
   const projectName = (id: string) => props.projects.find((project) => project.id === id)?.name ?? "未命名项目"
   const filtered = createMemo(() => {
@@ -757,6 +779,12 @@ function SessionsTab(props: {
         .toLowerCase()
         .includes(value),
     )
+  })
+  const visibleSessions = createMemo(() => filtered().slice(0, visibleCount()))
+  // 搜索词或数据集变化后回到首批；副作用放在 createEffect 而不是 memo 里。
+  createEffect(() => {
+    void filtered()
+    setVisibleCount(80)
   })
 
   function openSession(session: SessionRow, event: MouseEvent | KeyboardEvent) {
@@ -834,7 +862,7 @@ function SessionsTab(props: {
             })
           }}
         >
-          <For each={filtered()}>
+          <For each={visibleSessions()}>
             {(session) => (
               <div
                 class="uc-session-row"
@@ -866,6 +894,15 @@ function SessionsTab(props: {
             )}
           </For>
         </div>
+        <Show when={filtered().length > visibleSessions().length}>
+          <button
+            type="button"
+            class="uc-session-more"
+            onClick={() => setVisibleCount((count) => count + 120)}
+          >
+            显示更多（还有 {filtered().length - visibleSessions().length} 条）
+          </button>
+        </Show>
       </Show>
         </section>
       }
@@ -1003,7 +1040,7 @@ const CSS = `
   color: var(--uc-muted);
   font-size: 10.5px;
   font-weight: 560;
-  cursor: default;
+  cursor: pointer;
   white-space: nowrap;
 }
 .uc-seg button.uc-seg-on {
@@ -1047,7 +1084,7 @@ const CSS = `
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  cursor: default;
+  cursor: pointer;
 }
 .uc-tab[data-active="true"] { color: var(--uc-strong); font-weight: 650; }
 .uc-tab[data-active="true"]::after {
@@ -1099,9 +1136,24 @@ const CSS = `
   font-size: 10.5px;
   font-weight: 620;
   white-space: nowrap;
-  cursor: default;
+  cursor: pointer;
 }
 .uc-alert-link span { margin-left: 3px; }
+.uc-alert-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.uc-alert-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+.uc-alert-close svg { width: 10px; height: 10px; }
 .uc-notice {
   display: flex;
   align-items: center;
@@ -1121,7 +1173,7 @@ const CSS = `
   color: var(--uc-accent);
   font-size: 10.5px;
   font-weight: 620;
-  cursor: default;
+  cursor: pointer;
   white-space: nowrap;
 }
 
@@ -1186,8 +1238,21 @@ const CSS = `
 .uc-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .uc-card-title { font-size: 12px; font-weight: 660; letter-spacing: -0.01em; }
 .uc-card-sub { margin-top: 2px; color: var(--uc-faint); font-size: 10px; }
-.uc-card-link { color: var(--uc-accent); font-size: 10px; font-weight: 620; white-space: nowrap; padding-top: 2px; }
-.uc-card-link span { margin-left: 2px; }
+.uc-card-link {
+  border: 0;
+  background: transparent;
+  padding: 2px 0;
+  color: var(--uc-accent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 620;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.uc-card-link:hover span { transform: translateX(1px); }
+.uc-card-link span { display: inline-block; margin-left: 2px; transition: transform 0.12s ease; }
+.uc-card-link[data-tone="warn"] { color: var(--uc-amber); }
+.uc-card-link:focus-visible { outline: 2px solid color-mix(in srgb, var(--uc-accent) 45%, transparent); outline-offset: 2px; border-radius: 4px; }
 .uc-legend { display: flex; align-items: center; gap: 5px; color: var(--uc-muted); font-size: 9.8px; }
 .uc-legend i { width: 7px; height: 7px; border-radius: 2px; background: var(--uc-accent); }
 
@@ -1206,7 +1271,7 @@ const CSS = `
 .uc-donut svg { width: 92px; height: 92px; }
 .uc-donut-center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
 .uc-donut-center b { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-.uc-donut-center span { color: var(--uc-faint); font-size: 9px; margin-top: 1px; }
+.uc-donut-center span { color: var(--uc-faint); font-size: 10px; margin-top: 1px; }
 .uc-cost-legend { display: flex; flex-direction: column; gap: 5px; }
 .uc-cost-item { display: flex; align-items: center; gap: 6px; font-size: 9.6px; color: var(--uc-muted); min-width: 0; }
 .uc-cost-item i { width: 6px; height: 6px; border-radius: 2px; flex: 0 0 auto; }
@@ -1217,7 +1282,7 @@ const CSS = `
   padding-top: 8px;
   border-top: 1px dashed var(--uc-border);
   color: var(--uc-faint);
-  font-size: 9.2px;
+  font-size: 10px;
   line-height: 1.5;
 }
 .uc-cost-note b { color: var(--uc-amber); font-weight: 660; }
@@ -1232,7 +1297,7 @@ const CSS = `
 }
 .uc-model-head {
   color: var(--uc-faint);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.02em;
   padding-bottom: 5px;
   border-bottom: 1px solid var(--uc-border);
@@ -1256,40 +1321,52 @@ const CSS = `
 }
 .uc-model-text { min-width: 0; display: block; }
 .uc-model-title { display: block; font-size: 10.8px; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.uc-model-provider { display: block; color: var(--uc-faint); font-size: 9px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.uc-model-provider { display: block; color: var(--uc-faint); font-size: 10px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .uc-share { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .uc-share-bar { width: 34px; height: 3px; border-radius: 99px; background: var(--uc-track); overflow: hidden; }
 .uc-share-bar i { display: block; height: 100%; border-radius: 99px; background: var(--uc-accent); }
 .uc-zero { color: var(--uc-faint); }
-.uc-model-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--uc-border); padding-top: 6px; color: var(--uc-faint); font-size: 9px; margin-top: auto; }
+.uc-model-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--uc-border); padding-top: 6px; color: var(--uc-faint); font-size: 10px; margin-top: auto; }
 .uc-model-foot b { color: var(--uc-muted); font-weight: 620; }
+.uc-model-more {
+  border: 0;
+  background: transparent;
+  padding: 2px 0;
+  color: var(--uc-accent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 620;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.uc-model-more:hover { text-decoration: underline; }
 
 /* quota */
 .uc-quota { min-height: 238px; }
-.uc-badge { height: 17px; padding: 0 6px; border-radius: 4px; display: inline-flex; align-items: center; font-size: 8.8px; font-weight: 650; }
+.uc-badge { height: 17px; padding: 0 6px; border-radius: 4px; display: inline-flex; align-items: center; font-size: 9.5px; font-weight: 650; }
 .uc-badge-muted { color: var(--uc-faint); background: var(--uc-layer-2); }
-.uc-live { height: 17px; padding: 0 6px; border-radius: 4px; background: color-mix(in srgb, var(--uc-green) 9%, transparent); color: var(--uc-green); font-size: 8.8px; font-weight: 650; display: inline-flex; align-items: center; gap: 4px; }
+.uc-live { height: 17px; padding: 0 6px; border-radius: 4px; background: color-mix(in srgb, var(--uc-green) 9%, transparent); color: var(--uc-green); font-size: 9.5px; font-weight: 650; display: inline-flex; align-items: center; gap: 4px; }
 .uc-live i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
 .uc-quota-top { display: flex; align-items: center; gap: 16px; flex: 1; min-height: 0; }
 .uc-quota-donut { position: relative; width: 96px; height: 96px; flex: 0 0 auto; }
 .uc-quota-donut svg { width: 96px; height: 96px; }
 .uc-quota-center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
 .uc-quota-center b { font-size: 22px; font-weight: 700; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
-.uc-quota-center span { color: var(--uc-faint); font-size: 9px; margin-top: 1px; }
+.uc-quota-center span { color: var(--uc-faint); font-size: 10px; margin-top: 1px; }
 .uc-meters { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 9px; }
 .uc-quota-provider { display: flex; flex-direction: column; gap: 6px; }
 .uc-quota-provider + .uc-quota-provider { border-top: 1px dashed var(--uc-border); padding-top: 8px; }
 .uc-quota-provider-head { display: flex; align-items: baseline; gap: 6px; color: var(--uc-strong); font-size: 9.8px; font-weight: 650; }
-.uc-quota-provider-head small { color: var(--uc-faint); font-size: 8.4px; font-weight: 500; }
+.uc-quota-provider-head small { color: var(--uc-faint); font-size: 9.5px; font-weight: 500; }
 .uc-quota-notes { display: flex; flex-direction: column; gap: 6px; min-height: 130px; justify-content: center; }
 .uc-meter-row { min-width: 0; }
 .uc-meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--uc-muted); font-size: 9.5px; }
 .uc-meter-top span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-meter-top small { color: var(--uc-faint); font-size: 8.6px; margin-left: 5px; }
+.uc-meter-top small { color: var(--uc-faint); font-size: 9.5px; margin-left: 5px; }
 .uc-meter-top b { color: var(--uc-strong); font-size: 10.5px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .uc-meter { height: 4px; border-radius: 99px; background: var(--uc-track); overflow: hidden; margin-top: 4px; }
 .uc-meter i { display: block; height: 100%; border-radius: 99px; }
-.uc-quota-note { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--uc-border); padding-top: 8px; margin-top: 8px; color: var(--uc-faint); font-size: 9.4px; }
+.uc-quota-note { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--uc-border); padding-top: 8px; margin-top: 8px; color: var(--uc-faint); font-size: 10px; }
 .uc-quota-note i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 10%, transparent); flex: 0 0 auto; }
 .uc-quota-note[data-tone="danger"] { color: var(--uc-red); font-weight: 560; }
 .uc-quota-error {
@@ -1315,13 +1392,13 @@ const CSS = `
   flex: 0 0 auto;
   background: color-mix(in srgb, var(--uc-accent) 9%, transparent);
   color: var(--uc-accent);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 750;
 }
 .uc-exp-name { flex: 1; min-width: 0; }
 .uc-exp-name b { display: block; font-size: 10.5px; font-weight: 620; }
-.uc-exp-name span { display: block; color: var(--uc-faint); font-size: 8.8px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-exp-tag { font-size: 9.2px; font-weight: 620; font-variant-numeric: tabular-nums; padding: 2px 5px; border-radius: 4px; white-space: nowrap; }
+.uc-exp-name span { display: block; color: var(--uc-faint); font-size: 9.5px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-exp-tag { font-size: 10px; font-weight: 620; font-variant-numeric: tabular-nums; padding: 2px 5px; border-radius: 4px; white-space: nowrap; }
 .uc-exp-tag[data-tone="ok"] { color: var(--uc-green); background: color-mix(in srgb, var(--uc-green) 8%, transparent); }
 .uc-exp-tag[data-tone="warn"] { color: var(--uc-amber); background: color-mix(in srgb, var(--uc-amber) 9%, transparent); }
 .uc-exp-tag[data-tone="danger"] { color: var(--uc-red); background: color-mix(in srgb, var(--uc-red) 8%, transparent); }
@@ -1329,15 +1406,15 @@ const CSS = `
 
 /* health */
 .uc-health { min-height: 162px; }
-.uc-health-badge { height: 17px; padding: 0 6px; border-radius: 4px; display: inline-flex; align-items: center; font-size: 8.8px; font-weight: 650; }
+.uc-health-badge { height: 17px; padding: 0 6px; border-radius: 4px; display: inline-flex; align-items: center; font-size: 9.5px; font-weight: 650; }
 .uc-health-badge[data-tone="ok"] { color: var(--uc-green); background: color-mix(in srgb, var(--uc-green) 8%, transparent); }
 .uc-health-badge[data-tone="warn"] { color: var(--uc-amber); background: color-mix(in srgb, var(--uc-amber) 9%, transparent); }
 .uc-health-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 2px; }
 .uc-hm { min-width: 0; padding: 7px 0 6px; border-radius: 7px; background: var(--uc-layer); border: 1px solid var(--uc-border); text-align: center; }
 .uc-hm b { display: block; font-size: 14.5px; font-weight: 680; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-.uc-hm span { display: block; color: var(--uc-faint); font-size: 8.5px; margin-top: 2px; }
+.uc-hm span { display: block; color: var(--uc-faint); font-size: 9.5px; margin-top: 2px; }
 .uc-hm[data-tone="warn"] b { color: var(--uc-amber); }
-.uc-health-note { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--uc-border); color: var(--uc-muted); font-size: 9.2px; line-height: 1.45; display: flex; align-items: flex-start; gap: 5px; }
+.uc-health-note { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--uc-border); color: var(--uc-muted); font-size: 10px; line-height: 1.45; display: flex; align-items: flex-start; gap: 5px; }
 .uc-health-note i { width: 5px; height: 5px; border-radius: 50%; background: var(--uc-amber); margin-top: 4px; flex: 0 0 auto; }
 .uc-health-note b { color: var(--uc-amber); font-weight: 650; }
 
@@ -1370,7 +1447,7 @@ const CSS = `
   font: inherit;
   font-size: 10px;
   font-weight: 560;
-  cursor: default;
+  cursor: pointer;
   white-space: nowrap;
 }
 .uc-session-head, .uc-session-row {
@@ -1379,10 +1456,10 @@ const CSS = `
   align-items: center;
   gap: 8px;
 }
-.uc-session-head { color: var(--uc-faint); font-size: 9px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
+.uc-session-head { color: var(--uc-faint); font-size: 10px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
 .uc-session-list { max-height: 540px; overflow: auto; overscroll-behavior: contain; }
 .uc-session-head > span:nth-child(n+4), .uc-session-row > span:nth-child(n+4) { text-align: right; }
-.uc-session-row { min-height: 34px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10.3px; font-variant-numeric: tabular-nums; cursor: default; }
+.uc-session-row { min-height: 34px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10.3px; font-variant-numeric: tabular-nums; cursor: pointer; }
 .uc-session-row:last-child { border-bottom: 0; }
 .uc-session-row:hover { background: color-mix(in srgb, var(--uc-accent) 4%, transparent); }
 .uc-session-row:focus-visible { outline: 2px solid color-mix(in srgb, var(--uc-accent) 45%, transparent); outline-offset: -2px; border-radius: 5px; }
@@ -1393,6 +1470,19 @@ const CSS = `
 .uc-session-time { color: var(--uc-faint); display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .uc-session-time svg { width: 10px; height: 10px; opacity: 0; transform: translateX(-2px); transition: opacity 0.12s ease, transform 0.12s ease; }
 .uc-session-row:hover .uc-session-time svg, .uc-session-row:focus-visible .uc-session-time svg { opacity: 1; transform: none; }
+.uc-session-more {
+  margin-top: 8px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px dashed var(--uc-border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--uc-muted);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.uc-session-more:hover { color: var(--uc-strong); border-color: color-mix(in srgb, var(--uc-accent) 40%, var(--uc-border)); }
 
 /* detail tabs */
 .uc-detail-grid {
@@ -1405,7 +1495,7 @@ const CSS = `
 .uc-quota-detail { min-height: 0; }
 .uc-quota-block + .uc-quota-block { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--uc-border); }
 .uc-quota-block-head { display: flex; align-items: center; gap: 8px; color: var(--uc-strong); font-size: 11px; font-weight: 650; }
-.uc-quota-plan { color: var(--uc-faint); font-size: 9px; font-weight: 500; padding: 1px 6px; border-radius: 4px; background: var(--uc-layer-2); }
+.uc-quota-plan { color: var(--uc-faint); font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 4px; background: var(--uc-layer-2); }
 .uc-quota-block-note { margin-top: 8px; color: var(--uc-faint); font-size: 9.5px; }
 .uc-quota-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
 .uc-quota-stat { padding: 12px; border: 1px solid var(--uc-border); border-radius: 9px; background: var(--uc-layer); }
@@ -1416,8 +1506,8 @@ const CSS = `
 .uc-quota-stat[data-tone="danger"] .uc-quota-stat-head b { color: var(--uc-red); }
 .uc-quota-stat[data-tone="warn"] .uc-quota-stat-head b { color: var(--uc-amber); }
 .uc-meter-lg { height: 6px; margin-top: 12px; }
-.uc-quota-stat-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 8px; color: var(--uc-faint); font-size: 8.7px; }
-.uc-detail-note { margin-top: 12px; padding-top: 9px; border-top: 1px dashed var(--uc-border); color: var(--uc-faint); font-size: 9.3px; line-height: 1.5; }
+.uc-quota-stat-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 8px; color: var(--uc-faint); font-size: 9.5px; }
+.uc-detail-note { margin-top: 12px; padding-top: 9px; border-top: 1px dashed var(--uc-border); color: var(--uc-faint); font-size: 10px; line-height: 1.5; }
 .uc-kpis-latency { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .uc-kpi-value[data-tone="warn"] { color: var(--uc-amber); }
 .uc-unit { color: var(--uc-faint); font-size: 10px; font-weight: 520; letter-spacing: 0; }
@@ -1426,15 +1516,15 @@ const CSS = `
 .uc-lat-bars { display: flex; flex-direction: column; gap: 9px; margin-top: 4px; }
 .uc-lat-row { display: grid; grid-template-columns: minmax(120px, 190px) minmax(0, 1fr) 58px; align-items: center; gap: 10px; }
 .uc-lat-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 560; }
-.uc-lat-name small { display: block; color: var(--uc-faint); font-size: 8.5px; font-weight: 400; margin-top: 1px; }
+.uc-lat-name small { display: block; color: var(--uc-faint); font-size: 9.5px; font-weight: 400; margin-top: 1px; }
 .uc-lat-track { height: 7px; border-radius: 99px; background: var(--uc-track); overflow: hidden; }
 .uc-lat-track i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--uc-accent), #9b83ff); }
 .uc-lat-row b { font-size: 10px; font-weight: 620; text-align: right; font-variant-numeric: tabular-nums; }
 .uc-lat-health { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .uc-lat-stat { padding: 11px 9px; border: 1px solid var(--uc-border); border-radius: 8px; background: var(--uc-layer); }
 .uc-lat-stat b { display: block; font-size: 17px; font-weight: 680; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-.uc-lat-stat span { display: block; margin-top: 2px; color: var(--uc-faint); font-size: 8.8px; }
-.uc-lat-insight { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--uc-border); color: var(--uc-muted); font-size: 9.4px; line-height: 1.45; }
+.uc-lat-stat span { display: block; margin-top: 2px; color: var(--uc-faint); font-size: 9.5px; }
+.uc-lat-insight { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--uc-border); color: var(--uc-muted); font-size: 10px; line-height: 1.45; }
 .uc-lat-insight b { color: var(--uc-amber); font-weight: 650; }
 .uc-lat-table { overflow-x: auto; }
 .uc-lat-head, .uc-lat-table-row {
@@ -1444,7 +1534,7 @@ const CSS = `
   align-items: center;
   min-width: 680px;
 }
-.uc-lat-head { color: var(--uc-faint); font-size: 9px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
+.uc-lat-head { color: var(--uc-faint); font-size: 10px; padding-bottom: 5px; border-bottom: 1px solid var(--uc-border); }
 .uc-lat-head > span:nth-child(n+2), .uc-lat-table-row > span:nth-child(n+2) { text-align: right; }
 .uc-lat-table-row { min-height: 38px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 60%, transparent); font-size: 10px; font-variant-numeric: tabular-nums; }
 .uc-lat-table-row:last-child { border-bottom: 0; }
@@ -1452,7 +1542,7 @@ const CSS = `
 .uc-lat-model i { width: 20px; height: 20px; border-radius: 5px; display: grid; place-items: center; flex: 0 0 auto; background: color-mix(in srgb, var(--uc-accent) 9%, transparent); color: var(--uc-accent); font-size: 8px; font-weight: 750; font-style: normal; }
 .uc-lat-model span { min-width: 0; }
 .uc-lat-model b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
-.uc-lat-model small { display: block; color: var(--uc-faint); font-size: 8.5px; }
+.uc-lat-model small { display: block; color: var(--uc-faint); font-size: 9.5px; }
 
 /* loading + skeleton */
 .uc-first-load { display: flex; flex-direction: column; gap: 12px; }
@@ -1492,7 +1582,7 @@ const CSS = `
 .uc-spinner { width: 16px; height: 16px; border: 2px solid var(--uc-track); border-top-color: var(--uc-accent); border-radius: 50%; animation: uc-spin 0.8s linear infinite; }
 @keyframes uc-spin { to { transform: rotate(360deg); } }
 
-.uc-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--uc-faint); font-size: 9px; padding-top: 2px; }
+.uc-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--uc-faint); font-size: 10px; padding-top: 2px; }
 .uc-foot b { color: var(--uc-muted); font-weight: 620; }
 .uc-foot-links { display: flex; align-items: center; gap: 12px; }
 .uc-foot-error { color: var(--uc-red); }
@@ -1626,8 +1716,8 @@ const CSS = `
 }
 .uc-int-name { flex: 1; min-width: 0; }
 .uc-int-name b { display: block; font-size: 11.4px; font-weight: 680; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-int-name > span { display: block; color: var(--uc-faint); font-size: 9px; margin-top: 1.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-int-more { display: flex; align-items: center; gap: 4px; color: var(--uc-faint); font-size: 9.2px; font-weight: 620; }
+.uc-int-name > span { display: block; color: var(--uc-faint); font-size: 10px; margin-top: 1.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-int-more { display: flex; align-items: center; gap: 4px; color: var(--uc-faint); font-size: 10px; font-weight: 620; }
 .uc-int-card[data-open="true"] .uc-int-more { color: var(--int-glow); }
 .uc-int-meta { display: flex; flex-wrap: wrap; gap: 4px; }
 .uc-int-chip {
@@ -1639,7 +1729,7 @@ const CSS = `
   background: color-mix(in srgb, var(--int-glow) 5%, var(--uc-layer));
   border-radius: 999px;
   padding: 2px 8px;
-  font-size: 8.8px;
+  font-size: 9.5px;
   font-weight: 560;
   color: var(--uc-muted);
   overflow: hidden;
@@ -1651,7 +1741,7 @@ const CSS = `
 .uc-int-chip[data-active="true"] i { background: var(--uc-green); box-shadow: 0 0 5px color-mix(in srgb, var(--uc-green) 55%, transparent); }
 .uc-int-card[data-open="true"] .uc-int-body { border-top: 1px solid var(--uc-border); }
 .uc-int-body { padding: 9px 12px 11px; display: flex; flex-direction: column; gap: 7px; position: relative; z-index: 1; }
-.uc-int-section-title { color: var(--uc-faint); font-size: 8.8px; font-weight: 720; letter-spacing: 0.09em; text-transform: uppercase; }
+.uc-int-section-title { color: var(--uc-faint); font-size: 9.5px; font-weight: 720; letter-spacing: 0.09em; text-transform: uppercase; }
 .uc-int-methods { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .uc-method {
   display: inline-flex;
@@ -1664,7 +1754,7 @@ const CSS = `
   background: var(--uc-card);
   color: var(--uc-muted);
   font: inherit;
-  font-size: 9.2px;
+  font-size: 10px;
   font-weight: 580;
   cursor: pointer;
   transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
@@ -1682,8 +1772,8 @@ const CSS = `
   border-radius: 4px;
   padding: 1px 4px;
 }
-.uc-int-env { color: var(--uc-faint); font-size: 8.8px; border: 1px dashed var(--uc-border); border-radius: 7px; padding: 2px 7px; display: inline-flex; align-items: center; height: 23px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-int-provider { display: flex; align-items: center; gap: 8px; color: var(--uc-faint); font-size: 8.8px; padding-top: 6px; border-top: 1px dashed var(--uc-border); }
+.uc-int-env { color: var(--uc-faint); font-size: 9.5px; border: 1px dashed var(--uc-border); border-radius: 7px; padding: 2px 7px; display: inline-flex; align-items: center; height: 23px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-int-provider { display: flex; align-items: center; gap: 8px; color: var(--uc-faint); font-size: 9.5px; padding-top: 6px; border-top: 1px dashed var(--uc-border); }
 .uc-int-pkg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.8; }
 .uc-cred-row { display: flex; align-items: center; gap: 7px; padding: 5px 0; }
 .uc-cred-row + .uc-cred-row { border-top: 1px solid color-mix(in srgb, var(--uc-border) 55%, transparent); }
@@ -1691,7 +1781,7 @@ const CSS = `
 .uc-cred-dot[data-active="true"] { background: var(--uc-green); box-shadow: 0 0 6px color-mix(in srgb, var(--uc-green) 55%, transparent); }
 .uc-cred-main { flex: 1; min-width: 0; }
 .uc-cred-main b { display: block; font-size: 10.2px; font-weight: 620; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-cred-main span { display: block; color: var(--uc-faint); font-size: 8.8px; margin-top: 1px; }
+.uc-cred-main span { display: block; color: var(--uc-faint); font-size: 9.5px; margin-top: 1px; }
 
 /* OAuth 登录流程条 */
 .uc-flow {
@@ -1707,13 +1797,13 @@ const CSS = `
 .uc-flow[data-state="complete"] { border-color: color-mix(in srgb, var(--uc-green) 30%, transparent); background: color-mix(in srgb, var(--uc-green) 4%, var(--uc-card)); }
 .uc-flow-head { display: flex; align-items: center; gap: 8px; }
 .uc-flow-head b { font-size: 11px; font-weight: 650; }
-.uc-flow-method { color: var(--uc-faint); font-size: 9.3px; }
+.uc-flow-method { color: var(--uc-faint); font-size: 10px; }
 .uc-flow-spinner { width: 11px; height: 11px; border-width: 1.6px; }
 .uc-flow-head .uc-text-button { margin-left: auto; }
 .uc-flow-body { color: var(--uc-muted); font-size: 10.2px; line-height: 1.5; }
 .uc-flow-body .uc-text-button { margin-left: 6px; }
 .uc-flow-result { font-weight: 560; }
-.uc-flow-foot { color: var(--uc-faint); font-size: 9px; }
+.uc-flow-foot { color: var(--uc-faint); font-size: 10px; }
 
 /* models: 模型浏览页（常用区 + 家族聚合卡片，provider 主题色） */
 .uc-models-page { display: flex; flex-direction: column; gap: 10px; }
@@ -1727,7 +1817,7 @@ const CSS = `
 }
 .uc-recent-head { padding: 9px 0; width: 100%; }
 .uc-recent-head .uc-int-section-title { color: color-mix(in srgb, var(--uc-accent) 80%, var(--uc-strong)); }
-.uc-recent-note { color: var(--uc-faint); font-size: 9px; }
+.uc-recent-note { color: var(--uc-faint); font-size: 10px; }
 .uc-recent-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 7px; padding: 2px 0 12px; }
 .uc-recent-card {
   position: relative;
@@ -1752,10 +1842,10 @@ const CSS = `
 }
 .uc-recent-main { flex: 1; min-width: 0; }
 .uc-recent-main b { display: block; font-size: 10.8px; font-weight: 660; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-recent-main span { display: block; color: var(--uc-faint); font-size: 9px; margin-top: 1px; }
+.uc-recent-main span { display: block; color: var(--uc-faint); font-size: 10px; margin-top: 1px; }
 .uc-recent-stats { text-align: right; flex: 0 0 auto; }
 .uc-recent-stats b { display: block; font-size: 11.5px; font-weight: 720; color: var(--mp-accent, var(--uc-accent)); font-variant-numeric: tabular-nums; }
-.uc-recent-stats span { display: block; color: var(--uc-faint); font-size: 8.4px; }
+.uc-recent-stats span { display: block; color: var(--uc-faint); font-size: 9.5px; }
 .uc-mp-groups { display: flex; flex-direction: column; gap: 8px; }
 .uc-mp-group, .uc-agents {
   --mp-glow: color-mix(in srgb, var(--mp-accent, var(--uc-accent)) 60%, transparent);
@@ -1770,7 +1860,7 @@ const CSS = `
 .uc-agents[data-open="true"] { opacity: 1; }
 .uc-mp-head { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 12px; background: transparent; border: 0; color: inherit; text-align: left; cursor: pointer; position: relative; z-index: 1; }
 .uc-mp-head:hover { background: color-mix(in srgb, var(--mp-glow) 4%, transparent); }
-.uc-mp-count { margin-left: auto; color: var(--uc-faint); font-size: 9.3px; font-variant-numeric: tabular-nums; }
+.uc-mp-count { margin-left: auto; color: var(--uc-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
 .uc-mp-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
@@ -1815,8 +1905,8 @@ const CSS = `
   white-space: nowrap;
   min-width: 0;
 }
-.uc-mp-card-full { color: var(--uc-faint); font-size: 8.8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-mp-card-stats { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--uc-muted); font-size: 9.4px; font-variant-numeric: tabular-nums; }
+.uc-mp-card-full { color: var(--uc-faint); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-mp-card-stats { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--uc-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .uc-mp-card-stats > span { display: inline-flex; align-items: center; gap: 4px; }
 .uc-mp-card[data-expensive="true"] .uc-mp-card-stats span:nth-child(2) { color: var(--uc-amber); font-weight: 640; }
 .uc-mp-usage { color: var(--uc-green) !important; font-weight: 640; }
@@ -1836,7 +1926,7 @@ const CSS = `
 .uc-mp-ico-use { background: color-mix(in srgb, var(--uc-green) 12%, transparent); color: var(--uc-green); }
 .uc-mp-card[data-expensive="true"] .uc-mp-ico:nth-of-type(2) { background: color-mix(in srgb, var(--uc-amber) 13%, transparent); color: var(--uc-amber); }
 .uc-mp-caps { display: flex; flex-wrap: wrap; gap: 3px; }
-.uc-mp-caps em { font-style: normal; color: var(--uc-muted); background: var(--uc-layer-2); border-radius: 4px; padding: 1px 5px; font-size: 8.4px; }
+.uc-mp-caps em { font-style: normal; color: var(--uc-muted); background: var(--uc-layer-2); border-radius: 4px; padding: 1px 5px; font-size: 9.5px; }
 .uc-mp-card .ui-icon-button { height: 20px; width: 20px; }
 .uc-mp-variants-toggle {
   display: inline-flex;
@@ -1847,7 +1937,7 @@ const CSS = `
   background: transparent;
   color: color-mix(in srgb, var(--mp-glow) 75%, var(--uc-strong));
   font: inherit;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 640;
   cursor: pointer;
   padding: 1px 0;
@@ -1855,7 +1945,7 @@ const CSS = `
 .uc-mp-variants-toggle .uc-int-disclosure { width: 10px; height: 10px; }
 .uc-mp-card[data-variant-open="true"] .uc-mp-variants-toggle .uc-int-disclosure { transform: rotate(90deg); }
 .uc-mp-variant-list { display: flex; flex-direction: column; border-top: 1px dashed color-mix(in srgb, var(--mp-glow) 22%, var(--uc-border)); padding-top: 4px; }
-.uc-mp-variant { display: grid; grid-template-columns: minmax(0, 1fr) 44px 74px; gap: 6px; align-items: center; font-size: 9px; padding: 2.5px 0; }
+.uc-mp-variant { display: grid; grid-template-columns: minmax(0, 1fr) 44px 74px; gap: 6px; align-items: center; font-size: 10px; padding: 2.5px 0; }
 .uc-mp-variant + .uc-mp-variant { border-top: 1px solid color-mix(in srgb, var(--uc-border) 45%, transparent); }
 .uc-mp-variant b { font-weight: 600; color: var(--uc-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uc-mp-variant span { color: var(--uc-faint); font-variant-numeric: tabular-nums; text-align: right; }
@@ -1876,7 +1966,7 @@ const CSS = `
 .uc-mp-lv-row:last-child { border-bottom: 0; }
 .uc-mp-lv-head {
   color: var(--uc-faint);
-  font-size: 8.8px;
+  font-size: 9.5px;
   font-weight: 720;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -1886,7 +1976,7 @@ const CSS = `
 .uc-mp-lv-row[data-hidden="true"] .uc-mp-lv-name b { text-decoration: line-through; color: var(--uc-faint); }
 .uc-mp-lv-name { min-width: 0; }
 .uc-mp-lv-name b { display: block; font-size: 10.6px; font-weight: 620; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.uc-mp-lv-name span { display: block; color: var(--uc-faint); font-size: 8.6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-mp-lv-name span { display: block; color: var(--uc-faint); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uc-mp-lv-num { color: var(--uc-muted); font-size: 9.6px; font-variant-numeric: tabular-nums; }
 .uc-mp-lv-num[data-expensive="true"] { color: var(--uc-amber); font-weight: 640; }
 @media (max-width: 760px) {
@@ -1894,6 +1984,225 @@ const CSS = `
   .uc-mp-lv-num:nth-child(4) { display: none; }
 }
 `
+
+/** 总览页签的全部面板。keep-alive 容器要求每个页签是独立组件，这里承接原有的 JSX。 */
+function OverviewPanels(props: {
+  snapshot: Snapshot
+  quota?: Quota
+  credentials: readonly CredentialRow[]
+  insight?: { model: string; costShare: number; tokenShare: number }
+  cacheHit: number
+  tokens: number
+  totals?: Snapshot["totals"]
+  rangeLabel: string
+  models: readonly ModelRow[]
+  topModels: readonly ModelRow[]
+  restModels: readonly ModelRow[]
+  restTokens: number
+  restCost: number
+  delta: (read: (point: SeriesPoint) => number) => number | undefined
+  quotaID: string
+  expiryID: string
+  onRetryQuota: () => void
+  /** 「模型分布 → 全部 N 个」跳转模型页签。 */
+  onOpenModels: () => void
+  /** 总览右栏「订阅时效」卡片的跳转目标。 */
+  onOpenQuota: () => void
+}) {
+  return (
+    <>
+        <div class="uc-kpis">
+          <div class="uc-kpi">
+            <div class="uc-kpi-label"><i />总 Token</div>
+            <div class="uc-kpi-value">
+              {compact(props.tokens)}
+              <Show when={props.delta((point) => point.input + point.output)}>
+                {(value) => (
+                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
+                  </span>
+                )}
+              </Show>
+            </div>
+            <div class="uc-kpi-sub">
+              输入 {compact(props.totals?.tokens.input ?? 0)} · 输出 {compact(props.totals?.tokens.output ?? 0)}
+            </div>
+            <Sparkline
+              values={(props.snapshot.series ?? []).map((point) => point.input + point.output)}
+              color="var(--uc-accent)"
+            />
+          </div>
+          <div class="uc-kpi">
+            <div class="uc-kpi-label"><i data-tone="amber" />估算费用</div>
+            <div class="uc-kpi-value">
+              {money(props.totals?.cost ?? 0)}
+              <Show when={props.delta((point) => point.cost)}>
+                {(value) => (
+                  <span
+                    class="uc-delta"
+                    title="与所选范围前半段对比 · 费用下降为好消息"
+                    data-tone={value() > 0 ? "warn" : "down"}
+                  >
+                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(0)}%
+                  </span>
+                )}
+              </Show>
+            </div>
+            <div class="uc-kpi-sub">按量计费 · 不含订阅内调用</div>
+            <Sparkline values={(props.snapshot.series ?? []).map((point) => point.cost)} color="var(--uc-amber)" />
+          </div>
+          <div class="uc-kpi">
+            <div class="uc-kpi-label"><i data-tone="teal" />请求数</div>
+            <div class="uc-kpi-value">
+              {compact(props.totals?.requests ?? 0)}
+              <Show when={props.delta((point) => point.requests)}>
+                {(value) => (
+                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
+                  </span>
+                )}
+              </Show>
+            </div>
+            <div class="uc-kpi-sub">
+              日均 {compact((props.totals?.requests ?? 0) / Math.max(1, props.snapshot.series.length))} · 活跃 {props.totals?.activeDays ?? 0} 天
+            </div>
+            <Sparkline values={(props.snapshot.series ?? []).map((point) => point.requests)} color="var(--uc-teal)" />
+          </div>
+          <div class="uc-kpi">
+            <div class="uc-kpi-label"><i data-tone="blue" />缓存命中率</div>
+            <div class="uc-kpi-value">
+              {percent(props.cacheHit, 1)}
+              <Show when={cacheDeltaOf(props.snapshot.series)}>
+                {(value) => (
+                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
+                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}pt
+                  </span>
+                )}
+              </Show>
+            </div>
+            <div class="uc-kpi-sub">缓存读取 {compact(props.totals?.tokens.cacheRead ?? 0)} tokens</div>
+            <Sparkline
+              values={(props.snapshot.series ?? []).map((point) =>
+                point.cacheRead + point.input > 0 ? (point.cacheRead / (point.cacheRead + point.input)) * 100 : 0,
+              )}
+              color="var(--uc-blue)"
+            />
+          </div>
+        </div>
+
+        <div class="uc-body">
+          <div class="uc-left">
+            <section class="uc-card uc-trend">
+              <div class="uc-card-head">
+                <div>
+                  <div class="uc-card-title">Token 趋势</div>
+                  <div class="uc-card-sub">有效 Token（输入 + 输出），不含缓存读取 · {props.rangeLabel}</div>
+                </div>
+                <div class="uc-legend"><i />有效 Token</div>
+              </div>
+              <div class="uc-trend-body">
+                <div class="uc-chart-wrap">
+                  <TrendChart points={props.snapshot.series} />
+                  <div class="uc-chart-foot">
+                    <span>
+                      缓存读取 <b>{compact(props.totals?.tokens.cacheRead ?? 0)}</b> · 命中率{" "}
+                      <b>{percent(props.cacheHit, 1)}</b>
+                    </span>
+                    <span>峰值 <b>{compact(Math.max(0, ...props.snapshot.series.map((point) => point.input + point.output)))}</b></span>
+                  </div>
+                </div>
+                <div class="uc-cost-side">
+                  <div class="uc-side-title">费用构成</div>
+                  <CostDonut models={props.models} total={props.totals?.cost ?? 0} />
+                  <Show when={props.insight}>
+                    {(value) => (
+                      <div class="uc-cost-note">
+                        <b>{percent(value().costShare * 100, 1)}</b> 的费用来自 {value().model}，但它只占{" "}
+                        <b>{percent(value().tokenShare * 100, 1)}</b> 的有效 Token。
+                      </div>
+                    )}
+                  </Show>
+                </div>
+              </div>
+            </section>
+
+            <section class="uc-card uc-models">
+              <div class="uc-card-head">
+                <div>
+                  <div class="uc-card-title">模型分布</div>
+                  <div class="uc-card-sub">按有效 Token 排序 · 共 {props.models.length} 个</div>
+                </div>
+                <button type="button" class="uc-card-link" onClick={props.onOpenModels} title="打开「模型」页签查看全部模型的上下文、价格与用量">
+                  全部 {props.models.length} 个 <span>→</span>
+                </button>
+              </div>
+              <div class="uc-model-head">
+                <span>模型</span>
+                <span>占比</span>
+                <span>Token</span>
+                <span>请求</span>
+                <span>费用</span>
+              </div>
+              <Show when={props.topModels.length > 0} fallback={<div class="uc-empty-line">当前范围还没有模型调用</div>}>
+                <div class="uc-model-list">
+                  <For each={props.topModels}>
+                    {(model) => (
+                      <div class="uc-model-row">
+                        <div class="uc-model-name">
+                          <span class="uc-model-icon">{modelInitial(model.modelID)}</span>
+                          <span class="uc-model-text">
+                            <span class="uc-model-title" title={model.modelID}>{shortModel(model.modelID)}</span>
+                            <span class="uc-model-provider">{providerName(model.providerID)}</span>
+                          </span>
+                        </div>
+                        <span class="uc-share">
+                          <span class="uc-share-bar">
+                            <i style={{ width: `${Math.max(2, (sumTokens(model) / Math.max(1, props.tokens)) * 100)}%` }} />
+                          </span>
+                          {percent((sumTokens(model) / Math.max(1, props.tokens)) * 100, 1)}
+                        </span>
+                        <span>{compact(sumTokens(model))}</span>
+                        <span>{compact(model.requests)}</span>
+                        <span>{model.cost > 0 ? money(model.cost) : <span class="uc-zero">$0</span>}</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <div class="uc-model-foot">
+                  <Show when={props.restModels.length > 0}>
+                    <span>其他 {props.restModels.length} 个模型 · <b>{compact(props.restTokens)}</b> tokens</span>
+                    <button type="button" class="uc-model-more" onClick={props.onOpenModels}>
+                      查看全部 →
+                    </button>
+                  </Show>
+                </div>
+              </Show>
+            </section>
+          </div>
+
+          <div class="uc-right">
+            <QuotaCard quota={props.quota} onRetry={props.onRetryQuota} id={props.quotaID} />
+            <section id={props.expiryID}>
+              <ExpiryCard credentials={props.credentials} onOpenQuota={props.onOpenQuota} />
+            </section>
+            <HealthCard latency={props.snapshot.latency} insight={props.insight} />
+          </div>
+        </div>
+    </>
+  )
+}
+
+/** 缓存命中率的半程对比，独立出来供 keep-alive 后的 OverviewPanels 使用。 */
+function cacheDeltaOf(points: readonly SeriesPoint[]): number | undefined {
+  if (points.length < 4) return undefined
+  const mid = Math.floor(points.length / 2)
+  const calc = (list: readonly SeriesPoint[]) => {
+    const input = list.reduce((sum, point) => sum + point.input, 0)
+    const cache = list.reduce((sum, point) => sum + point.cacheRead, 0)
+    return cache + input > 0 ? (cache / (cache + input)) * 100 : 0
+  }
+  return calc(points.slice(mid)) - calc(points.slice(0, mid))
+}
 
 export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const api = props.ctx.client.rpc(Usage)
@@ -1907,9 +2216,16 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const [refreshing, setRefreshing] = createSignal(false)
   const [error, setError] = createSignal("")
   const [tab, setTab] = createSignal<Tab>("overview")
+  /**
+   * 页签切换不卸载：访问过的页签保留挂载、仅隐藏。会话搜索词、回放展开状态、
+   * 模型页的展开/筛选都因此保留，切回来也不再重放挂载成本。
+   */
+  const [visited, setVisited] = createSignal<ReadonlySet<Tab>>(new Set<Tab>(["overview"]))
   const [detailSession, setDetailSession] = createSignal<SessionRow>()
   const [remoteModels, setRemoteModels] = createSignal<import("@opencode/client/promise").ModelInfo[]>([])
   const [providerNames, setProviderNames] = createSignal(new Map<string, string>())
+  /** 模型页签首次打开才拉 host 的模型/provider 目录，首屏不背这两次 RPC。 */
+  const [hostDataDone, setHostDataDone] = createSignal(false)
   /** providerID:modelID → 最近 30 天真实请求，供模型页的「常用」区。声明顺序必须在 modelUsage 之前：esbuild 压缩后 const 无提升。 */
   const usageModels = () => snapshot()?.models ?? []
   const modelUsage = createMemo(() => {
@@ -2040,19 +2356,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   })
 
   onMount(() => {
-    // 凭据与模型页签的数据独立加载：只在该页签首次打开时拉取，之后由事件刷新。
-    void (async () => {
-      try {
-        const [modelList, providerList] = await Promise.all([
-          props.ctx.client.model.list(),
-          props.ctx.client.provider.list(),
-        ])
-        setRemoteModels(modelList.data)
-        setProviderNames(new Map(providerList.data.map((provider) => [provider.id, provider.name])))
-      } catch {
-        // 页签里会再显示具体错误
-      }
-    })()
+    // 凭据页签的数据在该页签首次挂载时自行拉取；模型目录延迟到用户点开「模型」页签。
   })
 
   onMount(() => {
@@ -2082,6 +2386,33 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
       if (timer) window.clearTimeout(timer)
     })
   })
+
+  /** 切页签：记录访问过，首次进「模型」页签时才拉 host 的模型目录。 */
+  function openTab(next: Tab) {
+    if (tab() === next) return
+    setVisited((prev) => {
+      if (prev.has(next)) return prev
+      const nextSet = new Set(prev)
+      nextSet.add(next)
+      return nextSet
+    })
+    setTab(next)
+    if (next === "models" && !hostDataDone()) {
+      setHostDataDone(true)
+      void (async () => {
+        try {
+          const [modelList, providerList] = await Promise.all([
+            props.ctx.client.model.list(),
+            props.ctx.client.provider.list(),
+          ])
+          setRemoteModels(modelList.data)
+          setProviderNames(new Map(providerList.data.map((provider) => [provider.id, provider.name])))
+        } catch {
+          // 页签里会再显示具体错误
+        }
+      })()
+    }
+  }
 
   const totals = () => snapshot()?.totals
   const tokens = () => {
@@ -2119,17 +2450,6 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     if (!value || value.first <= 0) return undefined
     return ((value.second - value.first) / value.first) * 100
   }
-  const cacheDelta = () => {
-    const points = snapshot()?.series ?? []
-    if (points.length < 4) return undefined
-    const mid = Math.floor(points.length / 2)
-    const calc = (list: SeriesPoint[]) => {
-      const input = list.reduce((sum, point) => sum + point.input, 0)
-      const cache = list.reduce((sum, point) => sum + point.cacheRead, 0)
-      return cache + input > 0 ? (cache / (cache + input)) * 100 : 0
-    }
-    return calc(points.slice(mid)) - calc(points.slice(0, mid))
-  }
   const insight = () => {
     const model = maxCostModel()
     if (!model || totals()?.cost === 0) return undefined
@@ -2140,6 +2460,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     }
   }
 
+  const [dismissedAlert, setDismissedAlert] = createSignal("")
   const alert = createMemo<Alert | undefined>(() => {
     const current = quota()
     if (current?.available) {
@@ -2171,7 +2492,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   })
 
   function openTarget(target: string) {
-    if (target === "uc-quota" || target === "uc-expiry") setTab("quota")
+    if (target === "uc-quota" || target === "uc-expiry") openTab("quota")
     window.setTimeout(() => {
       const suffix = target === "uc-quota" ? quotaID : expiryID
       document.getElementById(suffix)?.scrollIntoView({ behavior: "smooth", block: "center" })
@@ -2292,24 +2613,29 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
 
       <nav class="uc-tabs" role="tablist" aria-label="用量页面">
         <For each={TABS}>
-          {(item) => (
-            <button
-              type="button"
-              class="uc-tab"
-              role="tab"
-              data-active={tab() === item.id ? "true" : undefined}
-              aria-selected={tab() === item.id}
-              onClick={() => setTab(item.id)}
-            >
-              {item.label}
-              <Show when={item.id === "quota" && alert()}>
-                <span class="uc-tab-dot" />
-              </Show>
-              <Show when={item.id === "latency" && (snapshot()?.latency.ttftP95 ?? 0) > 30}>
-                <span class="uc-tab-dot" data-tone="warn" />
-              </Show>
-            </button>
-          )}
+          {(item) => {
+            const quotaAlert = () => item.id === "quota" && Boolean(alert())
+            const latencyAlert = () => item.id === "latency" && (snapshot()?.latency.ttftP95 ?? 0) > 30
+            return (
+              <button
+                type="button"
+                class="uc-tab"
+                role="tab"
+                data-active={tab() === item.id ? "true" : undefined}
+                aria-selected={tab() === item.id}
+                title={tabHint(item.id, quotaAlert(), latencyAlert())}
+                onClick={() => openTab(item.id)}
+              >
+                {item.label}
+                <Show when={quotaAlert()}>
+                  <span class="uc-tab-dot" title="某项订阅额度已用 ≥90%" />
+                </Show>
+                <Show when={latencyAlert()}>
+                  <span class="uc-tab-dot" data-tone="warn" title="首字 P95 超过 30 秒" />
+                </Show>
+              </button>
+            )
+          }}
         </For>
         <span class="uc-spacer" />
         <span class="uc-tabs-scope">
@@ -2320,7 +2646,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
         </span>
       </nav>
 
-      <Show when={alert()}>
+      <Show when={alert() && dismissedAlert() !== alert()?.title ? alert() : undefined}>
         {(item) => (
           <div class="uc-alert">
             <span class="uc-alert-icon">
@@ -2332,6 +2658,17 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
             </span>
             <button type="button" class="uc-alert-link" onClick={() => openTarget(item().target)}>
               {item().action} <span>→</span>
+            </button>
+            <button
+              type="button"
+              class="uc-alert-close"
+              aria-label="关闭提醒"
+              title="本次会话内不再提醒"
+              onClick={() => setDismissedAlert(item().title)}
+            >
+              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                <path d="M3 3l6 6M9 3l-6 6" />
+              </svg>
             </button>
           </div>
         )}
@@ -2363,208 +2700,67 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           )
         }
       >
-        <Show when={tab() === "overview"}>
-        <div class="uc-kpis">
-          <div class="uc-kpi">
-            <div class="uc-kpi-label"><i />总 Token</div>
-            <div class="uc-kpi-value">
-              {compact(tokens())}
-              <Show when={delta((point) => point.input + point.output)}>
-                {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
-                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
-                  </span>
-                )}
+        {/* keep-alive 页签容器：访问过的页签保留在 DOM 里用 display 隐藏，状态不丢 */}
+        <For each={TABS}>
+          {(item) => (
+            <div style={{ display: tab() === item.id ? undefined : "none" }} data-tab-body={item.id}>
+              <Show when={visited().has(item.id)}>
+                <Switch>
+                  <Match when={item.id === "overview"}>
+                    <OverviewPanels
+                      snapshot={snapshot()!}
+                      quota={quota()}
+                      credentials={credentials()}
+                      insight={insight()}
+                      cacheHit={cacheHit()}
+                      tokens={tokens()}
+                      totals={totals()}
+                      rangeLabel={rangeLabel()}
+                      models={models()}
+                      topModels={topModels()}
+                      restModels={restModels()}
+                      restTokens={restTokens()}
+                      restCost={restCost()}
+                      delta={delta}
+                      quotaID={quotaID}
+                      expiryID={expiryID}
+                      onRetryQuota={() => void loadQuota(true)}
+                      onOpenModels={() => openTab("models")}
+                      onOpenQuota={() => openTab("quota")}
+                    />
+                  </Match>
+                  <Match when={item.id === "quota"}>
+                    <QuotaDetail quota={quota()} credentials={credentials()} onRetry={() => void loadQuota(true)} id={quotaID} expiryID={expiryID} />
+                  </Match>
+                  <Match when={item.id === "latency"}>
+                    <LatencyTab latency={snapshot()!.latency} models={latencyModels()} />
+                  </Match>
+                  <Match when={item.id === "sessions"}>
+                    <SessionsTab
+                      ctx={props.ctx}
+                      sessions={sessions()}
+                      projects={projects()}
+                      selected={detailSession()}
+                      onSelect={setDetailSession}
+                      onClose={() => setDetailSession(undefined)}
+                    />
+                  </Match>
+                  <Match when={item.id === "integrations"}>
+                    <IntegrationsPage ctx={props.ctx} />
+                  </Match>
+                  <Match when={item.id === "models"}>
+                    <ModelsExplorer
+                      ctx={props.ctx}
+                      models={remoteModels()}
+                      providerNames={providerNames()}
+                      usage={modelUsage()}
+                    />
+                  </Match>
+                </Switch>
               </Show>
             </div>
-            <div class="uc-kpi-sub">
-              输入 {compact(totals()?.tokens.input ?? 0)} · 输出 {compact(totals()?.tokens.output ?? 0)}
-            </div>
-            <Sparkline
-              values={(snapshot()!.series ?? []).map((point) => point.input + point.output)}
-              color="var(--uc-accent)"
-            />
-          </div>
-          <div class="uc-kpi">
-            <div class="uc-kpi-label"><i data-tone="amber" />估算费用</div>
-            <div class="uc-kpi-value">
-              {money(totals()?.cost ?? 0)}
-              <Show when={delta((point) => point.cost)}>
-                {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone="warn">
-                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(0)}%
-                  </span>
-                )}
-              </Show>
-            </div>
-            <div class="uc-kpi-sub">按量计费 · 不含订阅内调用</div>
-            <Sparkline values={(snapshot()!.series ?? []).map((point) => point.cost)} color="var(--uc-amber)" />
-          </div>
-          <div class="uc-kpi">
-            <div class="uc-kpi-label"><i data-tone="teal" />请求数</div>
-            <div class="uc-kpi-value">
-              {compact(totals()?.requests ?? 0)}
-              <Show when={delta((point) => point.requests)}>
-                {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
-                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
-                  </span>
-                )}
-              </Show>
-            </div>
-            <div class="uc-kpi-sub">
-              日均 {compact((totals()?.requests ?? 0) / Math.max(1, snapshot()!.series.length))} · 活跃 {totals()?.activeDays ?? 0} 天
-            </div>
-            <Sparkline values={(snapshot()!.series ?? []).map((point) => point.requests)} color="var(--uc-teal)" />
-          </div>
-          <div class="uc-kpi">
-            <div class="uc-kpi-label"><i data-tone="blue" />缓存命中率</div>
-            <div class="uc-kpi-value">
-              {percent(cacheHit(), 1)}
-              <Show when={cacheDelta()}>
-                {(value) => (
-                  <span class="uc-delta" title="与所选范围前半段对比" data-tone={value() >= 0 ? "up" : "down"}>
-                    {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}pt
-                  </span>
-                )}
-              </Show>
-            </div>
-            <div class="uc-kpi-sub">缓存读取 {compact(totals()?.tokens.cacheRead ?? 0)} tokens</div>
-            <Sparkline
-              values={(snapshot()!.series ?? []).map((point) =>
-                point.cacheRead + point.input > 0 ? (point.cacheRead / (point.cacheRead + point.input)) * 100 : 0,
-              )}
-              color="var(--uc-blue)"
-            />
-          </div>
-        </div>
-
-        <div class="uc-body">
-          <div class="uc-left">
-            <section class="uc-card uc-trend">
-              <div class="uc-card-head">
-                <div>
-                  <div class="uc-card-title">Token 趋势</div>
-                  <div class="uc-card-sub">有效 Token（输入 + 输出），不含缓存读取 · {rangeLabel()}</div>
-                </div>
-                <div class="uc-legend"><i />有效 Token</div>
-              </div>
-              <div class="uc-trend-body">
-                <div class="uc-chart-wrap">
-                  <TrendChart points={snapshot()!.series} />
-                  <div class="uc-chart-foot">
-                    <span>
-                      缓存读取 <b>{compact(totals()?.tokens.cacheRead ?? 0)}</b> · 命中率{" "}
-                      <b>{percent(cacheHit(), 1)}</b>
-                    </span>
-                    <span>峰值 <b>{compact(Math.max(0, ...snapshot()!.series.map((point) => point.input + point.output)))}</b></span>
-                  </div>
-                </div>
-                <div class="uc-cost-side">
-                  <div class="uc-side-title">费用构成</div>
-                  <CostDonut models={models()} total={totals()?.cost ?? 0} />
-                  <Show when={insight()}>
-                    {(value) => (
-                      <div class="uc-cost-note">
-                        <b>{percent(value().costShare * 100, 1)}</b> 的费用来自 {value().model}，但它只占{" "}
-                        <b>{percent(value().tokenShare * 100, 1)}</b> 的有效 Token。
-                      </div>
-                    )}
-                  </Show>
-                </div>
-              </div>
-            </section>
-
-            <section class="uc-card uc-models">
-              <div class="uc-card-head">
-                <div>
-                  <div class="uc-card-title">模型分布</div>
-                  <div class="uc-card-sub">按有效 Token 排序 · 共 {models().length} 个</div>
-                </div>
-                <span class="uc-card-link">全部 {models().length} 个 <span>→</span></span>
-              </div>
-              <div class="uc-model-head">
-                <span>模型</span>
-                <span>占比</span>
-                <span>Token</span>
-                <span>请求</span>
-                <span>费用</span>
-              </div>
-              <Show when={topModels().length > 0} fallback={<div class="uc-empty-line">当前范围还没有模型调用</div>}>
-                <div class="uc-model-list">
-                  <For each={topModels()}>
-                    {(model) => (
-                      <div class="uc-model-row">
-                        <div class="uc-model-name">
-                          <span class="uc-model-icon">{modelInitial(model.modelID)}</span>
-                          <span class="uc-model-text">
-                            <span class="uc-model-title" title={model.modelID}>{shortModel(model.modelID)}</span>
-                            <span class="uc-model-provider">{providerName(model.providerID)}</span>
-                          </span>
-                        </div>
-                        <span class="uc-share">
-                          <span class="uc-share-bar">
-                            <i style={{ width: `${Math.max(2, (sumTokens(model) / Math.max(1, tokens())) * 100)}%` }} />
-                          </span>
-                          {percent((sumTokens(model) / Math.max(1, tokens())) * 100, 1)}
-                        </span>
-                        <span>{compact(sumTokens(model))}</span>
-                        <span>{compact(model.requests)}</span>
-                        <span>{model.cost > 0 ? money(model.cost) : <span class="uc-zero">$0</span>}</span>
-                      </div>
-                    )}
-                  </For>
-                </div>
-                <div class="uc-model-foot">
-                  <span>其他 {restModels().length} 个模型 · <b>{compact(restTokens())}</b> tokens</span>
-                  <span><b>{money(restCost())}</b> · 含高成本模型</span>
-                </div>
-              </Show>
-            </section>
-          </div>
-
-          <div class="uc-right">
-            <QuotaCard quota={quota()} onRetry={() => void loadQuota(true)} id={quotaID} />
-            <section id={expiryID}>
-              <ExpiryCard credentials={credentials()} />
-            </section>
-            <HealthCard latency={snapshot()!.latency} insight={insight()} />
-          </div>
-        </div>
-
-        </Show>
-
-        <Show when={tab() === "quota"}>
-          <QuotaDetail quota={quota()} credentials={credentials()} onRetry={() => void loadQuota(true)} id={quotaID} expiryID={expiryID} />
-        </Show>
-
-        <Show when={tab() === "latency"}>
-          <LatencyTab latency={snapshot()!.latency} models={latencyModels()} />
-        </Show>
-
-        <Show when={tab() === "sessions"}>
-          <SessionsTab
-            ctx={props.ctx}
-            sessions={sessions()}
-            projects={projects()}
-            selected={detailSession()}
-            onSelect={setDetailSession}
-            onClose={() => setDetailSession(undefined)}
-          />
-        </Show>
-
-        <Show when={tab() === "integrations"}>
-          <IntegrationsPage ctx={props.ctx} />
-        </Show>
-
-        <Show when={tab() === "models"}>
-          <ModelsExplorer
-            ctx={props.ctx}
-            models={remoteModels()}
-            providerNames={providerNames()}
-            usage={modelUsage()}
-          />
-        </Show>
+          )}
+        </For>
       </Show>
 
       <Show when={!props.embedded}>
@@ -2579,7 +2775,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           </Show>
         </span>
         <span class="uc-foot-links">
-          <span>⌥U 打开</span>
+          <span>⌘⌥U 打开</span>
           <span>本地优先 · 不上传会话内容</span>
         </span>
       </footer>

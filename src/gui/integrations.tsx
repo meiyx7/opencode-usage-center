@@ -450,10 +450,24 @@ export function IntegrationsPage(props: { ctx: Context }) {
         </div>
       </Show>
 
-      <Show when={!loading() && rows().length === 0} fallback={undefined}>
+      <Show when={loading()}>
+        <div class="uc-int-grid" aria-hidden="true">
+          <For each={[0, 1, 2, 3, 4, 5]}>
+            {() => (
+              <div class="uc-int-card uc-skeleton" style={{ "min-height": "64px" }}>
+                <span class="uc-sk-line" style={{ width: "38%", margin: "12px" }} />
+                <span class="uc-sk-line" style={{ width: "62%", margin: "0 12px 12px" }} />
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+
+      <Show when={!loading() && rows().length === 0}>
         <div class="uc-empty-line">还没有任何登录或凭据。点右上角「刷新」或先在 TUI 里 /login。</div>
       </Show>
 
+      <Show when={!loading()}>
       <div class="uc-int-grid">
         <For each={rows()}>
           {(row) => {
@@ -609,6 +623,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
           }}
         </For>
       </div>
+      </Show>
 
       <Show when={flow()}>
         {(current) => (

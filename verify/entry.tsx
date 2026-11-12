@@ -7,6 +7,7 @@ import { render } from "solid-js/web"
 import type { Context } from "@opencode/plugin/gui"
 import { OpenCode } from "@opencode/client/promise"
 import { IntegrationsPage } from "../src/gui/integrations"
+import { UsagePage } from "../src/gui/page"
 import { ModelsExplorer } from "../src/gui/models-explorer"
 import { SessionDetailView } from "../src/gui/session-detail"
 import type { SessionRow } from "../src/contract"
@@ -88,6 +89,8 @@ function App() {
       <style>{CSS_TEXT}</style>
       <h2 style={{ "font-size": "14px", margin: "0 0 8px" }}>凭据页（真实数据）</h2>
       <IntegrationsPage ctx={ctx} />
+      <h2 style={{ "font-size": "14px", margin: "24px 0 8px" }}>额度与时效（真实数据）</h2>
+      <UsagePage ctx={ctx} embedded />
       <h2 style={{ "font-size": "14px", margin: "24px 0 8px" }}>模型页（真实数据）</h2>
       <ModelsPage />
       <h2 style={{ "font-size": "14px", margin: "24px 0 8px" }}>会话明细时间轴（真实数据）</h2>

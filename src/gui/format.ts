@@ -26,6 +26,12 @@ export function compact(value: number): string {
   return `${Math.round(value)}`
 }
 
+/** 请求次数用千分位完整展示：10,800 次比 10.8K 次更直观。 */
+export function count(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0"
+  return Math.round(value).toLocaleString("en-US")
+}
+
 export function money(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "$0.00"
   return `$${MONEY.format(value)}`
