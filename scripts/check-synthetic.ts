@@ -67,6 +67,10 @@ function main(): void {
     if (!ok) failures.push(`${label}: got ${actual}, want ${wanted}`)
   }
 
+  // 磁盘缓存指到临时目录，便于直读缓存文件做序列化断言。
+  const cacheRoot = `${process.env.TMPDIR ?? "/tmp"}/uc-synthetic-cache-${process.pid}`
+  process.env.XDG_CACHE_HOME = cacheRoot
+
   const file = seed((path) => {
     const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
     seedMain(new Database(path))
@@ -112,12 +116,84 @@ function main(): void {
 
   store.close()
 
+  // 7. 跨 Store 磁盘冷启动（缓存修复 §1.3）：重建 Store 后项目归因必须与首次计算一致。
+  const cold = new UsageStore(file, () => {})
+  const coldSnap = cold.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+  expect("cold-start cost", coldSnap.totals.cost, 6, 1e-6)
+  expect("cold-start projectUsage rows", coldSnap.projectUsage.length, 2)
+  for (const row of coldSnap.projectUsage) {
+    expect(`cold-start project ${row.projectID} requests`, row.requests, 300)
+    expect(`cold-start project ${row.projectID} cost`, row.cost, 3, 1e-6)
+    expect(`cold-start project ${row.projectID} tokens`, row.input + row.output, 45_000)
+  }
+  cold.close()
+
+  // 8. 无项目归属的 Session 归到空桶，不混入其他项目。
+  const orphanFile = seed((path) => {    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const db = new Database(path)
+    db.exec(`INSERT INTO project VALUES ('p1', NULL, '/tmp/proj-a', 1)`)
+    db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-o', NULL, '孤儿', ?, ?)").run(yesterday, yesterday)
+    db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-a', 'p1', 'A', ?, ?)").run(yesterday, yesterday)
+    const insert = db.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, ?, ?)",
+    )
+    const payload = JSON.stringify({
+      model: { providerID: "prov", id: "model-a" },
+      agent: "build",
+      cost: 0.5,
+      tokens: { input: 10, output: 10 },
+      time: { created: yesterday, completed: yesterday + 100 },
+    })
+    insert.run("m-o", "s-o", yesterday, payload)
+    insert.run("m-a", "s-a", yesterday, payload)
+    db.close()
+  })
+  const orphanStore = new UsageStore(orphanFile, () => {})
+  const orphanSnap = orphanStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+  const orphanRows = [...orphanSnap.projectUsage]
+  expect("orphan bucket count", orphanRows.length, 2)
+  for (const row of orphanRows) {
+    expect(`orphan project "${row.projectID}" cost`, row.cost, 0.5, 1e-6)
+  }
+  orphanStore.close()
+
+  // 9. 磁盘缓存文件直读：sessionProject 必须真实存在（v1 bug 是被写成 {}）。
+  const dayFiles = [...new Bun.Glob("**/days/**/*.json").scanSync({ cwd: cacheRoot })]
+  expect("day cache files written", dayFiles.length > 0, true)
+  for (const rel of dayFiles) {
+    const raw = JSON.parse(require("node:fs").readFileSync(`${cacheRoot}/${rel}`, "utf8")) as Record<string, unknown>
+    expect(`cache ${rel} versioned`, typeof raw.version === "number", true)
+    expect(`cache ${rel} has sessionProject`, typeof raw.sessionProject === "object" && raw.sessionProject !== null && Object.keys(raw.sessionProject as object).length > 0, true)
+  }
+
+  // 10. 旧版本缓存（无 version 字段）必须被判定失效：改造缓存目录里的文件后冷启动应重算出正确结果。
+  for (const rel of dayFiles) {
+    const path = `${cacheRoot}/${rel}`
+    const raw = JSON.parse(require("node:fs").readFileSync(path, "utf8")) as Record<string, unknown>
+    delete raw.version
+    require("node:fs").writeFileSync(path, JSON.stringify(raw))
+  }
+  const legacy = new UsageStore(file, () => {})
+  const legacySnap = legacy.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+  expect("legacy cache recomputed cost", legacySnap.totals.cost, 6, 1e-6)
+  expect("legacy cache recomputed projects", legacySnap.projectUsage.length, 2)
+  legacy.close()
+
+  // 11. 损坏缓存文件必须安全恢复。
+  for (const rel of dayFiles) {
+    require("node:fs").writeFileSync(`${cacheRoot}/${rel}`, "{corrupted")
+  }
+  const corrupted = new UsageStore(file, () => {})
+  const corruptedSnap = corrupted.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+  expect("corrupted cache recovered cost", corruptedSnap.totals.cost, 6, 1e-6)
+  corrupted.close()
+
   if (failures.length > 0) {
     console.error("synthetic data regressions:")
     for (const failure of failures) console.error(`  - ${failure}`)
     process.exit(1)
   }
-  console.log("synthetic ok: 600 sessions across 2 projects, attribution complete beyond list cap")
+  console.log("synthetic ok: 600 sessions across 2 projects, attribution complete beyond list cap, cold-start stable")
 }
 
 main()

@@ -618,6 +618,35 @@ type DayAgg = {
   baseCount?: number
 }
 
+/** 磁盘逐日缓存的 schema 版本：结构变化时递增；读到旧版本/缺版本一律删除重算。 */
+const DAY_CACHE_VERSION = 2
+
+/**
+ * DayAgg 的可序列化形态：Map 转平面 Record。这是内存聚合与磁盘 JSON 之间
+ * 的唯一转换边界——DayAgg 里今后若再出现 Map/Set/Date 等非 JSON 结构，
+ * 必须在这里处理，不允许调用方各自 stringify。
+ */
+type PlainDayAgg = Omit<DayAgg, "sessionProject"> & { sessionProject: Record<string, string> }
+
+function dayToPlain(day: DayAgg): PlainDayAgg {
+  return { ...day, sessionProject: Object.fromEntries(day.sessionProject) }
+}
+
+/** 校验版本、日期与结构，还原 Map；不合法返回 undefined，调用方删除文件重算。 */
+function dayFromPlain(plain: unknown, date: string): DayAgg | undefined {
+  if (typeof plain !== "object" || plain === null) return undefined
+  const value = plain as Record<string, unknown>
+  // 无 version 字段的旧缓存（sessionProject 曾被 stringify 成 {}）直接判失效。
+  if (value.version !== DAY_CACHE_VERSION || value.date !== date) return undefined
+  const day = value as unknown as PlainDayAgg & { version: number }
+  if (!day.tokens || !day.models || !day.sessions || !day.agents || !day.latencyByModel || !Array.isArray(day.latency)) {
+    return undefined
+  }
+  if (typeof day.sessionProject !== "object" || day.sessionProject === null) return undefined
+  const { version: _version, ...rest } = day
+  return { ...rest, sessionProject: new Map(Object.entries(day.sessionProject)) }
+}
+
 /** 纯函数：把一天的消息行聚合成 DayAgg。输入输出与数据库解耦，便于缓存。 */
 function aggregateDay(date: string, rows: Row[]): DayAgg {
   const models: DayAgg["models"] = {}
@@ -810,24 +839,19 @@ export class UsageStore {
     return join(this.dayCacheDir(scope), `${date}.json`)
   }
 
-  /** 读一天的落盘聚合。文件损坏即删除并返回 undefined。 */
+  /** 读一天的落盘聚合。版本不符、结构不完整或文件损坏即删除并返回 undefined。 */
   private readDay(scope: string, date: string): DayAgg | undefined {
     try {
       const file = this.dayFilePath(scope, date)
       if (!existsSync(file)) return undefined
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as DayAgg
-      if (parsed.date !== date || !Array.isArray(parsed.latency)) {
+      const parsed: unknown = JSON.parse(readFileSync(file, "utf8"))
+      const day = dayFromPlain(parsed, date)
+      if (!day) {
+        // 旧版本缓存（含 sessionProject 丢失的 v1 文件）与损坏文件一律失效重算。
         unlinkSync(file)
         return undefined
       }
-      // 结构演进（如 0.5 新增 agents 维度）后旧缓存缺字段：丢弃重算，而不是
-      // 让 mergeDays 在 undefined 上崩溃。sessionProject 是 Map，序列化后为 {}。
-      if (!parsed.agents || !parsed.models || !parsed.sessions || !parsed.latencyByModel) {
-        unlinkSync(file)
-        return undefined
-      }
-      parsed.sessionProject = new Map(Object.entries((parsed.sessionProject as unknown as Record<string, string>) ?? {}))
-      return parsed
+      return day
     } catch {
       try {
         unlinkSync(this.dayFilePath(scope, date))
@@ -840,7 +864,8 @@ export class UsageStore {
 
   private writeDay(scope: string, day: DayAgg): void {
     try {
-      const body = JSON.stringify(day)
+      // 统一序列化边界：Map → Record（JSON.stringify 对 Map 会静默输出 {}）。
+      const body = JSON.stringify({ version: DAY_CACHE_VERSION, ...dayToPlain(day) })
       if (body.length > DAY_FILE_MAX_BYTES) return
       const dir = this.dayCacheDir(scope)
       mkdirSync(dir, { recursive: true })
