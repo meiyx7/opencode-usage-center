@@ -44,13 +44,13 @@ function withTurns(detail: SessionDetail, turns: SessionTurn[]): SessionDetail {
   return { ...detail, turns, hasMore, nextBefore: hasMore ? turns[0]!.index : 0 }
 }
 
-function tokenCount(tokens: { input: number; output: number }): number {
-  return tokens.input + tokens.output
-}
+import { cacheHitRate, effectiveTokens } from "./metrics"
 
-function cacheHit(request: SessionRequest): number {
-  const base = request.tokens.cacheRead + request.tokens.input
-  return base > 0 ? request.tokens.cacheRead / base : 0
+// 「有效 Token」与缓存命中率统一走 gui/metrics.ts（口径单一来源）。
+
+/** 全字段 Token 视觉足迹（可视化堆叠条与柱状图的分母，含缓存读写与推理）。 */
+function fullTokenFootprint(tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }): number {
+  return tokens.cacheRead + tokens.input + tokens.cacheWrite + tokens.output + tokens.reasoning
 }
 
 function cacheTone(value: number): "ok" | "warn" | "low" {
@@ -102,12 +102,7 @@ function statusLabel(status: string): string {
 }
 
 function PageBar(props: { turn: SessionTurn }) {
-  const total = () =>
-    props.turn.tokens.cacheRead +
-    props.turn.tokens.input +
-    props.turn.tokens.cacheWrite +
-    props.turn.tokens.output +
-    props.turn.tokens.reasoning
+  const total = () => fullTokenFootprint(props.turn.tokens)
   const width = (value: number) => `${Math.max(0, (value / Math.max(1, total())) * 100)}%`
   return (
     <span class="uc-turn-bar" title={`缓存 ${compact(props.turn.tokens.cacheRead)} · 输入 ${compact(props.turn.tokens.input)} · 输出 ${compact(props.turn.tokens.output)}`}>
@@ -120,8 +115,7 @@ function PageBar(props: { turn: SessionTurn }) {
 }
 
 function CacheBar(props: { tokens: SessionDetail["tokens"] }) {
-  const total = () =>
-    props.tokens.cacheRead + props.tokens.input + props.tokens.cacheWrite + props.tokens.output + props.tokens.reasoning
+  const total = () => fullTokenFootprint(props.tokens)
   const width = (value: number) => `${Math.max(0, (value / Math.max(1, total())) * 100)}%`
   return (
     <div class="uc-sd-cachebar">
@@ -197,9 +191,9 @@ function ToolCall(props: { tool: SessionToolCall }) {
 }
 
 function RequestCard(props: { request: SessionRequest; index: number; initialOpen?: boolean }) {
-  const hit = () => cacheHit(props.request)
+  const hit = () => cacheHitRate(props.request.tokens)
   const tone = () => cacheTone(hit())
-  const total = () => tokenCount(props.request.tokens)
+  const total = () => effectiveTokens(props.request.tokens)
   return (
     <details class="uc-req" open={props.initialOpen}>
       <summary class="uc-req-head">
@@ -294,9 +288,7 @@ function CostWaterfall(props: {
   const loadedCost = createMemo(() => props.turns.reduce((sum, turn) => sum + turn.cost, 0))
   const partial = createMemo(() => props.turns.length < props.totalTurns)
   const metricOf = (turn: SessionTurn) =>
-    byCost()
-      ? turn.cost
-      : turn.tokens.input + turn.tokens.output
+    byCost() ? turn.cost : effectiveTokens(turn.tokens)
   const max = createMemo(() => Math.max(1e-9, ...props.turns.map(metricOf)))
   const top = createMemo(() => {
     const sorted = [...props.turns].sort((a, b) => metricOf(b) - metricOf(a))
@@ -327,7 +319,7 @@ function CostWaterfall(props: {
                   style={{ height: `${Math.max(6, (value / max()) * 100)}%` }}
                   role="button"
                   tabIndex={0}
-                  title={`回合 #${turn.index} · ${byCost() ? money(turn.cost) : `${compact(turn.tokens.input + turn.tokens.output)} 有效 Token`}${turn.requests.length ? ` · ${turn.requests.length} 请求` : ""} · 点击展开`}
+                  title={`回合 #${turn.index} · ${byCost() ? money(turn.cost) : `${compact(effectiveTokens(turn.tokens))} 有效 Token`}${turn.requests.length ? ` · ${turn.requests.length} 请求` : ""} · 点击展开`}
                   onClick={() => props.onLocate(turn.index)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
@@ -405,7 +397,7 @@ export function SessionDetailView(props: {
   const projectLabel = () => detail()?.projectName || props.projectName || props.session.projectID || "项目"
   const totalTokens = () => {
     const tokens = detail()?.tokens
-    return tokens ? tokenCount(tokens) : 0
+    return tokens ? effectiveTokens(tokens) : 0
   }
   const allRequests = createMemo(() => detail()?.turns.flatMap((turn) => turn.requests) ?? [])
   const visibleTurns = createMemo(() => {
@@ -860,8 +852,9 @@ export function SessionDetailView(props: {
                 <div class="uc-sd-strip">
                   <For each={value().turns}>
                     {(turn) => {
-                      const tokens = turn.tokens.cacheRead + turn.tokens.input + turn.tokens.output + turn.tokens.reasoning
-                      const max = Math.max(1, ...value().turns.map((row) => row.tokens.cacheRead + row.tokens.input + row.tokens.output + row.tokens.reasoning))
+                      // 回合总 Token（可视化分母）：全字段之和，与 PageBar/CacheBar 堆叠口径一致
+                      const tokens = fullTokenFootprint(turn.tokens)
+                      const max = Math.max(1, ...value().turns.map((row) => fullTokenFootprint(row.tokens)))
                       return (
                         <span
                           class="uc-sd-strip-col"
@@ -984,7 +977,7 @@ export function SessionDetailView(props: {
                         <span class="uc-turn-preview">{previewLine(turn.prompt)}</span>
                         <span class="uc-turn-meta">
                           {turn.requests.length} 请求 · {turn.toolCount} 工具 ·{" "}
-                          {compact(tokenCount(turn.tokens))} token · 缓存 {percent(turn.cacheHit * 100, 1)}
+                          {compact(effectiveTokens(turn.tokens))} token · 缓存 {percent(turn.cacheHit * 100, 1)}
                           <Show when={turn.ttft > 0}>
                             {" · "}平均首字 {duration(turn.ttft)}
                           </Show>

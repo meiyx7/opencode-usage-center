@@ -24,6 +24,7 @@ import {
 import { SessionDetailView } from "./session-detail"
 import { IntegrationsPage } from "./integrations"
 import { ModelsExplorer } from "./models-explorer"
+import { cacheHitRate, effectiveTokens, modelTokens } from "./metrics"
 
 type Alert = { title: string; detail: string; action: string; target: string }
 type Tab = "overview" | "integrations" | "latency" | "sessions" | "models"
@@ -64,9 +65,7 @@ function niceMax(value: number): { top: number; step: number } {
   return { top: step * 4, step }
 }
 
-function sumTokens(model: ModelRow): number {
-  return model.input + model.output
-}
+// 「有效 Token」与缓存命中率的计算统一在 gui/metrics.ts（口径单一来源）。
 
 function Sparkline(props: { values: number[]; color: string }) {
   const path = createMemo(() => {
@@ -693,7 +692,7 @@ function ModelEfficiency(props: { latencyModels: readonly LatencyModelRow[]; usa
     return props.latencyModels
       .map((model) => {
         const costRow = usage.get(`${model.providerID}:${model.modelID}`)
-        const tokens = (costRow?.input ?? 0) + (costRow?.output ?? 0)
+        const tokens = costRow ? modelTokens(costRow) : 0
         return {
           providerID: model.providerID,
           modelID: model.modelID,
@@ -2402,11 +2401,11 @@ function OverviewPanels(props: {
                         </div>
                         <span class="uc-share">
                           <span class="uc-share-bar">
-                            <i style={{ width: `${Math.max(2, (sumTokens(model) / Math.max(1, props.tokens)) * 100)}%` }} />
+                            <i style={{ width: `${Math.max(2, (modelTokens(model) / Math.max(1, props.tokens)) * 100)}%` }} />
                           </span>
-                          {percent((sumTokens(model) / Math.max(1, props.tokens)) * 100, 1)}
+                          {percent((modelTokens(model) / Math.max(1, props.tokens)) * 100, 1)}
                         </span>
-                        <span>{compact(sumTokens(model))}</span>
+                        <span>{compact(modelTokens(model))}</span>
                         <span>{compact(model.requests)}</span>
                         <span>
                           {model.cost > 0 ? (
@@ -2765,27 +2764,26 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   }
 
   const totals = () => snapshot()?.totals
+  // 有效 Token 与缓存命中率统一走 gui/metrics.ts（口径单一来源）。
   const tokens = () => {
     const value = totals()?.tokens
-    return value ? value.input + value.output : 0
+    return value ? effectiveTokens(value) : 0
   }
   const cacheHit = () => {
     const value = totals()?.tokens
-    if (!value) return 0
-    const base = value.cacheRead + value.input
-    return base > 0 ? (value.cacheRead / base) * 100 : 0
+    return value ? cacheHitRate(value) * 100 : 0
   }
   const sessions = () => snapshot()?.sessions ?? []
   const models = () => snapshot()?.models ?? []
   const latencyModels = () => snapshot()?.latencyModels ?? []
   const credentials = () => snapshot()?.credentials ?? []
   const costModels = createMemo(() => [...models()].sort((a, b) => b.cost - a.cost))
-  const topModels = createMemo(() => [...models()].sort((a, b) => sumTokens(b) - sumTokens(a)).slice(0, 4))
-  const restModels = createMemo(() => models().slice().sort((a, b) => sumTokens(b) - sumTokens(a)).slice(4))
-  const restTokens = createMemo(() => restModels().reduce((sum, model) => sum + sumTokens(model), 0))
+  const topModels = createMemo(() => [...models()].sort((a, b) => modelTokens(b) - modelTokens(a)).slice(0, 4))
+  const restModels = createMemo(() => models().slice().sort((a, b) => modelTokens(b) - modelTokens(a)).slice(4))
+  const restTokens = createMemo(() => restModels().reduce((sum, model) => sum + modelTokens(model), 0))
   const restCost = createMemo(() => restModels().reduce((sum, model) => sum + model.cost, 0))
   const maxCostModel = createMemo(() => costModels().find((model) => model.cost > 0))
-  const tokenShare = (model: ModelRow) => (tokens() > 0 ? sumTokens(model) / tokens() : 0)
+  const tokenShare = (model: ModelRow) => (tokens() > 0 ? modelTokens(model) / tokens() : 0)
 
   // 增减幅度与“上一个等长完整周期”比较，而不是把所选区间切成不等长的两半。
   // 奇数天不再偏向后半段；最后一个数据点（可能是未结束的今天）不参与基期比较。

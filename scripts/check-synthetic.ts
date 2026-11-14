@@ -402,6 +402,119 @@ function main(): void {
     require("node:fs").rmSync(legacyFile)
   }
 
+  // 15. 统计口径对账（统计口径统一批次任务 6）：多项目、多模型、多 agent、
+  // 跨 provider 同名模型、无项目、缺 cost/tokens、unknown 兜底——三个维度
+  // 的费用与 Token 之和必须与总量对账，unknown 桶不得丢失。
+  {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const recFile = `${process.env.TMPDIR ?? "/tmp"}/uc-recon-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db = new Database(recFile)
+    db.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+    `)
+    db.exec(`INSERT INTO project VALUES ('pa', NULL, '/tmp/rec-a', 1), ('pb', NULL, '/tmp/rec-b', 2)`)
+    const insertSession = db.prepare(
+      "INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)",
+    )
+    const insertMessage = db.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', 1, ?, ?, ?)",
+    )
+    // 预期值直接从构造参数推导
+    const want = { cost: 0, input: 0, output: 0, cacheRead: 0, requests: 0 }
+    const add = (cost: number, input: number, output: number, cacheRead: number) => {
+      want.cost += cost
+      want.input += input
+      want.output += output
+      want.cacheRead += cacheRead
+      want.requests += 1
+    }
+    let seq = 0
+    const put = (sessionID: string, projectID: string | null, payload: Record<string, unknown>) => {
+      insertSession.run(sessionID, projectID, `对账 ${sessionID}`, yesterday, yesterday)
+      insertMessage.run(`rm${seq++}`, sessionID, yesterday, yesterday, JSON.stringify(payload))
+      const tokens = (payload.tokens ?? {}) as { input?: number; output?: number; cache?: { read?: number } }
+      // 缺 cost/tokens 的消息按 0 计入预期值（与聚合的 num() 语义一致）
+      add(typeof payload.cost === "number" ? payload.cost : 0, tokens.input ?? 0, tokens.output ?? 0, tokens.cache?.read ?? 0)
+    }
+    const msg = (cost: number, providerID: string, modelID: string, agent: string, input: number, output: number, cacheRead = 0) => ({
+      model: { providerID, id: modelID },
+      agent,
+      cost,
+      tokens: { input, output, cache: { read: cacheRead, write: 0 } },
+      time: { created: yesterday, completed: yesterday + 1000 },
+    })
+    // 多项目 × 多模型 × 多 agent 组合
+    put("ra1", "pa", msg(1.5, "prov-x", "model-a", "build", 100, 50, 200))
+    put("ra2", "pa", msg(0.25, "prov-y", "model-a", "explore", 60, 30)) // 同名模型跨 provider
+    put("ra3", "pb", msg(2, "prov-x", "model-b", "build", 200, 100, 400))
+    put("ra4", "pb", msg(0.75, "prov-x", "model-c", "plan", 40, 20, 80))
+    // 无项目归属（projectID NULL）→ 空串桶
+    put("ra5", null, msg(0.5, "prov-y", "model-b", "general", 10, 5, 20))
+    // 缺 cost（订阅内）与缺 tokens 对象
+    put("ra6", "pa", { model: { providerID: "prov-x", id: "model-a" }, agent: "build", time: { created: yesterday, completed: yesterday + 500 } })
+    // agent 缺失 → unknown 桶
+    put("ra7", "pb", { model: { providerID: "prov-x", id: "model-d" }, cost: 0.1, tokens: { input: 30, output: 15 }, time: { created: yesterday, completed: yesterday + 500 } })
+    db.close()
+
+    const recStore = new UsageStore(recFile, () => {})
+    const rec = recStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    // 总量对账
+    expect("recon total cost", rec.totals.cost, want.cost, 1e-9)
+    expect("recon total input", rec.totals.tokens.input, want.input)
+    expect("recon total output", rec.totals.tokens.output, want.output)
+    expect("recon total cacheRead", rec.totals.tokens.cacheRead, want.cacheRead)
+    expect("recon total requests", rec.totals.requests, want.requests)
+    // Σ 模型 = 总量（同名模型跨 provider 必须分行，不合并）
+    let modelCost = 0
+    let modelRows = 0
+    const modelKeys = new Set<string>()
+    for (const row of rec.models) {
+      modelCost += row.cost
+      modelRows += 1
+      modelKeys.add(`${row.providerID}:${row.modelID}`)
+    }
+    expect("recon Σ model cost = total", modelCost, rec.totals.cost, 1e-9)
+    expect("recon model-a split by provider", modelKeys.has("prov-x:model-a") && modelKeys.has("prov-y:model-a"), true)
+    // Σ agent = 总量（unknown 桶保留）
+    let agentCost = 0
+    let hasUnknownAgent = false
+    for (const row of rec.agents) {
+      agentCost += row.cost
+      if (row.agent === "unknown") hasUnknownAgent = true
+    }
+    expect("recon Σ agent cost = total", agentCost, rec.totals.cost, 1e-9)
+    expect("recon unknown agent kept", hasUnknownAgent, true)
+    // Σ 项目 = 总量（无项目桶保留且计入）
+    let projectCost = 0
+    let hasEmptyProject = false
+    for (const row of rec.projectUsage) {
+      projectCost += row.cost
+      if (row.projectID === "") hasEmptyProject = true
+    }
+    expect("recon Σ project cost = total", projectCost, rec.totals.cost, 1e-9)
+    expect("recon projectless bucket kept", hasEmptyProject, true)
+    // Σ 有效 Token 对账（模型维度）
+    let modelTokensSum = 0
+    for (const row of rec.models) modelTokensSum += row.input + row.output
+    expect("recon Σ model tokens = total", modelTokensSum, want.input + want.output)
+    // 缺 cost 的会话贡献 $0 但会话本身计入
+    expect("recon missing cost counted as 0", rec.totals.cost > 0, true)
+    // 会话列表行与聚合口径一致（同一会话跨路径对账）
+    const listed = rec.sessions.find((s) => s.id === "ra1")
+    expect("recon session row cost", listed?.cost ?? -1, 1.5, 1e-9)
+    expect("recon session row tokens", listed ? listed.input + listed.output : -1, 150)
+    // 会话详情（Session Replay 路径）与会话列表行对账
+    const detail = recStore.sessionDetail({ sessionID: "ra1", force: true })
+    expect("recon detail cost = list row", detail.cost, listed?.cost ?? -2, 1e-9)
+    expect("recon detail tokens = list row", detail.tokens.input + detail.tokens.output, 150)
+    recStore.close()
+    require("node:fs").rmSync(recFile)
+  }
+
   if (failures.length > 0) {
     console.error("synthetic data regressions:")
     for (const failure of failures) console.error(`  - ${failure}`)
