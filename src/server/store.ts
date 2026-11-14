@@ -620,8 +620,8 @@ type DayAgg = {
   /** 每个模型的时延样本：modelKey → [providerID, modelID, samples[]] */
   latencyByModel: Record<string, { providerID: string; modelID: string; samples: [number, number, number][] }>
   prompts: number
-  /** 聚合当天的全类型消息总数，用于回退检测 */
-  baseCount?: number
+  /** 聚合当天的源数据指纹（消息数 + 更新时间与数据长度之和），用于缓存校验 */
+  baseFingerprint?: string
 }
 
 /** 磁盘逐日缓存的 schema 版本：结构变化时递增；读到旧版本/缺版本一律删除重算。 */
@@ -644,6 +644,9 @@ function dayFromPlain(plain: unknown, date: string): DayAgg | undefined {
   const value = plain as Record<string, unknown>
   // 无 version 字段的旧缓存（sessionProject 曾被 stringify 成 {}）直接判失效。
   if (value.version !== DAY_CACHE_VERSION || value.date !== date) return undefined
+  // 无指纹的缓存不可信（§3.2）：无法区分「数据仍新鲜」与「同数量内容已修改」，
+  // 升级到指纹校验时的旧文件一律重算，宁可多算一次也不返回偏大结果。
+  if (typeof value.baseFingerprint !== "string") return undefined
   const day = value as unknown as PlainDayAgg & { version: number }
   if (!day.tokens || !day.models || !day.sessions || !day.agents || !day.latencyByModel || !Array.isArray(day.latency)) {
     return undefined
@@ -1015,21 +1018,21 @@ export class UsageStore {
     // 校验是一次毫秒级索引查询，换取缓存永不偏大。
     const memory = this.dayMemory.get(scope)?.get(date)
     if (memory && date !== today) {
-      if (this.dayCount(db, scope, date) === (memory.baseCount ?? -1)) return memory
-      this.log("day memory invalidated (count drift)", `${scope}/${date}`)
+      if (this.dayFingerprint(db, scope, date) === (memory.baseFingerprint ?? "")) return memory
+      this.log("day memory invalidated (fingerprint drift)", `${scope}/${date}`)
       this.dayMemory.get(scope)!.delete(date)
     }
     if (date !== today) {
       const disk = this.readDay(scope, date)
       if (disk) {
-        // 回退/删会话会减少历史消息；数量对不上就丢弃缓存重算。
-        const count = this.dayCount(db, scope, date)
-        if (disk.baseCount === undefined) disk.baseCount = count
-        if (count === disk.baseCount) {
+        // 内容修改/回退/删除都会改变指纹；对不上就丢弃缓存重算。
+        const fingerprint = this.dayFingerprint(db, scope, date)
+        if (disk.baseFingerprint === undefined) disk.baseFingerprint = fingerprint
+        if (fingerprint === disk.baseFingerprint) {
           this.rememberDay(scope, disk)
           return disk
         }
-        this.log("day cache invalidated (count drift)", `${scope}/${date}: ${disk.baseCount} -> ${count}`)
+        this.log("day cache invalidated (fingerprint drift)", `${scope}/${date}`)
       }
     }
 
@@ -1057,7 +1060,7 @@ export class UsageStore {
       )
       .all(...(scope !== "all" ? [from, to, scope] : [from, to]))
     const day = aggregateDay(date, rows)
-    day.baseCount = this.dayCount(db, scope, date)
+    day.baseFingerprint = this.dayFingerprint(db, scope, date)
     this.rememberDay(scope, day)
     // 今天的数据还会变，落盘要等它结束；历史天直接落盘。
     if (date !== today) this.writeDay(scope, day)
@@ -1065,21 +1068,26 @@ export class UsageStore {
   }
 
   /**
-   * 历史天的缓存可信度校验：回退（revert）会删掉旧消息，让缓存聚合偏大。
-   * 每天只做一次 count(*)（有索引，毫秒级）；数量对不上就作废重算。
-   * count 含全部消息类型，与聚合行的差值在同一天内是稳定的，所以把
-   * 首次聚合时的基准也存进文件里对比。
+   * 历史天的缓存可信度校验（§3.2）：单靠消息数量无法发现「同数量内容修改」。
+   * 指纹 = count | sum(time_updated)，同一条索引扫描内取齐。按方案的首选
+   * 顺序利用数据源已有的更新时间：OpenCode 写入路径在更新消息内容时维护
+   * time_updated（真实库中 6.6 万行佐证），内容修改必然触碰该分量；
+   * count 分量捕获删除/新增。曾尝试 sum(length(data)) 作第三分量，
+   * 实测占 83% 校验耗时（需逐行读 JSON payload，30 天 +150ms），换来的
+   * 覆盖（等长原地篡改且不碰 time_updated）不是数据源会产生的行为，
+   * 按方案「设计成本可控的指纹」原则放弃。
    */
-  private dayCount(db: Database, scope: string, date: string): number {
+  private dayFingerprint(db: Database, scope: string, date: string): string {
     const { from, to } = this.dayBounds(date)
-    return num(
-      db
-        .query<Row>(
-          `SELECT count(*) AS n FROM session_message m JOIN session_v2 s ON s.id = m.session_id
-           WHERE m.time_created >= ? AND m.time_created < ?${scope !== "all" ? " AND s.project_id = ?" : ""}`,
-        )
-        .get(...(scope !== "all" ? [from, to, scope] : [from, to]))?.n,
-    )
+    const row = db
+      .query<Row>(
+        `SELECT count(*) AS n,
+                coalesce(sum(m.time_updated), 0) AS touched
+         FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+         WHERE m.time_created >= ? AND m.time_created < ?${scope !== "all" ? " AND s.project_id = ?" : ""}`,
+      )
+      .get(...(scope !== "all" ? [from, to, scope] : [from, to]))
+    return `${num(row?.n)}|${num(row?.touched)}`
   }
 
   snapshot(input: SnapshotInput): Snapshot {

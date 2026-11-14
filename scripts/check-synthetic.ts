@@ -23,7 +23,7 @@ function seed(toBeBytes: (sessionID: string) => string): string {
   const db = new Database(file)
   db.exec(`
     CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
-    CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT);
+    CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
     CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
     CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
   `)
@@ -38,7 +38,7 @@ function seedMain(db: import("bun:sqlite").Database): void {
     "INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)",
   )
   const insertMessage = db.prepare(
-    "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, ?, ?)",
+    "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', 1, ?, ?, ?)",
   )
   // 600 会话：p1 300 个 × $0.01，p2 300 个 × $0.01 → 每项目 $3.00
   for (let index = 0; index < 600; index++) {
@@ -48,6 +48,7 @@ function seedMain(db: import("bun:sqlite").Database): void {
     insertMessage.run(
       `m${index}`,
       sessionID,
+      yesterday,
       yesterday,
       JSON.stringify({
         model: { providerID: "prov", id: "model-a" },
@@ -135,7 +136,7 @@ function main(): void {
     db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-o', NULL, '孤儿', ?, ?)").run(yesterday, yesterday)
     db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-a', 'p1', 'A', ?, ?)").run(yesterday, yesterday)
     const insert = db.prepare(
-      "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, ?, ?)",
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', 1, ?, ?, ?)",
     )
     const payload = JSON.stringify({
       model: { providerID: "prov", id: "model-a" },
@@ -144,8 +145,8 @@ function main(): void {
       tokens: { input: 10, output: 10 },
       time: { created: yesterday, completed: yesterday + 100 },
     })
-    insert.run("m-o", "s-o", yesterday, payload)
-    insert.run("m-a", "s-a", yesterday, payload)
+    insert.run("m-o", "s-o", yesterday, yesterday, payload)
+    insert.run("m-a", "s-a", yesterday, yesterday, payload)
     db.close()
   })
   const orphanStore = new UsageStore(orphanFile, () => {})
@@ -188,6 +189,28 @@ function main(): void {
   expect("corrupted cache recovered cost", corruptedSnap.totals.cost, 6, 1e-6)
   corrupted.close()
 
+  // 11b. 同数量记录内容修改必须触发缓存失效（§3.2）：直接改 DB 里某条
+  // 消息的 cost 并同步 time_updated（OpenCode 写入路径维护的更新信号），
+  // count 不变但指纹漂移，第二次快照必须反映新值。
+  {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const db = new Database(file)
+    const before = db.query("SELECT data FROM session_message WHERE id = 'm0'").get() as { data: string } | undefined
+    const original = JSON.parse(before!.data) as Record<string, unknown>
+    const changed = { ...original, cost: 9.99 }
+    db.query("UPDATE session_message SET data = ?, time_updated = ? WHERE id = 'm0'").run(
+      JSON.stringify(changed),
+      yesterday + 60_000,
+    )
+    db.close()
+  }
+  const mutated = new UsageStore(file, () => {})
+  const mutatedSnap = mutated.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+  // p1 有 300 个 $0.01 会话，m0 改成 $9.99 → p1 3.00 - 0.01 + 9.99 = 12.98
+  const p1 = mutatedSnap.projectUsage.find((row) => row.projectID === "p1")
+  expect("same-count content change invalidates cache", p1?.cost ?? -1, 12.98, 1e-6)
+  mutated.close()
+
   // 12. 长历史完整性（方案 B §五）：120 个月（10 年）跨年历史，每月 1 个会话。
   // 中间空月按 0 保留；总费用 = 会话数 × 单价；跨年边界无重复无遗漏。
   const months = 120
@@ -199,7 +222,7 @@ function main(): void {
       "INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, 'ph', ?, ?, ?)",
     )
     const insertMessage = db.prepare(
-      "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, ?, ?)",
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', 1, ?, ?, ?)",
     )
     for (let index = 0; index < months; index++) {
       // 真实「每月 15 日」：从当月往回推 index 个月，避免 30 天近似导致两个
@@ -214,6 +237,7 @@ function main(): void {
       insertMessage.run(
         `hm${index}`,
         sessionID,
+        stamp,
         stamp,
         JSON.stringify({
           model: { providerID: "prov", id: "model-a" },
