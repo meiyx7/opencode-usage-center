@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite"
+import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, join } from "node:path"
@@ -842,13 +843,31 @@ export class UsageStore {
     private readonly log: (message: string, detail?: unknown) => void = () => {},
   ) {}
 
+  /**
+   * 磁盘缓存目录。scope 之外再叠加数据库身份（路径散列 + 文件大小）：
+   * 不同数据库（换机器、重建 DB、测试里同一目录下的多个临时库）的逐日
+   * 聚合不同但文件名相同，不加隔离会互相污染——聚合数据错乱且指纹可能
+   * 恰好一致而无法察觉。文件大小参与散列是因为重建后的同一路径是不同的库。
+   */
+  private dbCacheKey(): string {
+    try {
+      const size = statSync(this.path).size
+      return createHash("sha1")
+        .update(`${this.path}:${size}`)
+        .digest("hex")
+        .slice(0, 12)
+    } catch {
+      return "nodb"
+    }
+  }
+
   private dayCacheDir(scope: string): string {
     return join(
       process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
       "opencode",
       "usage-center",
       "days",
-      scope.replace(/[^a-zA-Z0-9_-]/g, "_") || "all",
+      `${this.dbCacheKey()}-${scope.replace(/[^a-zA-Z0-9_-]/g, "_") || "all"}`,
     )
   }
 

@@ -337,6 +337,13 @@ function main(): void {
       ["end-next-early", makeStamp(2026, 11, 2, 0, 30, ny)], // 次日凌晨
       ["start-day-noon", makeStamp(2026, 3, 8, 12, 0, ny)], // 23 小时那天中午
       ["start-next-early", makeStamp(2026, 3, 9, 0, 30, ny)], // 次日凌晨，旧实现重复
+      // 日历边界对（前一条 23:30 属前一日，后一条 00:30 属次日）：
+      ["month-end", makeStamp(2026, 9, 30, 23, 30, ny)],
+      ["month-start", makeStamp(2026, 10, 1, 0, 30, ny)],
+      ["year-end", makeStamp(2025, 12, 31, 23, 30, ny)],
+      ["year-start", makeStamp(2026, 1, 1, 0, 30, ny)],
+      ["leap-day", makeStamp(2024, 2, 29, 12, 0, ny)], // 闰年 2/29 存在且只归 2024
+      ["leap-next", makeStamp(2024, 3, 1, 0, 30, ny)],
     ]
     stamps.forEach(([id, stamp], index) => {
       insert.run(id, "s-dst", index + 1, stamp, stamp, JSON.stringify({
@@ -351,15 +358,22 @@ function main(): void {
 
     const dstStore = new UsageStore(dstFile, () => {})
     const dstSnap = dstStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
-    // 5 条消息各统计一次：旧实现漏算 25th hour 那条、重复统计 3/9 凌晨那条
-    expect("DST requests", dstSnap.totals.requests, 5)
-    expect("DST cost", dstSnap.totals.cost, 0.5, 1e-6)
+    // 11 条消息各统计一次（5 条 DST 缝隙 + 6 条日历边界），旧实现在 DST 缝隙上漏算/重复
+    expect("DST requests", dstSnap.totals.requests, 11)
+    expect("DST cost", dstSnap.totals.cost, 1.1, 1e-6)
     const byDate = new Map(dstSnap.series.filter((p) => p.requests > 0).map((p) => [p.date, p.requests]))
     // 11/1：中午 + 23:30（25th hour 的本地日仍是 11/1）；11/2：凌晨 00:30
     expect("DST end day (11/1)", byDate.get("2026-11-01") ?? -1, 2)
     expect("DST day after end (11/2)", byDate.get("2026-11-02") ?? -1, 1)
     expect("DST start day (3/8)", byDate.get("2026-03-08") ?? -1, 1)
     expect("DST day after start (3/9)", byDate.get("2026-03-09") ?? -1, 1)
+    // 月末/月初、年末/年初、闰年 2/29：每天恰好 1 条，无跨日重复或遗漏
+    expect("month-end (9/30)", byDate.get("2026-09-30") ?? -1, 1)
+    expect("month-start (10/1)", byDate.get("2026-10-01") ?? -1, 1)
+    expect("year-end (2025/12/31)", byDate.get("2025-12-31") ?? -1, 1)
+    expect("year-start (2026/1/1)", byDate.get("2026-01-01") ?? -1, 1)
+    expect("leap day (2024/2/29)", byDate.get("2024-02-29") ?? -1, 1)
+    expect("day after leap (2024/3/1)", byDate.get("2024-03-01") ?? -1, 1)
     dstStore.close()
     require("node:fs").rmSync(dstFile)
     } finally {
@@ -400,6 +414,23 @@ function main(): void {
     expect("legacy schema error mentions column", logs.some((l) => l.includes("time_updated")), true)
     legacyStore.close()
     require("node:fs").rmSync(legacyFile)
+
+    // 缺整表：credential 表不存在时同样降级并指名缺表，不崩溃。
+    const noTableFile = `${process.env.TMPDIR ?? "/tmp"}/uc-notable-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db2 = new Database(noTableFile)
+    db2.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+    `)
+    db2.close()
+    const tableLogs: string[] = []
+    const noTableStore = new UsageStore(noTableFile, (message, detail) => tableLogs.push(`${message} ${detail ?? ""}`))
+    const noTableSnap = noTableStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    expect("missing table snapshot empty", noTableSnap.totals.requests, 0)
+    expect("missing table error mentions table", tableLogs.some((l) => l.includes("credential")), true)
+    noTableStore.close()
+    require("node:fs").rmSync(noTableFile)
   }
 
   // 15. 统计口径对账（统计口径统一批次任务 6）：多项目、多模型、多 agent、
@@ -513,6 +544,119 @@ function main(): void {
     expect("recon detail tokens = list row", detail.tokens.input + detail.tokens.output, 150)
     recStore.close()
     require("node:fs").rmSync(recFile)
+
+    // 15b. 单会话单模型最小用例：一个会话一条消息，所有维度对账退化为恒等。
+    const minFile = `${process.env.TMPDIR ?? "/tmp"}/uc-min-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbMin = new Database(minFile)
+    dbMin.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+    `)
+    dbMin.exec(`INSERT INTO project VALUES ('pm', NULL, '/tmp/min', 1)`)
+    dbMin.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('rm1', 'pm', '最小', ?, ?)").run(yesterday, yesterday)
+    dbMin.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('rmm1', 'rm1', 'assistant', 1, ?, ?, ?)").run(
+      yesterday,
+      yesterday,
+      JSON.stringify({ model: { providerID: "prov-x", id: "model-a" }, agent: "build", cost: 0.4, tokens: { input: 80, output: 40, cache: { read: 120, write: 0 } }, time: { created: yesterday, completed: yesterday + 800 } }),
+    )
+    dbMin.close()
+    const minStore = new UsageStore(minFile, () => {})
+    const min = minStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    expect("min requests", min.totals.requests, 1)
+    expect("min cost", min.totals.cost, 0.4, 1e-9)
+    expect("min models rows", min.models.length, 1)
+    expect("min model = total", min.models[0]?.cost ?? -1, min.totals.cost, 1e-9)
+    expect("min agents rows", min.agents.length, 1)
+    expect("min project rows", min.projectUsage.length, 1)
+    expect("min sessions", min.totals.sessions, 1)
+    const minDetail = minStore.sessionDetail({ sessionID: "rm1", force: true })
+    expect("min detail cost", minDetail.cost, 0.4, 1e-9)
+    expect("min detail requests", minDetail.requestCount, 1)
+    minStore.close()
+    require("node:fs").rmSync(minFile)
+
+    // 15c. 无模型归属：缺 model 字段的消息必须进 unknown 模型桶，不丢失。
+    const unkFile = `${process.env.TMPDIR ?? "/tmp"}/uc-unk-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbUnk = new Database(unkFile)
+    dbUnk.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+    `)
+    dbUnk.exec(`INSERT INTO project VALUES ('pu', NULL, '/tmp/unk', 1)`)
+    dbUnk.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('ru1', 'pu', '无模型', ?, ?)").run(yesterday, yesterday)
+    dbUnk.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('rum1', 'ru1', 'assistant', 1, ?, ?, ?)").run(
+      yesterday,
+      yesterday,
+      JSON.stringify({ agent: "build", cost: 0.7, tokens: { input: 20, output: 10 }, time: { created: yesterday, completed: yesterday + 300 } }),
+    )
+    dbUnk.close()
+    const unkStore = new UsageStore(unkFile, () => {})
+    const unk = unkStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    expect("unknown model requests", unk.totals.requests, 1)
+    expect("unknown model cost kept", unk.totals.cost, 0.7, 1e-9)
+    expect("unknown model bucket", unk.models.length, 1)
+    expect("unknown model id", unk.models[0]?.modelID ?? "", "unknown")
+    expect("unknown model provider", unk.models[0]?.providerID ?? "", "unknown")
+    expect("unknown Σ model = total", unk.models[0]?.cost ?? -1, unk.totals.cost, 1e-9)
+    unkStore.close()
+    require("node:fs").rmSync(unkFile)
+
+    // 15d. 分页对账：会话详情翻页（beforeTurn）的各页费用/Token 之和 = 整会话总量。
+    const pageFile = `${process.env.TMPDIR ?? "/tmp"}/uc-page-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbPage = new Database(pageFile)
+    dbPage.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+    `)
+    dbPage.exec(`INSERT INTO project VALUES ('pp', NULL, '/tmp/page', 1)`)
+    dbPage.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('rp1', 'pp', '分页', ?, ?)").run(yesterday, yesterday)
+    const pageMsg = dbPage.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    // 5 个回合，每回合 1 条 user + 1 条 assistant（cost 0.1 × 5 = 0.5）
+    const turnCount = 5
+    for (let index = 0; index < turnCount; index++) {
+      const at = yesterday - (turnCount - index) * 3_600_000
+      pageMsg.run(`pm-u${index}`, "rp1", "user", index * 2 + 1, at, at, JSON.stringify({ text: `第 ${index + 1} 问` }))
+      pageMsg.run(`pm-a${index}`, "rp1", "assistant", index * 2 + 2, at + 1000, at + 1000, JSON.stringify({
+        model: { providerID: "prov-x", id: "model-a" },
+        agent: "build",
+        cost: 0.1,
+        tokens: { input: 50, output: 25 },
+        time: { created: at + 1000, completed: at + 2000 },
+      }))
+    }
+    dbPage.close()
+    const pageStore = new UsageStore(pageFile, () => {})
+    const fullDetail = pageStore.sessionDetail({ sessionID: "rp1", force: true })
+    expect("page full cost", fullDetail.cost, turnCount * 0.1, 1e-9)
+    expect("page full turns", fullDetail.turns.length, turnCount)
+    // 逐页往后翻，各页之和必须等于整会话
+    let pageCost = 0
+    let pageTurns = 0
+    let before: number | undefined
+    for (;;) {
+      const page = pageStore.sessionDetail({ sessionID: "rp1", beforeTurn: before, limit: 2, force: true })
+      for (const turn of page.turns) {
+        pageCost += turn.cost
+        pageTurns += 1
+      }
+      if (!page.hasMore) break
+      before = page.nextBefore
+    }
+    expect("page turns sum = full", pageTurns, turnCount)
+    expect("page cost sum = full", pageCost, fullDetail.cost, 1e-9)
+    pageStore.close()
+    require("node:fs").rmSync(pageFile)
   }
 
   if (failures.length > 0) {
