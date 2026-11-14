@@ -94,11 +94,12 @@ cacheWrite，而「回合 Token 柱状图」(session-detail.tsx L863) 漏加 cac
 | 分页 | 渲染分页（visibleCount），不影响汇总 | ✅ |
 | 缓存键 | 前端 `VIEW_CACHE` 键 = range+scope；后端快照缓存键 = from/to/project | 范围变化正确区分 ✅ |
 
-## 8. 本批依据审计结论执行的改动
+## 8. 依据审计结论执行的改动
 
 1. **任务 2**：新增 `src/gui/metrics.ts`——「有效 Token」与「缓存命中率」两个重复计算
-   的公式的单一来源；前端 5 处调用点收敛；回合柱状图漏 cacheWrite 一并修复。
-2. **任务 6**：`check-synthetic.ts` 新增对账场景——Σ模型=Σagent=Σ项目=总费用、
+   的公式的单一来源；前端全部调用点收敛（首轮 5 处、评审后含 TrendChart 等 10 处）；
+   回合柱状图漏 cacheWrite 一并修复。
+2. **任务 6**：`check-synthetic.ts` 对账场景——Σ模型=Σagent=Σ项目=总费用、
    Token 对账、会话列表行 vs 会话详情（同一会话跨路径 cost/token 相等）、
    跨 provider 同名模型不合并、unknown 桶保留；15b 单会话单模型最小用例、
    15c 无 model 字段消息进 unknown 模型桶、15d 分页 Replay 各页之和 = 整会话。
@@ -113,5 +114,78 @@ cacheWrite，而「回合 Token 柱状图」(session-detail.tsx L863) 漏加 cac
 指纹校验也无法察觉。修复：缓存目录嵌入数据库身份（路径 sha1 前 12 位 + 文件大小），
 重建后的同路径库也会得到独立目录。
 
-**等待确认的口径决策（本批未动）**：R1（reasoning 是否计入有效 Token）、
-C1（$0 与缺失 cost 的区分）、Sessions 页模型筛选是否改为 provider+modelID 精确匹配。
+## 9. 三个待确认统计口径的分析与推荐（评审任务 6，等产品侧确认）
+
+### R1：Reasoning Token 是否计入有效 Token？
+
+**现状**：有效 Token = input + output，reasoning 独立字段不参与任何汇总 KPI。
+
+**数据结构实际含义**（真实 DB 验证）：OpenCode 消息的 tokens 对象中 `output` 与
+`reasoning` 是**并列的独立字段**，reasoning 不包含在 output 里——证据：
+- 35218 行含非零 reasoning；其中 reasoning > output 的有 17119 行（存在
+  output=0 而 reasoning=64000 的极端样本），output > reasoning 的有 18022 行
+- reasoning 总量是 output 总量的 166%，若已含在 output 内不可能超过 100%
+
+**重复累计风险**：计入 reasoning 不会重复（字段独立）；**不计入**则思考密集型
+模型的输出被低估（如 claude/gpt 高推理档位，真实「生成量」≈ output + reasoning）。
+
+**影响范围（若改为 input + output + reasoning）**：
+- Overview 有效 Token KPI、Token 趋势图、峰值与日均——数值上升，幅度取决于
+  用户的模型构成（本机数据约 +37%）
+- 模型分布排序与占比、模型费用洞察的 tokenShare——排名可能变化（高推理模型上升）
+- Sessions 列表有效 Token 列、CSV 导出、成本归因卡零费用时的占比分母
+- 趋势对比（delta）、缓存命中率口径不变（分母不涉及 output）
+- 合成测试所有 Token 预期值需同步更新
+
+**推荐方案**：改为 `input + output + reasoning`，理由：reasoning 是模型实际生成
+的输出 token，计费语义上也按输出价计；现状低估会让「输出速度 tok/s」（分母是
+时延不是 token）之外的所有 Token 口径失真。**变更成本集中在期望值更新，无
+性能影响**。但该口径已用于多个已发布版本的展示，历史数据无影响（聚合时字段
+独立保留，随时可重算），建议产品侧确认后一次切换并在 UI 口径说明里标注。
+
+### C1：如何区分 Cost 为 0 和 Cost 缺失？
+
+**现状**：两者都按 0 处理。真实 DB 分布：缺失 125 行（0.2%）、=0 58555 行（92%）、
+>0 4592 行（7%）——缺失占比极小，但语义完全不同：
+- **=0**：订阅内调用、免费模型——真实发生且费用确为 0
+- **缺失**：老版本 OpenCode 没写 cost 字段、或消息尚未完成计费——**未知**，不是 0
+
+**对总费用的影响**：缺失按 0 不会让总额偏大（宁小不大），符合「缓存永不偏大」
+的既有原则；但费用完整性（真实消费 ≥ 当前显示值）无法从 UI 判断。
+**对模型排名的影响**：缺失 cost 的模型会在「按费用排序」中垫底，与免费模型混淆。
+
+**是否加缺失计数**：可以在 Snapshot.samples 或 ModelRow 里加 `missingCost` 计数
+（wire 契约变更，向后兼容——新字段），UI 在费用卡片标注「N 条请求未记录费用」。
+
+**推荐方案**：加 `missingCost` 计数并在 UI 提示，**不做缺失推算**（不把缺失按
+模型单价反推为真实消费——推算值会污染「读取优先」的 cost 口径）。等待确认后
+实施；当前 0.2% 的缺失占比下优先级不高。
+
+### C2：Sessions 模型筛选是否精确到 Provider？
+
+**现状**：模型统计按 `providerID\0modelID` 分行（正确），但 Sessions 页模型筛选
+下拉只按 `modelID` 匹配（`session.modelID !== modelFilter()`）——同名模型跨
+Provider 会被一起筛出。真实 DB 有 7 个同名模型跨 2-3 个 Provider
+（如 deepseek-v4.1-flash 同名 3 个 Provider、11543 条消息）。
+
+**对用户理解的影响**：从 Overview 模型分布（按 provider+model 分行）钻取到
+Sessions 时，用户点的是「prov-x / deepseek-v4.1-flash」这一行，但筛出的列表混入
+其他 Provider 的同名会话——钻取意图与结果不一致，是目前唯一一处跨页面口径
+错位（其他页签共享同一 snapshot，天然一致）。
+
+**影响与方案**：筛选标识改为 `providerID:modelID` 组合（SessionRow 已携带两个
+字段，纯前端改动）；下拉选项按组合去重、显示 provider 名。API 无需变更。
+**推荐方案**：统一为 provider+model 精确匹配，与模型分布行、模型统计的归因
+键一致。等待确认后实施（涉及下拉交互变化，属 UI 行为调整）。
+
+## 10. 评审任务遗留修复记录
+
+- **性能测试内存测量**（评审任务 1）：改子进程隔离 + 平台单位换算 + 基线/峰值/
+  增量三项报告；发现并绕过 Bun `-e` 长脚本静默不执行的坑（改独立 worker 文件）。
+- **独立预期值对账**（评审任务 1）：数据构造时独立累计 7 个 token/cost 分量与
+  三维度费用，子进程内与统计结果全量对账。
+- **DST 多时区**（评审任务 2）：纽约/伦敦 DST 缝隙 + 上海普通日期 + 月末年末对，
+  旧实现敏感度验证通过（NY 与 London 各漏 1 条/多 1 条）。
+- **前端公式收敛**（评审任务 4）：metrics.ts 扩展 pointTokens/sessionTokens/
+  agentTokens/projectUsageTokens/pointCacheHit，page.tsx 全部 10 处内联公式收敛；
+  「有效 Token」口径说明文字（glossary）不属于公式，保留原文。

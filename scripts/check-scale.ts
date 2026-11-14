@@ -1,15 +1,23 @@
 /**
- * 大规模历史数据性能测试（本批任务 3）：三档规模实测冷/热耗时与峰值内存。
+ * 大规模历史数据性能测试（数据可靠性收尾批次任务 3；评审修订版）。
  *
- * 场景：12 月 × 1k 会话（基准）、36 月 × 10k（中等）、60 月 × 50k（大规模）。
- * 数据特征：多项目、多模型、多 agent、不同 token/cost/耗时、部分无项目归属、
- * 部分缺统计字段。每会话多条消息，全部数据可复现（固定种子）。
+ * 三档规模：12 月 × 1k / 36 月 × 10k / 60 月 × 50k 会话，数据特征覆盖
+ * 多项目、多模型、多 agent、不同 token/cost/耗时、部分无项目归属、
+ * 部分缺统计字段、非零 reasoning/cacheWrite。全部数据可复现（固定种子）。
  *
- * 观察：冷缓存首次统计、热缓存重复统计、缓存淘汰后统计完整性、
- * 内存峰值（maxRSS 差值）。结果一致性做断言（总费用跨路径必须相等）。
+ * 测量方式（评审 P0 修订）：
+ * - 统计阶段在独立子进程中执行：数据构造（父进程）不污染统计的 RSS 基线。
+ * - 子进程记录统计前基线 RSS 与执行期间的峰值 RSS，按平台正确换算
+ *   （macOS ru_maxrss 单位为 bytes，Linux 为 KB）。
+ * - 报告基线 RSS、峰值 RSS、统计阶段内存增量，不再使用跨阶段的历史
+ *   maxRSS 当作本次统计的内存结果。
  *
- * 用法：bun scripts/check-scale.ts [scale]，scale = base|medium|large|all（默认 all）。
- * 大规模档需要 ~2 分钟和 ~1GB 内存，内存不足时用 base|medium 分级跑。
+ * 对账方式（评审 P0 修订）：
+ * - 数据生成时独立累计预期值（sessions/requests/各 Token 分量/cost/
+ *   项目·模型·Agent 维度费用），不从被测统计结果反推。
+ * - 实际统计结果与独立预期值对账，缺失字段与未知归属单独断言。
+ *
+ * 用法：bun scripts/check-scale.ts [base|medium|large|all]（默认 all）。
  */
 import { UsageStore } from "../src/server/store"
 
@@ -27,7 +35,7 @@ const CASES: Record<string, ScaleCase> = {
   large: { name: "大规模 60 月 × 50k 会话", months: 60, sessions: 50_000 },
 }
 
-/** 可复现伪随机：mulberry32 */
+/** 可复现伪随机：mulberry32。种子由规模决定，同档数据逐次一致。 */
 function rng(seed: number): () => number {
   let a = seed
   return () => {
@@ -39,9 +47,48 @@ function rng(seed: number): () => number {
   }
 }
 
-/** 构造大规模合成库。返回 DB 文件路径与实际消息数。 */
-function buildDb(scale: ScaleCase, dir: string): { file: string; messages: number } {
+/** 独立累计的预期值（数据生成阶段填充，与被测统计完全无关）。 */
+interface Expected {
+  sessions: number
+  requests: number
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+  projectCost: Map<string, number>
+  modelCost: Map<string, number>
+  agentCost: Map<string, number>
+}
+
+function newExpected(): Expected {
+  return {
+    sessions: 0,
+    requests: 0,
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    projectCost: new Map(),
+    modelCost: new Map(),
+    agentCost: new Map(),
+  }
+}
+
+function bumpCost(map: Map<string, number>, key: string, value: number): void {
+  map.set(key, (map.get(key) ?? 0) + value)
+}
+
+/**
+ * 构造大规模合成库，同时独立累计预期值。
+ * 返回 DB 文件路径、消息总数与预期对象（供子进程对账用，序列化为 JSON）。
+ */
+function buildDb(scale: ScaleCase, dir: string): { file: string; messages: number; expectedPath: string } {
   const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+  const { writeFileSync } = require("node:fs") as typeof import("node:fs")
   const file = `${dir}/uc-scale-${scale.sessions}.db`
   const db = new Database(file)
   db.exec(`
@@ -52,7 +99,6 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
     CREATE INDEX session_message_time_created_idx ON session_message (time_created);
     CREATE INDEX session_v2_project_idx ON session_v2 (project_id);
   `)
-  const now = new Date()
   const rand = rng(scale.sessions)
 
   const projects: string[] = []
@@ -72,6 +118,7 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
   const models = ["model-a", "model-b", "model-c", "model-d"]
   const providers = ["prov-x", "prov-y"]
   const agents = ["build", "explore", "plan", "general"]
+  const expected = newExpected()
   let messages = 0
   let batch: unknown[][] = []
   const flush = () => {
@@ -82,8 +129,9 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
   }
 
   for (let s = 0; s < scale.sessions; s++) {
-    // 会话起点：从现在往回铺满 months 个月；部分会话无项目（NULL）
-    const projectID = s % 17 === 0 ? null : projects[s % projects.length]
+    // 会话起点从现在往回铺满 months 个月；部分会话无项目（NULL，约 6%）
+    const projectless = s % 17 === 0
+    const projectID = projectless ? null : projects[s % projects.length]
     const span = scale.months * 30 * DAY
     const start = Date.now() - rand() * span
     const msgCount = 2 + Math.floor(rand() * 6) // 2-7 条消息
@@ -97,22 +145,41 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
       const agent = agents[Math.floor(rand() * agents.length)]
       const input = Math.floor(100 + rand() * 19_900)
       const output = Math.floor(10 + rand() * 4_990)
+      const reasoning = rand() < 0.4 ? Math.floor(rand() * 5_000) : 0
       const cacheRead = Math.floor(rand() * 200_000)
+      const cacheWrite = rand() < 0.3 ? Math.floor(rand() * 20_000) : 0
       const cost = Math.round(rand() * 50_000) / 100_000 // $0-0.5
       sessionCost += cost
-      // 部分（2%）缺 cost/tokens 字段
-      const payload =
-        rand() < 0.02
-          ? JSON.stringify({ model: { providerID, id: modelID }, agent })
-          : JSON.stringify({
-              model: { providerID, id: modelID },
-              agent,
-              cost,
-              tokens: { input, output, cache: { read: cacheRead, write: 0 } },
-              time: { created: at, completed: at + Math.floor(500 + rand() * 30_000) },
-            })
+      // 2% 消息缺整个 tokens 对象（与 cost 一起缺失）
+      const missing = rand() < 0.02
+      const payload = missing
+        ? JSON.stringify({ model: { providerID, id: modelID }, agent })
+        : JSON.stringify({
+            model: { providerID, id: modelID },
+            agent,
+            cost,
+            tokens: { input, output, reasoning, cache: { read: cacheRead, write: cacheWrite } },
+            time: { created: at, completed: at + Math.floor(500 + rand() * 30_000) },
+          })
       batch.push([`m${s}-${m}`, `s${s}`, at, at, payload])
       messages += 1
+      // 独立预期值：与聚合的 num() 语义一致——缺失字段按 0
+      const eCost = missing ? 0 : cost
+      const eInput = missing ? 0 : input
+      const eOutput = missing ? 0 : output
+      const eReasoning = missing ? 0 : reasoning
+      const eCacheRead = missing ? 0 : cacheRead
+      const eCacheWrite = missing ? 0 : cacheWrite
+      expected.requests += 1
+      expected.cost += eCost
+      expected.input += eInput
+      expected.output += eOutput
+      expected.reasoning += eReasoning
+      expected.cacheRead += eCacheRead
+      expected.cacheWrite += eCacheWrite
+      bumpCost(expected.modelCost, `${providerID}:${modelID}`, eCost)
+      bumpCost(expected.agentCost, agent, eCost)
+      bumpCost(expected.projectCost, projectless ? "" : projectID!, eCost)
       if (batch.length >= 5000) flush()
     }
     insertSession.run(
@@ -128,93 +195,68 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
       null,
       null,
     )
+    expected.sessions += 1
     if (s % 5000 === 0) flush()
   }
   flush()
   db.close()
-  return { file, messages }
+  const expectedPath = `${dir}/expected-${scale.sessions}.json`
+  writeFileSync(expectedPath, JSON.stringify(expected))
+  return { file, messages, expectedPath }
 }
 
 function fmtMB(bytes: number): string {
   return `${(bytes / 1048576).toFixed(0)}MB`
 }
 
+
 function runScale(scale: ScaleCase, dir: string, cacheDir: string): boolean {
   console.log(`\n=== ${scale.name} ===`)
   const t0 = performance.now()
-  const { file, messages } = buildDb(scale, dir)
+  const { file, messages, expectedPath } = buildDb(scale, dir)
   console.log(`数据构造 ${fmtMB(require("node:fs").statSync(file).size)} DB / ${messages} 消息 / ${(performance.now() - t0).toFixed(0)}ms`)
 
   // 独立缓存目录：冷缓存从空目录开始
   const coldCache = `${cacheDir}/cold-${scale.sessions}`
   require("node:fs").mkdirSync(coldCache, { recursive: true })
-  const scopeEnv = process.env.XDG_CACHE_HOME
-  process.env.XDG_CACHE_HOME = coldCache
 
-  const store = new UsageStore(file, () => {})
-  const from = 0
-  const to = Date.now()
-
-  // 冷缓存首次统计（全部历史）
-  const coldStart = performance.now()
-  const cold = store.snapshot({ from, to, projectID: undefined, force: true })
-  const coldMs = performance.now() - coldStart
-  const coldRSS = process.resourceUsage().maxRSS / 1024
-
-  // 热缓存重复统计（逐日缓存全命中）
-  const warmStart = performance.now()
-  const warm = store.snapshot({ from, to, projectID: undefined, force: true })
-  const warmMs = performance.now() - warmStart
-  const warmRSS = process.resourceUsage().maxRSS / 1024
-
-  // 再热一次（指纹校验路径）
-  const warm2Start = performance.now()
-  const warm2 = store.snapshot({ from, to, projectID: undefined, force: true })
-  const warm2Ms = performance.now() - warm2Start
-
-  const failures: string[] = []
-  const expect = (label: string, actual: unknown, wanted: unknown, tolerance = 0) => {
-    const ok =
-      typeof actual === "number" && typeof wanted === "number"
-        ? Math.abs(actual - wanted) <= tolerance
-        : actual === wanted
-    if (!ok) failures.push(`${label}: got ${actual}, want ${wanted}`)
-  }
-
-  // 一致性断言：冷/热/再热三条路径的总费用与请求数完全一致
-  expect("cold requests", cold.totals.requests, warm.totals.requests)
-  expect("cold cost", cold.totals.cost, warm.totals.cost, 1e-9)
-  expect("warm cost (repeat)", warm.totals.cost, warm2.totals.cost, 1e-9)
-  expect("cold sessions", cold.totals.sessions, warm.totals.sessions)
-  // 统计完整性：requests > 0，且缓存淘汰（60 月 > DAY_CACHE_LIMIT=600 天）后
-  // series 活跃天数仍与带数据的天数一致（趋势数据不受淘汰影响）
-  expect("requests > 0", cold.totals.requests > 0, true)
-  const withData = cold.series.filter((p) => p.requests > 0).length
-  expect("series with data > 0", withData > 0, true)
-  expect("activeDays matches series", cold.totals.activeDays, withData)
-  // 项目归因之和 = 总费用（完整聚合归组，不受 LIMIT 500 影响）
-  const projectSum = cold.projectUsage.reduce((sum, row) => sum + row.cost, 0)
-  expect("project cost sum = total", projectSum, cold.totals.cost, 1e-6)
-
-  const modelSum = Object.values(cold.models).reduce((sum, m) => sum + m.cost, 0)
-  expect("model cost sum = total", modelSum, cold.totals.cost, 1e-6)
-
-  console.log(`冷缓存  ${coldMs.toFixed(0)}ms  req ${cold.totals.requests}  cost $${cold.totals.cost.toFixed(2)}  峰值内存 ${fmtMB(coldRSS * 1024)}`)
-  console.log(`热缓存  ${warmMs.toFixed(0)}ms  峰值内存 ${fmtMB(warmRSS * 1024)}`)
-  console.log(`再热    ${warm2Ms.toFixed(0)}ms`)
-  console.log(`series ${cold.series.length} 天（有数据 ${withData} 天）/ 模型 ${cold.models.length} 行 / 项目 ${cold.projectUsage.length} 行`)
-
-  store.close()
-  if (scopeEnv === undefined) delete process.env.XDG_CACHE_HOME
-  else process.env.XDG_CACHE_HOME = scopeEnv
-  require("node:fs").rmSync(file)
-
-  if (failures.length > 0) {
-    console.error(`${scale.name} 回归:`)
-    for (const f of failures) console.error(`  - ${f}`)
+  // 统计阶段在独立子进程中执行：父进程的数据构造不进入子进程的内存历史。
+  // 注意必须用文件模式（scripts/scale-worker.ts）而不是 bun -e：Bun 1.3 对
+  // 约 4KB 以上的 -e 脚本会静默不执行（exit 0、无输出、无错误）。
+  const outPath = `${dir}/result-${scale.sessions}.json`
+  const childInputPath = `${dir}/input-${scale.sessions}.json`
+  require("node:fs").writeFileSync(
+    childInputPath,
+    JSON.stringify({ file, expectedPath, outPath }),
+  )
+  const workerPath = require.resolve("./scale-worker")
+  const child = Bun.spawnSync({
+    cmd: [process.execPath, workerPath, workerPath, childInputPath],
+    env: { ...process.env, XDG_CACHE_HOME: coldCache },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  if (child.exitCode !== 0) {
+    console.error(`${scale.name} 子进程失败（exit ${child.exitCode}）:`)
+    console.error(child.stderr.toString().slice(0, 2000))
+    // 对账失败（exit 2）时结果文件仍写出了失败明细，尽量打印
+    try {
+      const r = JSON.parse(require("node:fs").readFileSync(outPath, "utf8"))
+      for (const f of r.failures ?? []) console.error(`  - ${f}`)
+    } catch {
+      // 结果文件不存在就以 stderr 为准
+    }
     return false
   }
-  console.log(`${scale.name} 通过`)
+  const r = JSON.parse(require("node:fs").readFileSync(outPath, "utf8"))
+
+  // 子进程已完成全部对账断言（失败会 exit 2）；这里汇总展示
+  console.log(`冷缓存  ${r.coldMs.toFixed(0)}ms  req ${r.actual.requests}  cost $${r.actual.cost.toFixed(2)}`)
+  console.log(`热缓存  ${r.warmMs.toFixed(0)}ms  再热 ${r.warm2Ms.toFixed(0)}ms`)
+  console.log(`内存  统计前基线 ${fmtMB(r.baseline)} · 进程峰值 ${fmtMB(r.peakProc)} · 统计增量 ≈ ${fmtMB(r.peakProc - r.baseline)}`)
+  console.log(`series ${r.seriesWithData} 天有数据 / 模型 ${r.modelRows} / 项目 ${r.projectRows} / agent ${r.agentRows} 行`)
+
+  console.log(`${scale.name} 通过（独立预期值对账 + 三维度对账全部一致）`)
   return true
 }
 
@@ -235,7 +277,7 @@ function main(): void {
   }
   require("node:fs").rmSync(dir, { recursive: true, force: true })
   if (!ok) process.exit(1)
-  console.log("\nscale ok: cold/warm parity, attribution sums match, series complete after eviction")
+  console.log("\nscale ok: independent expectations reconciled, cold/warm parity, per-stage memory measured")
 }
 
 main()

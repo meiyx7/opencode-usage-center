@@ -287,99 +287,109 @@ function main(): void {
   expect("history cold-start active days", historyColdSnap.totals.activeDays, expectedMonths)
   historyCold.close()
 
-  // 13. DST 夏令时日期边界（本批任务 1）：dayBounds 必须按本地日历推次日
-  // 零点。在美国 DST 结束日（11/1，25 小时）与开始日（3/8，23 小时）前后
-  // 各放消息，固定 +86400000 的旧实现会把边界偏 1 小时：25th hour 那条
-  // 漏算、3/9 凌晨那条被重复统计。测试块内固定运行时区为纽约，期望值
-  // 与 CI 的时区无关。
+  // 13. DST 夏令时日期边界（本批任务 1 + 评审 P1）：dayBounds 必须按本地
+  // 日历推次日零点。在 DST 结束日（25 小时）与开始日（23 小时）前后的
+  // 「差异缝隙」上放消息：固定 +86400000 的旧实现会把边界偏 1 小时——
+  // 25th hour 那条漏算、开始日次日凌晨那条被重复统计。每个时区一套
+  // 期望值，测试块内固定运行时区，与 CI 的时区无关。
   {
     const prevTZ = process.env.TZ
-    process.env.TZ = "America/New_York"
-    try {
     const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
-    const dstFile = `${process.env.TMPDIR ?? "/tmp"}/uc-dst-${process.pid}-${Math.random().toString(36).slice(2)}.db`
-    const db = new Database(dstFile)
-    db.exec(`
-      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
-      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
-      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
-      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
-    `)
-    db.exec(`INSERT INTO project VALUES ('pd', NULL, '/tmp/dst', 1)`)
-    db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-dst', 'pd', 'DST', NULL, NULL)").run()
-    const insert = db.prepare(
-      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
-    )
     // 用带固定偏移的 UTC 时间反向构造各时区的本地时刻：先查该时区在该
     // 时刻的偏移量，再从 UTC 减掉偏移。避免依赖运行环境时区。
     const makeStamp = (y: number, m: number, d: number, hh: number, mm: number, tz: string) => {
       const iso = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`
-      // 该时区 `${iso}Z` 时刻的偏移（分钟）：local = utc + offset
       const offsetMinutes = new Date(`${iso}Z`).toLocaleString("en-US", { timeZone: tz, timeZoneName: "longOffset" })
       const match = /GMT([+-]\d{2}):(\d{2})/.exec(offsetMinutes)
       const sign = match?.[1].startsWith("-") ? -1 : 1
       const oh = parseInt(match?.[1].slice(1) ?? "0", 10)
       const om = parseInt(match?.[2] ?? "0", 10)
       const utcGuess = new Date(`${iso}Z`).getTime()
-      // local(utcGuess) 显示为 hh:mm，实际本地时刻 = utcGuess + offset。
-      // 我们要 local 显示为 iso，即 utc = utcGuess - offset。
       return utcGuess - sign * (oh * 60 + om) * 60_000
     }
-    // 2026 年美国 DST：3 月 8 日 02:00 开始（当天 23 小时），11 月 1 日
-    // 02:00 结束（当天 25 小时）。消息特意放在新旧实现的差异缝隙上：
-    // - DST 结束日的最后一小时（11/1 23:30 EST）：旧实现 [from+24h) 漏算
-    // - DST 开始日的次日凌晨（3/9 00:30 EDT）：旧实现把 3/8 的 to 多撑 1
-    //   小时，与 3/9 重叠，重复统计
-    const ny = "America/New_York"
-    const stamps = [
-      ["end-day-noon", makeStamp(2026, 11, 1, 12, 0, ny)], // 25 小时那天中午
-      ["end-day-late", makeStamp(2026, 11, 1, 23, 30, ny)], // 25th hour，旧实现漏算
-      ["end-next-early", makeStamp(2026, 11, 2, 0, 30, ny)], // 次日凌晨
-      ["start-day-noon", makeStamp(2026, 3, 8, 12, 0, ny)], // 23 小时那天中午
-      ["start-next-early", makeStamp(2026, 3, 9, 0, 30, ny)], // 次日凌晨，旧实现重复
-      // 日历边界对（前一条 23:30 属前一日，后一条 00:30 属次日）：
-      ["month-end", makeStamp(2026, 9, 30, 23, 30, ny)],
-      ["month-start", makeStamp(2026, 10, 1, 0, 30, ny)],
-      ["year-end", makeStamp(2025, 12, 31, 23, 30, ny)],
-      ["year-start", makeStamp(2026, 1, 1, 0, 30, ny)],
-      ["leap-day", makeStamp(2024, 2, 29, 12, 0, ny)], // 闰年 2/29 存在且只归 2024
-      ["leap-next", makeStamp(2024, 3, 1, 0, 30, ny)],
+    // 每个时区：DST 开始/结束日（无 DST 的时区只放月末年末对）与期望分桶。
+    // gap 消息专挑新旧实现差异缝隙（23:30 / 次日 00:30）；pair 消息验证
+    // 普通日历边界（前一条 23:30 属前一日，后一条 00:30 属次日）。
+    const CASES13: { tz: string; messages: { date: string; hh: number; mm: number }[]; want: Record<string, number> }[] = [
+      {
+        tz: "America/New_York",
+        messages: [
+          { date: "2026-11-01", hh: 12, mm: 0 }, // 25 小时那天中午
+          { date: "2026-11-01", hh: 23, mm: 30 }, // 25th hour，旧实现漏算
+          { date: "2026-11-02", hh: 0, mm: 30 }, // 次日凌晨
+          { date: "2026-03-08", hh: 12, mm: 0 }, // 23 小时那天中午
+          { date: "2026-03-09", hh: 0, mm: 30 }, // 次日凌晨，旧实现重复
+        ],
+        want: { "2026-11-01": 2, "2026-11-02": 1, "2026-03-08": 1, "2026-03-09": 1 },
+      },
+      {
+        tz: "Europe/London",
+        messages: [
+          { date: "2026-10-25", hh: 12, mm: 0 }, // 英国 DST 结束（25 小时那天）中午
+          { date: "2026-10-25", hh: 23, mm: 30 }, // 25th hour
+          { date: "2026-10-26", hh: 0, mm: 30 },
+          { date: "2026-03-29", hh: 12, mm: 0 }, // 英国 DST 开始（23 小时那天）中午
+          { date: "2026-03-30", hh: 0, mm: 30 },
+        ],
+        want: { "2026-10-25": 2, "2026-10-26": 1, "2026-03-29": 1, "2026-03-30": 1 },
+      },
+      {
+        tz: "Asia/Shanghai",
+        // 无夏令时：24 小时日 + 月末/年末边界（评审要求普通日期覆盖）
+        messages: [
+          { date: "2026-06-15", hh: 12, mm: 0 },
+          { date: "2026-06-15", hh: 23, mm: 30 },
+          { date: "2026-06-16", hh: 0, mm: 30 },
+          { date: "2026-01-31", hh: 23, mm: 30 },
+          { date: "2026-02-01", hh: 0, mm: 30 },
+          { date: "2025-12-31", hh: 23, mm: 30 },
+          { date: "2026-01-01", hh: 0, mm: 30 },
+        ],
+        want: { "2026-06-15": 2, "2026-06-16": 1, "2026-01-31": 1, "2026-02-01": 1, "2025-12-31": 1, "2026-01-01": 1 },
+      },
     ]
-    stamps.forEach(([id, stamp], index) => {
-      insert.run(id, "s-dst", index + 1, stamp, stamp, JSON.stringify({
-        model: { providerID: "prov", id: "model-a" },
-        agent: "build",
-        cost: 0.1,
-        tokens: { input: 100, output: 50 },
-        time: { created: stamp, completed: stamp + 100 },
-      }))
-    })
-    db.close()
+    for (const spec of CASES13) {
+      process.env.TZ = spec.tz
+      const dstFile = `${process.env.TMPDIR ?? "/tmp"}/uc-dst-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+      const db = new Database(dstFile)
+      db.exec(`
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+        CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      `)
+      db.exec(`INSERT INTO project VALUES ('pd', NULL, '/tmp/dst', 1)`)
+      db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-dst', 'pd', 'DST', NULL, NULL)").run()
+      const insert = db.prepare(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
+      )
+      spec.messages.forEach((item, index) => {
+        const [y, m, d] = item.date.split("-").map((v) => parseInt(v, 10))
+        const stamp = makeStamp(y, m, d, item.hh, item.mm, spec.tz)
+        insert.run(`${spec.tz}-${index}`, "s-dst", index + 1, stamp, stamp, JSON.stringify({
+          model: { providerID: "prov", id: "model-a" },
+          agent: "build",
+          cost: 0.1,
+          tokens: { input: 100, output: 50 },
+          time: { created: stamp, completed: stamp + 100 },
+        }))
+      })
+      db.close()
 
-    const dstStore = new UsageStore(dstFile, () => {})
-    const dstSnap = dstStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
-    // 11 条消息各统计一次（5 条 DST 缝隙 + 6 条日历边界），旧实现在 DST 缝隙上漏算/重复
-    expect("DST requests", dstSnap.totals.requests, 11)
-    expect("DST cost", dstSnap.totals.cost, 1.1, 1e-6)
-    const byDate = new Map(dstSnap.series.filter((p) => p.requests > 0).map((p) => [p.date, p.requests]))
-    // 11/1：中午 + 23:30（25th hour 的本地日仍是 11/1）；11/2：凌晨 00:30
-    expect("DST end day (11/1)", byDate.get("2026-11-01") ?? -1, 2)
-    expect("DST day after end (11/2)", byDate.get("2026-11-02") ?? -1, 1)
-    expect("DST start day (3/8)", byDate.get("2026-03-08") ?? -1, 1)
-    expect("DST day after start (3/9)", byDate.get("2026-03-09") ?? -1, 1)
-    // 月末/月初、年末/年初、闰年 2/29：每天恰好 1 条，无跨日重复或遗漏
-    expect("month-end (9/30)", byDate.get("2026-09-30") ?? -1, 1)
-    expect("month-start (10/1)", byDate.get("2026-10-01") ?? -1, 1)
-    expect("year-end (2025/12/31)", byDate.get("2025-12-31") ?? -1, 1)
-    expect("year-start (2026/1/1)", byDate.get("2026-01-01") ?? -1, 1)
-    expect("leap day (2024/2/29)", byDate.get("2024-02-29") ?? -1, 1)
-    expect("day after leap (2024/3/1)", byDate.get("2024-03-01") ?? -1, 1)
-    dstStore.close()
-    require("node:fs").rmSync(dstFile)
-    } finally {
-      if (prevTZ === undefined) delete process.env.TZ
-      else process.env.TZ = prevTZ
+      const dstStore = new UsageStore(dstFile, () => {})
+      const dstSnap = dstStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
+      const total = spec.messages.length
+      expect(`[${spec.tz}] requests（${total} 条各统计一次）`, dstSnap.totals.requests, total)
+      expect(`[${spec.tz}] cost`, dstSnap.totals.cost, total * 0.1, 1e-6)
+      const byDate = new Map(dstSnap.series.filter((p) => p.requests > 0).map((p) => [p.date, p.requests]))
+      for (const [date, wanted] of Object.entries(spec.want)) {
+        expect(`[${spec.tz}] ${date}`, byDate.get(date) ?? -1, wanted)
+      }
+      dstStore.close()
+      require("node:fs").rmSync(dstFile)
     }
+    if (prevTZ === undefined) delete process.env.TZ
+    else process.env.TZ = prevTZ
   }
 
   // 14. Schema 兼容（本批任务 2）：缺 session_message.time_updated（缓存
@@ -467,24 +477,29 @@ function main(): void {
     const put = (sessionID: string, projectID: string | null, payload: Record<string, unknown>) => {
       insertSession.run(sessionID, projectID, `对账 ${sessionID}`, yesterday, yesterday)
       insertMessage.run(`rm${seq++}`, sessionID, yesterday, yesterday, JSON.stringify(payload))
-      const tokens = (payload.tokens ?? {}) as { input?: number; output?: number; cache?: { read?: number } }
+      const tokens = (payload.tokens ?? {}) as { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } }
       // 缺 cost/tokens 的消息按 0 计入预期值（与聚合的 num() 语义一致）
       add(typeof payload.cost === "number" ? payload.cost : 0, tokens.input ?? 0, tokens.output ?? 0, tokens.cache?.read ?? 0)
+      // 独立累计 reasoning / cacheWrite 预期（评审要求非零覆盖）
+      wantReasoning += tokens.reasoning ?? 0
+      wantCacheWrite += tokens.cache?.write ?? 0
     }
-    const msg = (cost: number, providerID: string, modelID: string, agent: string, input: number, output: number, cacheRead = 0) => ({
+    let wantReasoning = 0
+    let wantCacheWrite = 0
+    const msg = (cost: number, providerID: string, modelID: string, agent: string, input: number, output: number, cacheRead = 0, extra?: { reasoning?: number; cacheWrite?: number }) => ({
       model: { providerID, id: modelID },
       agent,
       cost,
-      tokens: { input, output, cache: { read: cacheRead, write: 0 } },
+      tokens: { input, output, reasoning: extra?.reasoning ?? 0, cache: { read: cacheRead, write: extra?.cacheWrite ?? 0 } },
       time: { created: yesterday, completed: yesterday + 1000 },
     })
-    // 多项目 × 多模型 × 多 agent 组合
-    put("ra1", "pa", msg(1.5, "prov-x", "model-a", "build", 100, 50, 200))
-    put("ra2", "pa", msg(0.25, "prov-y", "model-a", "explore", 60, 30)) // 同名模型跨 provider
-    put("ra3", "pb", msg(2, "prov-x", "model-b", "build", 200, 100, 400))
+    // 多项目 × 多模型 × 多 agent 组合（部分带非零 reasoning / cacheWrite）
+    put("ra1", "pa", msg(1.5, "prov-x", "model-a", "build", 100, 50, 200, { reasoning: 300, cacheWrite: 500 }))
+    put("ra2", "pa", msg(0.25, "prov-y", "model-a", "explore", 60, 30, 0, { reasoning: 40 })) // 同名模型跨 provider
+    put("ra3", "pb", msg(2, "prov-x", "model-b", "build", 200, 100, 400, { cacheWrite: 1200 }))
     put("ra4", "pb", msg(0.75, "prov-x", "model-c", "plan", 40, 20, 80))
     // 无项目归属（projectID NULL）→ 空串桶
-    put("ra5", null, msg(0.5, "prov-y", "model-b", "general", 10, 5, 20))
+    put("ra5", null, msg(0.5, "prov-y", "model-b", "general", 10, 5, 20, { reasoning: 15, cacheWrite: 25 }))
     // 缺 cost（订阅内）与缺 tokens 对象
     put("ra6", "pa", { model: { providerID: "prov-x", id: "model-a" }, agent: "build", time: { created: yesterday, completed: yesterday + 500 } })
     // agent 缺失 → unknown 桶
@@ -532,6 +547,28 @@ function main(): void {
     let modelTokensSum = 0
     for (const row of rec.models) modelTokensSum += row.input + row.output
     expect("recon Σ model tokens = total", modelTokensSum, want.input + want.output)
+    // 项目维度有效 Token 对账（评审 P0：总体 = 各项目之和 + 无项目）
+    let projectTokensSum = 0
+    let projectlessTokens = 0
+    for (const row of rec.projectUsage) {
+      if (row.projectID === "") projectlessTokens += row.input + row.output
+      else projectTokensSum += row.input + row.output
+    }
+    expect("recon Σ project tokens + projectless = total", projectTokensSum + projectlessTokens, rec.totals.tokens.input + rec.totals.tokens.output)
+    expect("recon projectless tokens kept", projectlessTokens > 0, true)
+    // Agent 维度有效 Token 对账（评审 P0：总体 = 各 agent 之和 + unknown）
+    let agentTokensSum = 0
+    let unknownAgentTokens = 0
+    for (const row of rec.agents) {
+      if (row.agent === "unknown") unknownAgentTokens += row.input + row.output
+      else agentTokensSum += row.input + row.output
+    }
+    expect("recon Σ agent tokens + unknown = total", agentTokensSum + unknownAgentTokens, rec.totals.tokens.input + rec.totals.tokens.output)
+    // Reasoning / CacheWrite 独立预期对账（评审要求非零数据）
+    expect("recon reasoning = expected", rec.totals.tokens.reasoning, wantReasoning)
+    expect("recon cacheWrite = expected", rec.totals.tokens.cacheWrite, wantCacheWrite)
+    expect("recon reasoning nonzero", wantReasoning > 0, true)
+    expect("recon cacheWrite nonzero", wantCacheWrite > 0, true)
     // 缺 cost 的会话贡献 $0 但会话本身计入
     expect("recon missing cost counted as 0", rec.totals.cost > 0, true)
     // 会话列表行与聚合口径一致（同一会话跨路径对账）

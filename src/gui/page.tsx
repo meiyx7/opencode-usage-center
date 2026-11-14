@@ -24,7 +24,7 @@ import {
 import { SessionDetailView } from "./session-detail"
 import { IntegrationsPage } from "./integrations"
 import { ModelsExplorer } from "./models-explorer"
-import { cacheHitRate, effectiveTokens, modelTokens } from "./metrics"
+import { agentTokens, cacheHitRate, effectiveTokens, modelTokens, pointCacheHit, pointTokens, projectUsageTokens, sessionTokens } from "./metrics"
 
 type Alert = { title: string; detail: string; action: string; target: string }
 type Tab = "overview" | "integrations" | "latency" | "sessions" | "models"
@@ -90,7 +90,7 @@ function Sparkline(props: { values: number[]; color: string }) {
 
 function TrendChart(props: { points: readonly SeriesPoint[] }) {
   const data = createMemo(() => props.points.slice(-30))
-  const maxValue = createMemo(() => Math.max(1, ...data().map((point) => point.input + point.output)))
+  const maxValue = createMemo(() => Math.max(1, ...data().map(pointTokens)))
   const scale = createMemo(() => niceMax(maxValue()))
   const W = 640
   const H = 212
@@ -104,7 +104,7 @@ function TrendChart(props: { points: readonly SeriesPoint[] }) {
   const barWidth = createMemo(() => Math.min(16, Math.max(3, step() * 0.56)))
   const average = createMemo(() => {
     if (!data().length) return 0
-    return data().reduce((sum, point) => sum + point.input + point.output, 0) / data().length
+    return data().reduce((sum, point) => sum + pointTokens(point), 0) / data().length
   })
 
   return (
@@ -155,7 +155,7 @@ function TrendChart(props: { points: readonly SeriesPoint[] }) {
           />
           <For each={data()}>
             {(point, index) => {
-              const total = () => point.input + point.output
+              const total = () => pointTokens(point)
               const height = () => Math.max(total() > 0 ? 1.2 : 0, (total() / scale().top) * plotH)
               const x = () => L + step() * index() + (step() - barWidth()) / 2
               const y = () => T + plotH - height()
@@ -983,7 +983,7 @@ function SessionsTab(props: {
                   <i>{modelInitial(session.modelID)}</i>
                   {shortModel(session.modelID)}
                 </span>
-                <span>{compact(session.input + session.output)}</span>
+                <span>{compact(sessionTokens(session))}</span>
                 <span>
                   {session.cost > 0 ? (
                     money(session.cost)
@@ -2197,13 +2197,13 @@ function OverviewPanels(props: {
 }) {
   /** 0.5 成本归因：agent 与项目的用量排序（费用优先，零费用按 token）。 */
   const agentRows = createMemo(() =>
-    [...props.snapshot.agents].sort((a, b) => b.cost - a.cost || b.input + b.output - (a.input + a.output)),
+    [...props.snapshot.agents].sort((a, b) => b.cost - a.cost || agentTokens(b) - agentTokens(a)),
   )
   const projectRows = createMemo(() => {
     const nameOf = (id: string) => props.snapshot.projects.find((project) => project.id === id)?.name ?? id
     return props.snapshot.projectUsage
       .map((row) => ({ ...row, name: nameOf(row.projectID) }))
-      .sort((a, b) => b.cost - a.cost || b.input + b.output - (a.input + a.output))
+      .sort((a, b) => b.cost - a.cost || projectUsageTokens(b) - projectUsageTokens(a))
   })
   /**
    * 费用异常检测（0.5）：最后一天（今天，未结束）的费用对照之前完整天的
@@ -2233,7 +2233,7 @@ function OverviewPanels(props: {
             <div class="uc-kpi-label"><i />输入输出 Token</div>
             <div class="uc-kpi-value">
               {compact(props.tokens)}
-              <Show when={props.delta((point) => point.input + point.output)}>
+              <Show when={props.delta((point) => pointTokens(point))}>
                 {(value) => (
                   <span class="uc-delta" title="与上一个等长周期对比" data-tone={value() >= 0 ? "up" : "down"}>
                     {value() >= 0 ? "↑" : "↓"} {Math.abs(value()).toFixed(1)}%
@@ -2245,7 +2245,7 @@ function OverviewPanels(props: {
               不含缓存读写 · 输入 {compact(props.totals?.tokens.input ?? 0)} · 输出 {compact(props.totals?.tokens.output ?? 0)}
             </div>
             <Sparkline
-              values={(props.snapshot.series ?? []).map((point) => point.input + point.output)}
+              values={(props.snapshot.series ?? []).map(pointTokens)}
               color="var(--uc-accent)"
             />
           </div>
@@ -2312,9 +2312,7 @@ function OverviewPanels(props: {
             </div>
             <div class="uc-kpi-sub">缓存读取 {compact(props.totals?.tokens.cacheRead ?? 0)} tokens</div>
             <Sparkline
-              values={(props.snapshot.series ?? []).map((point) =>
-                point.cacheRead + point.input > 0 ? (point.cacheRead / (point.cacheRead + point.input)) * 100 : 0,
-              )}
+              values={(props.snapshot.series ?? []).map((point) => pointCacheHit(point) * 100)}
               color="var(--uc-blue)"
             />
           </div>
@@ -2340,7 +2338,7 @@ function OverviewPanels(props: {
                       缓存读取 <b>{compact(props.totals?.tokens.cacheRead ?? 0)}</b> · 命中率{" "}
                       <b>{percent(props.cacheHit, 1)}</b>
                     </span>
-                    <span>峰值 <b>{compact(Math.max(0, ...props.snapshot.series.map((point) => point.input + point.output)))}</b></span>
+                    <span>峰值 <b>{compact(Math.max(0, ...props.snapshot.series.map(pointTokens)))}</b></span>
                   </div>
                 </div>
                 <div class="uc-cost-side">
@@ -2493,7 +2491,7 @@ function AttributionCard(props: {
             <div class="uc-attr-col-title">Agent</div>
             <For each={props.agents.slice(0, 6)}>
               {(row) => {
-                const tokenCount = row.input + row.output
+                const tokenCount = agentTokens(row)
                 const pct = share(row.cost, tokenCount, agentBase())
                 return (
                   <div class="uc-attr-row" title={`${row.agent} · ${compact(tokenCount)} 有效 Token · ${money(row.cost)}`}>
@@ -2513,7 +2511,7 @@ function AttributionCard(props: {
             <div class="uc-attr-col-title">项目</div>
             <For each={props.projects.slice(0, 6)}>
               {(row) => {
-                const tokenCount = row.input + row.output
+                const tokenCount = projectUsageTokens(row)
                 const pct = share(row.cost, tokenCount, projectBase())
                 return (
                   <div class="uc-attr-row" title={`${row.name} · ${compact(tokenCount)} 有效 Token · ${money(row.cost)}`}>
