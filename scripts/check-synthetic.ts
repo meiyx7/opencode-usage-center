@@ -39,8 +39,8 @@ function seed(toBeBytes: (sessionID: string) => string): string {
   return file
 }
 
-/** 主场景：600 个会话分布在 2 个项目，超出会话列表 LIMIT 500。 */
-function seedMain(db: import("bun:sqlite").Database): void {
+/** 主场景：600 个会话分布在 2 个项目，超出会话列表 LIMIT 500。cost 可换（11c 用等形库）。 */
+function seedMain(db: import("bun:sqlite").Database, cost = 0.01): void {
   db.exec(`INSERT INTO project VALUES ('p1', NULL, '/tmp/proj-a', 1), ('p2', NULL, '/tmp/proj-b', 2)`)
   const insertSession = db.prepare(
     "INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)",
@@ -48,7 +48,7 @@ function seedMain(db: import("bun:sqlite").Database): void {
   const insertMessage = db.prepare(
     "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', 1, ?, ?, ?)",
   )
-  // 600 会话：p1 300 个 × $0.01，p2 300 个 × $0.01 → 每项目 $3.00
+  // 600 会话：p1 300 个 × $cost，p2 300 个 × $cost → 每项目 300 × cost
   for (let index = 0; index < 600; index++) {
     const project = index < 300 ? "p1" : "p2"
     const sessionID = `s${index}`
@@ -61,7 +61,7 @@ function seedMain(db: import("bun:sqlite").Database): void {
       JSON.stringify({
         model: { providerID: "prov", id: "model-a" },
         agent: index % 2 === 0 ? "build" : "explore",
-        cost: 0.01,
+        cost,
         tokens: { input: 100, output: 50, cache: { read: 400, write: 10 } },
         time: { created: yesterday, streamed: yesterday + 500, completed: yesterday + 2000 },
       }),
@@ -218,6 +218,45 @@ function main(): void {
   const p1 = mutatedSnap.projectUsage.find((row) => row.projectID === "p1")
   expect("same-count content change invalidates cache", p1?.cost ?? -1, 12.98, 1e-6)
   mutated.close()
+
+  // 11c. 同路径重建 + 相同文件大小 + 相同内容指纹的数据库（评审 P1）。
+  // 构造技巧：重建库用同一 seedMain 造（相同的 600 条消息、相同的 ID 长度、
+  // 相同的时间戳），只把 cost 从 0.01 换成 0.09——等长字符串使文件大小一致，
+  // 相同的 count 与 Σtime_updated 使内容指纹一致。此时旧缓存能否被误读
+  // 完全取决于数据库身份键里的 dev/inode。
+  {
+    // 先用旧库把磁盘缓存填上（走一遍冷启动）
+    const warmup = new UsageStore(file, () => {})
+    warmup.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    warmup.close()
+    const { statSync, rmSync } = require("node:fs") as typeof import("node:fs")
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const oldSize = statSync(file).size
+    const oldIno = statSync(file).ino
+    // 重建：删掉旧文件，在同一建一个同形异值的库
+    rmSync(file)
+    const db = new Database(file)
+    db.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+    `)
+    seedMain(db, 0.09)
+    // 复刻 11b 对旧库做过的修改：m0 的 time_updated 同样 +60s。这样重建库
+    // 与 11b 之后的旧库「文件大小相同 + 内容指纹（count|Σtime_updated）相同」，
+    // 两个弱身份信号全部撞车——能否隔离完全取决于身份键里的 dev/inode。
+    db.query("UPDATE session_message SET time_updated = ? WHERE id = 'm0'").run(yesterday + 60_000)
+    db.close()
+    expect("rebuilt db same size", statSync(file).size, oldSize)
+    expect("rebuilt db new inode", statSync(file).ino !== oldIno, true)
+    const rebuilt = new UsageStore(file, () => {})
+    const rebuiltSnap = rebuilt.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    // 重建库每条 $0.09（600 × 0.09 = $54）；若误读旧库缓存（$0.01×600 = $6），这里会得到 6
+    expect("rebuilt db reads own cache only", rebuiltSnap.totals.cost, 54, 1e-6)
+    expect("rebuilt db requests", rebuiltSnap.totals.requests, 600)
+    rebuilt.close()
+  }
 
   // 12. 长历史完整性（方案 B §五）：120 个月（10 年）跨年历史，每月 1 个会话。
   // 中间空月按 0 保留；总费用 = 会话数 × 单价；跨年边界无重复无遗漏。

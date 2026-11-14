@@ -1,23 +1,29 @@
 /**
- * 大规模历史数据性能测试（数据可靠性收尾批次任务 3；评审修订版）。
+ * 大规模历史数据性能测试（数据可靠性收尾批次任务 3；评审修订版 2）。
  *
  * 三档规模：12 月 × 1k / 36 月 × 10k / 60 月 × 50k 会话，数据特征覆盖
  * 多项目、多模型、多 agent、不同 token/cost/耗时、部分无项目归属、
  * 部分缺统计字段、非零 reasoning/cacheWrite。全部数据可复现（固定种子）。
  *
- * 测量方式（评审 P0 修订）：
- * - 统计阶段在独立子进程中执行：数据构造（父进程）不污染统计的 RSS 基线。
- * - 子进程记录统计前基线 RSS 与执行期间的峰值 RSS，按平台正确换算
- *   （macOS ru_maxrss 单位为 bytes，Linux 为 KB）。
- * - 报告基线 RSS、峰值 RSS、统计阶段内存增量，不再使用跨阶段的历史
- *   maxRSS 当作本次统计的内存结果。
+ * 测量方式（评审二轮修订）：
+ * - 统计阶段在独立子进程（scripts/scale-worker.ts）中执行：数据构造
+ *   （父进程）不污染统计的 RSS 基线。
+ * - 内存增量用 maxRSS 高水位差：统计前记一次 maxRSS，全部统计步骤结束后
+ *   再记一次，两者之差即统计阶段增量——不与当前 RSS 相减（运行时启动
+ *   阶段的历史峰值会污染该口径）。平台单位换算：macOS ru_maxrss 为 bytes，
+ *   Linux 为 KB。
+ * - 报告启动基线 RSS、基线高水位、统计后高水位、统计阶段增量四项。
  *
- * 对账方式（评审 P0 修订）：
+ * 对账方式（评审二轮修订：维度逐 Key 对账）：
  * - 数据生成时独立累计预期值（sessions/requests/各 Token 分量/cost/
- *   项目·模型·Agent 维度费用），不从被测统计结果反推。
- * - 实际统计结果与独立预期值对账，缺失字段与未知归属单独断言。
+ *   三维度的费用与有效 Token），不从被测统计结果反推；全部用可序列化的
+ *   普通对象（第一版误用 Map，JSON.stringify 会丢成 {}）。
+ * - worker 对每个维度逐 Key 比较（模型键含 provider），双向检查多余/
+ *   缺失 Key——汇总相等不能证明每笔费用归属正确。
  *
- * 用法：bun scripts/check-scale.ts [base|medium|large|all]（默认 all）。
+ * 用法：bun scripts/check-scale.ts [base|medium|large|all]（默认 all）；
+ * npm 脚本 test:scale(base) / test:scale:medium / test:scale:large /
+ * test:scale:all。
  */
 import { UsageStore } from "../src/server/store"
 
@@ -57,9 +63,14 @@ interface Expected {
   cacheRead: number
   cacheWrite: number
   cost: number
-  projectCost: Map<string, number>
-  modelCost: Map<string, number>
-  agentCost: Map<string, number>
+  /** 维度费用预期：键为 projectID（无项目为空串）/ agent / provider:model。 */
+  projectCost: Record<string, number>
+  modelCost: Record<string, number>
+  agentCost: Record<string, number>
+  /** 维度有效 Token 预期（input+output），与费用分开逐 Key 对账。 */
+  projectTokens: Record<string, number>
+  modelTokens: Record<string, number>
+  agentTokens: Record<string, number>
 }
 
 function newExpected(): Expected {
@@ -72,14 +83,18 @@ function newExpected(): Expected {
     cacheRead: 0,
     cacheWrite: 0,
     cost: 0,
-    projectCost: new Map(),
-    modelCost: new Map(),
-    agentCost: new Map(),
+    projectCost: {},
+    modelCost: {},
+    agentCost: {},
+    projectTokens: {},
+    modelTokens: {},
+    agentTokens: {},
   }
 }
 
-function bumpCost(map: Map<string, number>, key: string, value: number): void {
-  map.set(key, (map.get(key) ?? 0) + value)
+function bump(costMap: Record<string, number>, tokenMap: Record<string, number>, key: string, cost: number, tokens: number): void {
+  costMap[key] = (costMap[key] ?? 0) + cost
+  tokenMap[key] = (tokenMap[key] ?? 0) + tokens
 }
 
 /**
@@ -177,9 +192,12 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
       expected.reasoning += eReasoning
       expected.cacheRead += eCacheRead
       expected.cacheWrite += eCacheWrite
-      bumpCost(expected.modelCost, `${providerID}:${modelID}`, eCost)
-      bumpCost(expected.agentCost, agent, eCost)
-      bumpCost(expected.projectCost, projectless ? "" : projectID!, eCost)
+      // 维度预期键与统计实现一致：模型 = provider:model，agent 原样，无项目 = 空串。
+      // 有效 Token 分量与费用分开累计，两个维度都要逐 Key 对账。
+      const eTokens = eInput + eOutput
+      bump(expected.modelCost, expected.modelTokens, `${providerID}:${modelID}`, eCost, eTokens)
+      bump(expected.agentCost, expected.agentTokens, agent, eCost, eTokens)
+      bump(expected.projectCost, expected.projectTokens, projectless ? "" : projectID!, eCost, eTokens)
       if (batch.length >= 5000) flush()
     }
     insertSession.run(
@@ -253,7 +271,7 @@ function runScale(scale: ScaleCase, dir: string, cacheDir: string): boolean {
   // 子进程已完成全部对账断言（失败会 exit 2）；这里汇总展示
   console.log(`冷缓存  ${r.coldMs.toFixed(0)}ms  req ${r.actual.requests}  cost $${r.actual.cost.toFixed(2)}`)
   console.log(`热缓存  ${r.warmMs.toFixed(0)}ms  再热 ${r.warm2Ms.toFixed(0)}ms`)
-  console.log(`内存  统计前基线 ${fmtMB(r.baseline)} · 进程峰值 ${fmtMB(r.peakProc)} · 统计增量 ≈ ${fmtMB(r.peakProc - r.baseline)}`)
+  console.log(`内存  启动基线 RSS ${fmtMB(r.baselineRss)} · 基线高水位 ${fmtMB(r.baselineHigh)} · 统计后高水位 ${fmtMB(r.peakHigh)} · 统计阶段增量 ${fmtMB(r.stageDelta)}`)
   console.log(`series ${r.seriesWithData} 天有数据 / 模型 ${r.modelRows} / 项目 ${r.projectRows} / agent ${r.agentRows} 行`)
 
   console.log(`${scale.name} 通过（独立预期值对账 + 三维度对账全部一致）`)

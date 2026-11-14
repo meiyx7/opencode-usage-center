@@ -844,16 +844,17 @@ export class UsageStore {
   ) {}
 
   /**
-   * 磁盘缓存目录。scope 之外再叠加数据库身份（路径散列 + 文件大小）：
+   * 磁盘缓存目录。scope 之外再叠加数据库身份（路径 + dev + inode + 大小）：
    * 不同数据库（换机器、重建 DB、测试里同一目录下的多个临时库）的逐日
    * 聚合不同但文件名相同，不加隔离会互相污染——聚合数据错乱且指纹可能
-   * 恰好一致而无法察觉。文件大小参与散列是因为重建后的同一路径是不同的库。
+   * 恰好一致而无法察觉。dev/inode 参与散列是因为重建后的同一路径是新文件
+   * （新 inode）；只有大小参与时，同路径重建出恰好同大小的库仍会碰撞。
    */
   private dbCacheKey(): string {
     try {
-      const size = statSync(this.path).size
+      const st = statSync(this.path)
       return createHash("sha1")
-        .update(`${this.path}:${size}`)
+        .update(`${this.path}:${st.dev}:${st.ino}:${st.size}`)
         .digest("hex")
         .slice(0, 12)
     } catch {

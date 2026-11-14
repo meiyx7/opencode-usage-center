@@ -50,6 +50,5 @@ export function cacheHitRate(tokens: Pick<TokenTotals, "input" | "cacheRead">): 
  * 版本一致（cacheRead / (cacheRead + input)）。KPI Sparkline 等图表使用。
  */
 export function pointCacheHit(point: Pick<SeriesPoint, "input" | "cacheRead">): number {
-  const base = point.cacheRead + point.input
-  return base > 0 ? point.cacheRead / base : 0
+  return cacheHitRate(point)
 }

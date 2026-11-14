@@ -180,12 +180,37 @@ Sessions 时，用户点的是「prov-x / deepseek-v4.1-flash」这一行，但�
 
 ## 10. 评审任务遗留修复记录
 
-- **性能测试内存测量**（评审任务 1）：改子进程隔离 + 平台单位换算 + 基线/峰值/
-  增量三项报告；发现并绕过 Bun `-e` 长脚本静默不执行的坑（改独立 worker 文件）。
-- **独立预期值对账**（评审任务 1）：数据构造时独立累计 7 个 token/cost 分量与
-  三维度费用，子进程内与统计结果全量对账。
-- **DST 多时区**（评审任务 2）：纽约/伦敦 DST 缝隙 + 上海普通日期 + 月末年末对，
+- **性能测试内存测量**（评审一轮任务 1）：改子进程隔离 + 平台单位换算 +
+  基线/峰值/增量三项报告；发现并绕过 Bun `-e` 长脚本静默不执行的坑（改独立 worker 文件）。
+- **独立预期值对账**（评审一轮任务 1）：数据构造时独立累计 7 个 token/cost 分量与
+  三维度费用，子进程内与统计结果对账。
+- **DST 多时区**（评审一轮任务 2）：纽约/伦敦 DST 缝隙 + 上海普通日期 + 月末年末对，
   旧实现敏感度验证通过（NY 与 London 各漏 1 条/多 1 条）。
-- **前端公式收敛**（评审任务 4）：metrics.ts 扩展 pointTokens/sessionTokens/
+- **前端公式收敛**（评审一轮任务 4）：metrics.ts 扩展 pointTokens/sessionTokens/
   agentTokens/projectUsageTokens/pointCacheHit，page.tsx 全部 10 处内联公式收敛；
   「有效 Token」口径说明文字（glossary）不属于公式，保留原文。
+- **R1/C1/C2 分析**（评审一轮任务 6）：见 §9，均未改动统计口径。
+
+## 11. 评审二轮修复记录（08a88fa 复审意见）
+
+- **维度逐 Key 对账**（二轮 P0）：一轮实现在 `expected` 里用 `Map` 存维度预期，
+  `JSON.stringify` 序列化为 `{}`，且 worker 未读取——三维度对账当时只验证了
+  「Σ维度 = 总额」的自洽，不能证明每笔费用归属正确。修复：预期值改普通对象
+  （cost 与有效 Token 各一份），worker 对模型（键含 provider）、agent、项目
+  三维度逐 Key 比较，双向检查多余/缺失 Key；并做了敏感度验证（把模型键故意
+  降级为 modelID-only 时对账立即失败，报多余+缺失）。
+- **内存高水位差**（二轮 P1）：统计阶段增量改为「统计前 maxRSS − 全部统计
+  步骤结束后 maxRSS」，不再与当前 RSS 相减（运行时启动峰值会污染旧口径）。
+  报告四项：启动基线 RSS、基线高水位、统计后高水位、统计阶段增量。
+- **数据库身份键增强**（二轮 P1）：dbCacheKey 从 `path:size` 升级为
+  `path:dev:ino:size`——同路径重建出恰好同大小的库时旧键会碰撞。新增 11c
+  回归：重建库用同一 seedMain 造（600 条消息、等长字符串、相同时间戳，
+  mtime/指纹/大小全部与旧库一致，只换 cost 值），断言重建库读到自己的
+  $54 而不是旧库的 $6；敏感度验证：退回 size-only 键时测试失败（读到 $15.98
+  的脏混合值）。mtime 不参与身份键：每次写库都会变，会打穿缓存。
+- **前端公式彻底收敛**（二轮 P1）：AttributionCard `share()` 的 Token 分母改走
+  `effectiveTokens`；`cacheDeltaOf` 周期命中率改「先累计 input/cacheRead 再调
+  `cacheHitRate`」；`pointCacheHit` 委托 `cacheHitRate`，不再各自实现公式。
+- **规模测试命令**（二轮 P1）：`npm run test:scale -- medium` 实际会把 medium
+  追加在 base 后面（argv[2] 仍是 base）。新增独立脚本 `test:scale:medium` /
+  `test:scale:large` / `test:scale:all`，CI 注释同步更正。

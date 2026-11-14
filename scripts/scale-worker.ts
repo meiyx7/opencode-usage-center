@@ -16,6 +16,7 @@ const input = JSON.parse(readFileSync(process.argv[3]!, "utf8")) as {
   expectedPath: string
   outPath: string
 }
+/** 维度预期键与统计实现一致：模型 = provider:model，agent 原样，无项目 = 空串。 */
 const expected = JSON.parse(readFileSync(input.expectedPath, "utf8")) as {
   sessions: number
   requests: number
@@ -25,20 +26,29 @@ const expected = JSON.parse(readFileSync(input.expectedPath, "utf8")) as {
   cacheRead: number
   cacheWrite: number
   cost: number
+  projectCost: Record<string, number>
+  modelCost: Record<string, number>
+  agentCost: Record<string, number>
+  projectTokens: Record<string, number>
+  modelTokens: Record<string, number>
+  agentTokens: Record<string, number>
 }
 
 /** macOS ru_maxrss 单位为 bytes；Linux getrusage 惯例为 KB。统一换算成 bytes。 */
 const toBytes = (maxRss: number): number => (process.platform === "darwin" ? maxRss : maxRss * 1024)
+// 高水位口径：maxRSS 是进程生命周期峰值（只增不减），统计阶段的内存增量必须
+// 用「统计前 maxRSS − 统计后 maxRSS」的高水位差，而不是与当前 RSS 相减——
+// 若运行时启动阶段曾冲高，后者会把启动峰值误算成本次统计的增量。
+const maxRssNow = () => toBytes(process.resourceUsage().maxRSS)
 const rssNow = () => toBytes(process.memoryUsage.rss())
-const baseline = rssNow()
+const baselineRss = rssNow()
+const baselineHigh = maxRssNow()
 
 const store = new UsageStore(input.file, () => {})
 const to = Date.now()
 const coldStart = performance.now()
 const cold = store.snapshot({ from: 0, to, projectID: undefined, force: true })
 const coldMs = performance.now() - coldStart
-// 进程峰值（含基线 + 本次统计）
-const peakProc = toBytes(process.resourceUsage().maxRSS)
 
 const warmStart = performance.now()
 const warm = store.snapshot({ from: 0, to, projectID: undefined, force: true })
@@ -46,6 +56,9 @@ const warmMs = performance.now() - warmStart
 const warm2Start = performance.now()
 const warm2 = store.snapshot({ from: 0, to, projectID: undefined, force: true })
 const warm2Ms = performance.now() - warm2Start
+// 峰值采集放在全部统计步骤结束之后：三次 snapshot 的高水位都计入。
+const peakHigh = maxRssNow()
+const stageDelta = peakHigh - baselineHigh
 
 const failures: string[] = []
 const expect = (label: string, actual: unknown, wanted: unknown, tolerance = 0) => {
@@ -69,13 +82,56 @@ expect("cost = expected", cold.totals.cost, expected.cost, 1e-6)
 expect("warm requests = cold", warm.totals.requests, cold.totals.requests)
 expect("warm cost = cold", warm.totals.cost, cold.totals.cost, 1e-9)
 expect("warm2 cost = cold", warm2.totals.cost, cold.totals.cost, 1e-9)
-// 三维度费用与 Token 对账
-expect("Σ model cost = total", cold.models.reduce((s, m) => s + m.cost, 0), cold.totals.cost, 1e-6)
-expect("Σ agent cost = total", cold.agents.reduce((s, a) => s + a.cost, 0), cold.totals.cost, 1e-6)
-expect("Σ project cost = total", cold.projectUsage.reduce((s, p) => s + p.cost, 0), cold.totals.cost, 1e-6)
-expect("Σ model tokens = total", cold.models.reduce((s, m) => s + m.input + m.output, 0), cold.totals.tokens.input + cold.totals.tokens.output)
-expect("Σ agent tokens = total", cold.agents.reduce((s, a) => s + a.input + a.output, 0), cold.totals.tokens.input + cold.totals.tokens.output)
-expect("Σ project tokens = total", cold.projectUsage.reduce((s, p) => s + p.input + p.output, 0), cold.totals.tokens.input + cold.totals.tokens.output)
+// 三维度逐 Key 对账（评审 P0：汇总相等不能证明每笔费用归属正确——某模型
+// 错配另一模型时总和不变。与独立预期值逐项比较，并双向检查多余/缺失 Key）。
+const expectMap = (
+  label: string,
+  actualRows: { key: string; cost: number; tokens: number }[],
+  wantCost: Record<string, number>,
+  wantTokens: Record<string, number>,
+) => {
+  const actualCost: Record<string, number> = {}
+  const actualTokens: Record<string, number> = {}
+  for (const row of actualRows) {
+    actualCost[row.key] = (actualCost[row.key] ?? 0) + row.cost
+    actualTokens[row.key] = (actualTokens[row.key] ?? 0) + row.tokens
+  }
+  const keys = new Set([...Object.keys(actualCost), ...Object.keys(wantCost)])
+  for (const key of [...keys].sort()) {
+    if (!(key in wantCost)) {
+      failures.push(`${label}: 多余 Key "${key}"（统计有、预期无，cost=${actualCost[key]}）`)
+      continue
+    }
+    if (!(key in actualCost)) {
+      failures.push(`${label}: 缺失 Key "${key}"（预期有、统计无，cost=${wantCost[key]}）`)
+      continue
+    }
+    expect(`${label}[${key}] cost`, actualCost[key], wantCost[key], 1e-6)
+    expect(`${label}[${key}] tokens`, actualTokens[key], wantTokens[key], 0)
+  }
+}
+// 模型维度：键含 provider（统计实现按 provider:model 分行）。
+expectMap(
+  "model",
+  cold.models.map((m) => ({ key: `${m.providerID}:${m.modelID}`, cost: m.cost, tokens: m.input + m.output })),
+  expected.modelCost,
+  expected.modelTokens,
+)
+// Agent 维度（消息未标注 agent 时统计归入 unknown 桶）。
+expectMap(
+  "agent",
+  cold.agents.map((a) => ({ key: a.agent, cost: a.cost, tokens: a.input + a.output })),
+  expected.agentCost,
+  expected.agentTokens,
+)
+// 项目维度（无项目归属的会话归入空串桶）。
+expectMap(
+  "project",
+  cold.projectUsage.map((p) => ({ key: p.projectID, cost: p.cost, tokens: p.input + p.output })),
+  expected.projectCost,
+  expected.projectTokens,
+)
+// 冷/热/再热三路径一致
 // 缓存淘汰后统计完整性（60 月 > DAY_CACHE_LIMIT 600 天）
 const seriesWithData = cold.series.filter((p) => p.requests > 0).length
 expect("activeDays matches series", cold.totals.activeDays, seriesWithData)
@@ -84,8 +140,10 @@ expect("projectless bucket kept", cold.projectUsage.some((p) => p.projectID === 
 
 const result = {
   failures,
-  baseline,
-  peakProc,
+  baselineRss,
+  baselineHigh,
+  peakHigh,
+  stageDelta,
   coldMs,
   warmMs,
   warm2Ms,

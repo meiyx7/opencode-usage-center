@@ -44,6 +44,7 @@ jobs:
         run: npm run test:synthetic
 
       # 大规模性能回归只跑基准档（CI 内存有限）；medium/large 档本地跑
-      # `npm run test:scale -- medium|large`。
+      # `npm run test:scale:medium` / `npm run test:scale:large`（独立脚本，
+      # `-- 传参` 会被 base 档吃掉）。
       - name: Scale regression (base)
         run: npm run test:scale

@@ -2448,9 +2448,10 @@ function cacheDeltaOf(points: readonly SeriesPoint[]): number | undefined {
   const half = Math.floor(complete.length / 2)
   if (half < 1) return undefined
   const calc = (list: readonly SeriesPoint[]) => {
+    // 聚合周期的命中率：先累计 Input 与 Cache Read 再走统一公式（评审 P1）。
     const input = list.reduce((sum, point) => sum + point.input, 0)
     const cache = list.reduce((sum, point) => sum + point.cacheRead, 0)
-    return cache + input > 0 ? (cache / (cache + input)) * 100 : 0
+    return cacheHitRate({ input, cacheRead: cache }) * 100
   }
   return calc(complete.slice(complete.length - half)) - calc(complete.slice(0, half))
 }
@@ -2465,18 +2466,15 @@ function AttributionCard(props: {
   tokens: number
 }) {
   const hasData = () => props.agents.length > 1 || props.projects.length > 1
-  const share = (cost: number, tokenCount: number, all: readonly { cost: number }[]) => {
+  const share = (cost: number, tokenCount: number, all: readonly { cost: number; input: number; output: number }[]) => {
     const totalCost = all.reduce((sum, row) => sum + row.cost, 0)
     if (totalCost > 0) return totalCost > 0 ? (cost / totalCost) * 100 : 0
-    // 全部为 $0（订阅内调用）：按有效 Token 占比
-    const totalTokens = all.reduce((sum, row) => {
-      const r = row as unknown as { input?: number; output?: number }
-      return sum + (r.input ?? 0) + (r.output ?? 0)
-    }, 0)
+    // 全部为 $0（订阅内调用）：按有效 Token 占比（统一走 effectiveTokens）
+    const totalTokens = all.reduce((sum, row) => sum + effectiveTokens(row), 0)
     return totalTokens > 0 ? ((tokenCount / totalTokens) * 100) : 0
   }
-  const agentBase = () => props.agents.map((a) => ({ cost: a.cost }))
-  const projectBase = () => props.projects.map((p) => ({ cost: p.cost }))
+  const agentBase = () => props.agents.map((a) => ({ cost: a.cost, input: a.input, output: a.output }))
+  const projectBase = () => props.projects.map((p) => ({ cost: p.cost, input: p.input, output: p.output }))
   return (
     <Show when={hasData()} fallback={null}>
       <section class="uc-card uc-attribution">
