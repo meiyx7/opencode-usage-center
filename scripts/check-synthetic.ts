@@ -16,6 +16,14 @@ const todayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
 // 昨天 12:00，确保落在「昨天」而不是今天
 const yesterday = todayStart - DAY / 2
 
+/** 与 store 的 localDate 同口径的本地日期（YYYY-MM-DD），供期望值判定用。 */
+function localDateOf(ms: number): string {
+  const date = new Date(ms)
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
 function seed(toBeBytes: (sessionID: string) => string): string {
   // 临时文件 DB（UsageStore 只读打开真实文件）
   const file = `${process.env.TMPDIR ?? "/tmp"}/uc-synthetic-${process.pid}-${Math.random().toString(36).slice(2)}.db`
@@ -214,6 +222,8 @@ function main(): void {
   // 12. 长历史完整性（方案 B §五）：120 个月（10 年）跨年历史，每月 1 个会话。
   // 中间空月按 0 保留；总费用 = 会话数 × 单价；跨年边界无重复无遗漏。
   const months = 120
+  /** 落在查询范围（≤ now）内的会话 ID，期望值由此动态推导。 */
+  const expected = new Set<string>()
   const historyFile = seed((path) => {
     const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
     const db = new Database(path)
@@ -226,13 +236,19 @@ function main(): void {
     )
     for (let index = 0; index < months; index++) {
       // 真实「每月 15 日」：从当月往回推 index 个月，避免 30 天近似导致两个
-      // 会话落在同一天；12:00 确保不会因时区落到相邻日。
+      // 会话落在同一天；12:00 确保不会因时区落到相邻日。会记录实际生成的
+      // 日期，期望值按「落在 ≤ 运行时刻的 15 日个数」动态计算——当月 15 日
+      // 是否已到取决于运行时刻与时区，不能写死。
       const at = new Date()
       at.setDate(15)
       at.setMonth(at.getMonth() - index, 15)
       at.setHours(12, 0, 0, 0)
       const stamp = at.getTime()
       const sessionID = `h${index}`
+      // store 对「今天」聚合整个本地日（dayBounds 到次日零点），所以判定
+      // 标准是「本地日期 ≤ 今天的本地日期」而不是时间戳先后——极东时区
+      // （UTC+14）跑测试时当月 15 日可能已经是今天。
+      if (localDateOf(stamp) <= localDateOf(now)) expected.add(sessionID)
       insertSession.run(sessionID, `历史 ${index}`, stamp, stamp)
       insertMessage.run(
         `hm${index}`,
@@ -252,8 +268,7 @@ function main(): void {
   })
   const historyStore = new UsageStore(historyFile, () => {})
   const historySnap = historyStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
-  // 当月 15 日可能在运行日之后（如 14 日跑测试），被 lastDay 排除属预期
-  const expectedMonths = months - 1
+  const expectedMonths = expected.size
   expect("history requests", historySnap.totals.requests, expectedMonths)
   expect("history cost", historySnap.totals.cost, expectedMonths * 0.1, 1e-6)
   expect("history effective tokens", historySnap.totals.tokens.input + historySnap.totals.tokens.output, expectedMonths * 1500)
