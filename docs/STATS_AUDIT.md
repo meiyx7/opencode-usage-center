@@ -100,9 +100,18 @@ cacheWrite，而「回合 Token 柱状图」(session-detail.tsx L863) 漏加 cac
    的公式的单一来源；前端 5 处调用点收敛；回合柱状图漏 cacheWrite 一并修复。
 2. **任务 6**：`check-synthetic.ts` 新增对账场景——Σ模型=Σagent=Σ项目=总费用、
    Token 对账、会话列表行 vs 会话详情（同一会话跨路径 cost/token 相等）、
-   跨 provider 同名模型不合并、unknown 桶保留。
+   跨 provider 同名模型不合并、unknown 桶保留；15b 单会话单模型最小用例、
+   15c 无 model 字段消息进 unknown 模型桶、15d 分页 Replay 各页之和 = 整会话。
 3. **任务 3/4/5**：审计确认现有实现已满足要求，无代码改动，本文档即审计结论。
 4. **任务 7**：改动后复跑 `test:scale` 与 `test:data` 对比基线（见执行报告）。
+
+### 8.1 审计后追加修复（24b5570）
+
+补测试缺口时发现**真实产品 bug：跨数据库磁盘缓存污染**——逐日缓存文件按
+`<scope>/<date>.json` 命名，两个不同数据库（换机器、重建 DB、测试临时库）
+读同一 scope/日期会互相拿到对方的聚合；消息数与 time_updated 总和恰好一致时
+指纹校验也无法察觉。修复：缓存目录嵌入数据库身份（路径 sha1 前 12 位 + 文件大小），
+重建后的同路径库也会得到独立目录。
 
 **等待确认的口径决策（本批未动）**：R1（reasoning 是否计入有效 Token）、
 C1（$0 与缺失 cost 的区分）、Sessions 页模型筛选是否改为 provider+modelID 精确匹配。
