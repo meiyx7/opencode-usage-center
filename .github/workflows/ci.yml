@@ -28,5 +28,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Plugin wire tests
+        run: npm run test:plugin
+
+      - name: Synthetic data tests
+        run: npm run test:synthetic
+
       - name: Build
         run: npm run build

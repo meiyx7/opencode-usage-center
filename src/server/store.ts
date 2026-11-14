@@ -187,24 +187,6 @@ function fillSeries(points: SeriesPoint[], from: number, to: number): SeriesPoin
   return result
 }
 
-function activeStreak(days: string[], today: string): number {
-  const set = new Set(days)
-  let cursor = today
-  if (!set.has(cursor)) {
-    const yesterday = new Date(`${today}T12:00:00`)
-    yesterday.setDate(yesterday.getDate() - 1)
-    cursor = localDate(yesterday.getTime())
-  }
-  let streak = 0
-  while (set.has(cursor) && streak < 400) {
-    streak += 1
-    const previous = new Date(`${cursor}T12:00:00`)
-    previous.setDate(previous.getDate() - 1)
-    cursor = localDate(previous.getTime())
-  }
-  return streak
-}
-
 function parseJSON(value: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(value)
@@ -623,6 +605,8 @@ type DayAgg = {
   models: Record<string, { providerID: string; modelID: string; requests: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }>
   /** sessionID → 聚合 */
   sessions: Record<string, { requests: number; cost: number; input: number; output: number; cacheRead: number; providerID: string; modelID: string }>
+  /** sessionID → projectID，供项目归因从完整聚合归组 */
+  sessionProject: Map<string, string>
   /** agent（build / explore / general…）→ 聚合；0.5 成本归因 */
   agents: Record<string, { requests: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }>
   /** 每个样本 [ttft, total, output]，保留原值供跨天分位数计算 */
@@ -638,6 +622,8 @@ type DayAgg = {
 function aggregateDay(date: string, rows: Row[]): DayAgg {
   const models: DayAgg["models"] = {}
   const sessions: DayAgg["sessions"] = {}
+  /** sessionID → projectID，供项目归因从完整聚合归组（不依赖 LIMIT 列表）。 */
+  const sessionProject = new Map<string, string>()
   const agents: DayAgg["agents"] = {}
   const latency: [number, number, number][] = []
   const latencyByModel: DayAgg["latencyByModel"] = {}
@@ -698,6 +684,7 @@ function aggregateDay(date: string, rows: Row[]): DayAgg {
       usage.modelID = modelID
     }
     sessions[sessionID] = usage
+    if (row.projectID !== undefined) sessionProject.set(sessionID, text(row.projectID))
 
     const modelKey = `${providerID}\u0000${modelID}`
     const model = models[modelKey] ?? {
@@ -726,7 +713,7 @@ function aggregateDay(date: string, rows: Row[]): DayAgg {
       latencyByModel[modelKey] = group
     }
   }
-  return { date, requests, cost, tokens, models, sessions, agents, latency, latencyByModel, prompts }
+  return { date, requests, cost, tokens, models, sessions, sessionProject, agents, latency, latencyByModel, prompts }
 }
 
 /** 合并多天聚合。modelMap/sessionMap 可为传入的累计对象（增量合并）。 */
@@ -782,6 +769,9 @@ function mergeDays(target: DayAgg, days: readonly DayAgg[]): DayAgg {
         target.agents[key] = { ...agent }
       }
     }
+    for (const [sessionID, projectID] of day.sessionProject) {
+      if (!target.sessionProject.has(sessionID)) target.sessionProject.set(sessionID, projectID)
+    }
     target.latency.push(...day.latency)
     for (const [key, group] of Object.entries(day.latencyByModel)) {
       const existing = target.latencyByModel[key]
@@ -831,11 +821,12 @@ export class UsageStore {
         return undefined
       }
       // 结构演进（如 0.5 新增 agents 维度）后旧缓存缺字段：丢弃重算，而不是
-      // 让 mergeDays 在 undefined 上崩溃。
+      // 让 mergeDays 在 undefined 上崩溃。sessionProject 是 Map，序列化后为 {}。
       if (!parsed.agents || !parsed.models || !parsed.sessions || !parsed.latencyByModel) {
         unlinkSync(file)
         return undefined
       }
+      parsed.sessionProject = new Map(Object.entries((parsed.sessionProject as unknown as Record<string, string>) ?? {}))
       return parsed
     } catch {
       try {
@@ -987,8 +978,16 @@ export class UsageStore {
 
   /** 取一天的聚合：内存 → 磁盘 → 现算。今天总是现算（消息还在增长）。 */
   private dayAgg(db: Database, scope: string, date: string, today: string): DayAgg {
+    // 内存命中也要校验源数据（1.0 发布门槛 §5.4）：同量修改（revert 后重发）
+    // 不改变 count，但那类变更只发生在「今天」或未落盘的天；历史天的 count
+    // 漂移能覆盖删除/回退，同量内容修改在本数据模型中不产生（消息不可变）。
+    // 校验是一次毫秒级索引查询，换取缓存永不偏大。
     const memory = this.dayMemory.get(scope)?.get(date)
-    if (memory && date !== today) return memory
+    if (memory && date !== today) {
+      if (this.dayCount(db, scope, date) === (memory.baseCount ?? -1)) return memory
+      this.log("day memory invalidated (count drift)", `${scope}/${date}`)
+      this.dayMemory.get(scope)!.delete(date)
+    }
     if (date !== today) {
       const disk = this.readDay(scope, date)
       if (disk) {
@@ -1008,6 +1007,7 @@ export class UsageStore {
       .query<Row>(
         `SELECT
            m.session_id AS sessionID,
+           s.project_id AS projectID,
            m.type AS type,
            coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
            coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
@@ -1069,17 +1069,23 @@ export class UsageStore {
     const today = localDate(Date.now())
 
     // 找出范围覆盖的每一天，逐日取聚合（历史天走缓存，只有今天现算）。
+    // 「全部」必须语义真实：逐日缓存让跨多年历史也可控，不再用 400 天
+    // 保护性截断（1.0 发布门槛 §5.3）。安全上限 5 年（1825 天）防御
+    // 异常时间戳导致的死循环，触达时在快照里标注截断。
+    const MAX_RANGE_DAYS = 1825
     const firstDay = input.from === 0 ? undefined : localDate(input.from)
     const lastDay = localDate(Math.min(input.to, Date.now()))
     const dates: string[] = []
+    let truncated = false
     if (firstDay) {
       let cursor = firstDay
       let guard = 0
-      while (cursor <= lastDay && guard < 400) {
+      while (cursor <= lastDay && guard < MAX_RANGE_DAYS) {
         dates.push(cursor)
         cursor = nextDate(cursor)
         guard += 1
       }
+      truncated = cursor <= lastDay
     } else {
       // 「全部」范围没有明确的起点：先查数据库里最早的消息日期。
       const scopeFilter = scope !== "all" ? " AND s.project_id = ?" : ""
@@ -1093,11 +1099,12 @@ export class UsageStore {
       if (earliestTime > 0) {
         let cursor = localDate(earliestTime)
         let guard = 0
-        while (cursor <= lastDay && guard < 400) {
+        while (cursor <= lastDay && guard < MAX_RANGE_DAYS) {
           dates.push(cursor)
           cursor = nextDate(cursor)
           guard += 1
         }
+        truncated = cursor <= lastDay
       }
     }
 
@@ -1109,6 +1116,7 @@ export class UsageStore {
         tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
         models: {},
         sessions: {},
+        sessionProject: new Map(),
         agents: {},
         latency: [],
         latencyByModel: {},
@@ -1179,19 +1187,26 @@ export class UsageStore {
     const credentials = this.credentials(db)
     const days = series.filter((point) => point.requests > 0).map((point) => point.date)
     const filled = fillSeries(series, input.from, input.to)
-    /** 成本归因（0.5）：agent 维度直接来自聚合；项目维度把 session 聚合按 project 归组。 */
+    /**
+     * 成本归因（0.5）：agent 维度直接来自聚合；项目维度从**完整聚合**
+     * （total.sessions，覆盖范围内全部会话）按 project 归组——不能复用
+     * 上面的 sessions 列表（LIMIT 500，超限少算，1.0 发布门槛 §5.2）。
+     */
     const agents: AgentRow[] = Object.entries(total.agents)
       .map(([agent, usage]) => ({ agent, ...usage }))
       .sort((a, b) => b.input + b.output - (a.input + a.output))
     const usageByProject = new Map<string, { requests: number; cost: number; input: number; output: number; cacheRead: number }>()
-    for (const session of sessions) {
-      const bucket = usageByProject.get(session.projectID) ?? { requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0 }
+    for (const [sessionID, usage] of Object.entries(total.sessions)) {
+      // 范围内没有 assistant 消息的会话不构成归因行
+      if (usage.requests === 0 && usage.cost === 0 && usage.input + usage.output === 0) continue
+      const projectID = total.sessionProject.get(sessionID) ?? ""
+      const bucket = usageByProject.get(projectID) ?? { requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0 }
       bucket.requests += 1
-      bucket.cost += session.cost
-      bucket.input += session.input
-      bucket.output += session.output
-      bucket.cacheRead += session.cacheRead
-      usageByProject.set(session.projectID, bucket)
+      bucket.cost += usage.cost
+      bucket.input += usage.input
+      bucket.output += usage.output
+      bucket.cacheRead += usage.cacheRead
+      usageByProject.set(projectID, bucket)
     }
     const projectUsage: ProjectUsageRow[] = [...usageByProject.entries()]
       .map(([projectID, usage]) => ({ projectID, ...usage }))
@@ -1204,13 +1219,13 @@ export class UsageStore {
         latency: total.latency.length,
         sessions: Object.keys(total.sessions).length,
         days: dates.length,
+        truncated,
       },
       totals: {
         requests: total.requests,
         sessions: Object.keys(total.sessions).length,
         prompts: total.prompts,
         activeDays: days.length,
-        streak: activeStreak(days, today),
         cost: total.cost,
         tokens: total.tokens,
       },
@@ -1560,13 +1575,12 @@ export class UsageStore {
       generatedAt: Date.now(),
       range: { from: input.from, to: input.to },
       database: this.fileInfo(),
-      samples: { latency: 0, sessions: 0, days: 0 },
+      samples: { latency: 0, sessions: 0, days: 0, truncated: false },
       totals: {
         requests: 0,
         sessions: 0,
         prompts: 0,
         activeDays: 0,
-        streak: 0,
         cost: 0,
         tokens: emptyTokens(),
       },

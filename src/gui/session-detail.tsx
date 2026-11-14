@@ -287,9 +287,12 @@ function RequestCard(props: { request: SessionRequest; index: number; initialOpe
 function CostWaterfall(props: {
   turns: readonly SessionTurn[]
   totalCost: number
+  totalTurns: number
   onLocate: (index: number) => void
 }) {
   const byCost = createMemo(() => props.turns.reduce((sum, turn) => sum + turn.cost, 0) > 0)
+  const loadedCost = createMemo(() => props.turns.reduce((sum, turn) => sum + turn.cost, 0))
+  const partial = createMemo(() => props.turns.length < props.totalTurns)
   const metricOf = (turn: SessionTurn) =>
     byCost()
       ? turn.cost
@@ -305,9 +308,11 @@ function CostWaterfall(props: {
         <div class="uc-sd-panel-title">
           费用瀑布
           <span>
-            {byCost()
-              ? `${money(props.totalCost)} 总费用`
-              : `全部 $0 · 按 Token 显示`}
+            {partial()
+              ? `已加载 ${props.turns.length}/${props.totalTurns} 回合 · ${byCost() ? money(loadedCost()) : "全部 $0"}`
+              : byCost()
+                ? `${money(props.totalCost)} 总费用`
+                : `全部 $0 · 按 Token 显示`}
           </span>
         </div>
         <div class="uc-sd-strip uc-cost-strip">
@@ -339,6 +344,9 @@ function CostWaterfall(props: {
           {byCost()
             ? `柱高为回合费用 · 最高回合 #${top()?.index}（${money(top()?.cost ?? 0)}）· 点击展开该回合`
             : "柱高为回合有效 Token（费用未记录，订阅内调用可能为 $0）· 点击展开该回合"}
+          <Show when={partial()}>
+            <span> · 图表仅覆盖已加载回合，向下加载更早回合后自动刷新</span>
+          </Show>
         </div>
       </div>
     </Show>
@@ -534,8 +542,6 @@ export function SessionDetailView(props: {
       const base = {
         index: turn.index,
         time: new Date(turn.time).toISOString(),
-        files: turn.files,
-        agents: turn.agents,
         cost: turn.cost,
         tokens: turn.tokens,
         toolCount: turn.toolCount,
@@ -544,9 +550,13 @@ export function SessionDetailView(props: {
         ttftSeconds: turn.ttft,
         cacheHit: turn.cacheHit,
       }
-      if (!full) return { ...base, requests: turn.requests.map(stripRequest) }
+      // 脱敏模式同时剥离附件名（files 可能含文件路径）；agents 是通用
+      // agent 类型名（build / explore），非用户标识，保留。
+      if (!full) return { ...base, agents: turn.agents, requests: turn.requests.map(stripRequest) }
       return {
         ...base,
+        files: turn.files,
+        agents: turn.agents,
         prompt: turn.prompt,
         promptTruncated: turn.promptTruncated,
         requests: turn.requests.map((request) => ({
@@ -580,8 +590,8 @@ export function SessionDetailView(props: {
       exportedAt: new Date().toISOString(),
       sanitized: !full,
       note: full
-        ? "完整导出：包含提示词、回复与工具输出，请勿外发。"
-        : "脱敏导出：不含提示词、回复与工具内容。",
+        ? "完整导出：包含提示词、回复、工具输出与附件名，请勿外发。"
+        : "内容脱敏导出：去除提示词、回复、思考、工具内容与附件名；仍保留会话标题、项目、模型、时间等元数据。",
       session: {
         id: current.id,
         title: current.title,
@@ -728,7 +738,7 @@ export function SessionDetailView(props: {
             <button
               type="button"
               class="uc-sd-mini"
-              title={sanitizeExport() ? "导出结构化 JSON（已脱敏：不含提示词 / 回复 / 工具内容）" : "导出结构化 JSON（保留完整内容，含提示词与工具输出）"}
+              title={sanitizeExport() ? "内容脱敏导出：不含提示词 / 回复 / 工具内容 / 附件名，保留元数据" : "完整导出：保留全部内容，含提示词与工具输出"}
               onClick={() => exportJson(!sanitizeExport())}
             >
               导出 JSON
@@ -868,6 +878,7 @@ export function SessionDetailView(props: {
               <CostWaterfall
                 turns={value().turns}
                 totalCost={value().cost}
+                totalTurns={value().totalTurns}
                 onLocate={toggleTurn}
               />
               <div class="uc-sd-panel">

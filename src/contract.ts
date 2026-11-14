@@ -295,13 +295,14 @@ export const Snapshot = Schema.Struct({
     sessions: Schema.Number,
     /** Day buckets the series covers; below the full range means the DB has less history. */
     days: Schema.Number,
+    /** The requested range exceeded the safety cap and was clipped. */
+    truncated: Schema.Boolean,
   }),
   totals: Schema.Struct({
     requests: Schema.Number,
     sessions: Schema.Number,
     prompts: Schema.Number,
     activeDays: Schema.Number,
-    streak: Schema.Number,
     cost: Schema.Number,
     tokens: TokenTotals,
   }),

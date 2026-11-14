@@ -2867,7 +2867,12 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   }
 
 
-  const rangeLabel = () => RANGES.find((item) => item.id === range())?.label ?? "30 天"
+  const rangeLabel = () => {
+    const label = RANGES.find((item) => item.id === range())?.label ?? "30 天"
+    // 「全部」语义真实（1.0 §5.3）：触发安全上限截断时明说覆盖不完整。
+    if (range() === "all" && snapshot()?.samples.truncated) return "全部（近 5 年）"
+    return label
+  }
   const scopeLabel = () => {
     if (scope() === "all") return "全部项目"
     if (scope() === "current") return currentProject()?.name ?? "当前项目"
