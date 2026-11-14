@@ -188,6 +188,66 @@ function main(): void {
   expect("corrupted cache recovered cost", corruptedSnap.totals.cost, 6, 1e-6)
   corrupted.close()
 
+  // 12. 长历史完整性（方案 B §五）：120 个月（10 年）跨年历史，每月 1 个会话。
+  // 中间空月按 0 保留；总费用 = 会话数 × 单价；跨年边界无重复无遗漏。
+  const months = 120
+  const historyFile = seed((path) => {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const db = new Database(path)
+    db.exec(`INSERT INTO project VALUES ('ph', NULL, '/tmp/hist', 1)`)
+    const insertSession = db.prepare(
+      "INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, 'ph', ?, ?, ?)",
+    )
+    const insertMessage = db.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, ?, ?)",
+    )
+    for (let index = 0; index < months; index++) {
+      // 真实「每月 15 日」：从当月往回推 index 个月，避免 30 天近似导致两个
+      // 会话落在同一天；12:00 确保不会因时区落到相邻日。
+      const at = new Date()
+      at.setDate(15)
+      at.setMonth(at.getMonth() - index, 15)
+      at.setHours(12, 0, 0, 0)
+      const stamp = at.getTime()
+      const sessionID = `h${index}`
+      insertSession.run(sessionID, `历史 ${index}`, stamp, stamp)
+      insertMessage.run(
+        `hm${index}`,
+        sessionID,
+        stamp,
+        JSON.stringify({
+          model: { providerID: "prov", id: "model-a" },
+          agent: "build",
+          cost: 0.1,
+          tokens: { input: 1000, output: 500 },
+          time: { created: stamp, completed: stamp + 1000 },
+        }),
+      )
+    }
+    db.close()
+  })
+  const historyStore = new UsageStore(historyFile, () => {})
+  const historySnap = historyStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
+  // 当月 15 日可能在运行日之后（如 14 日跑测试），被 lastDay 排除属预期
+  const expectedMonths = months - 1
+  expect("history requests", historySnap.totals.requests, expectedMonths)
+  expect("history cost", historySnap.totals.cost, expectedMonths * 0.1, 1e-6)
+  expect("history effective tokens", historySnap.totals.tokens.input + historySnap.totals.tokens.output, expectedMonths * 1500)
+  // 无截断：全部历史完整统计
+  expect("history not truncated", historySnap.samples.truncated, false)
+  // 活跃天数 = 有 assistant 消息的天数（每月一天，超出内存缓存容量也要完整）
+  expect("history active days", historySnap.totals.activeDays, expectedMonths)
+  // 项目归因与总量一致
+  expect("history project rows", historySnap.projectUsage.length, 1)
+  expect("history project cost", historySnap.projectUsage[0]?.cost ?? -1, expectedMonths * 0.1, 1e-6)
+  // 冷启动后长历史结果一致（磁盘缓存支撑）
+  historyStore.close()
+  const historyCold = new UsageStore(historyFile, () => {})
+  const historyColdSnap = historyCold.snapshot({ from: 0, to: now, projectID: undefined, force: true })
+  expect("history cold-start cost", historyColdSnap.totals.cost, expectedMonths * 0.1, 1e-6)
+  expect("history cold-start active days", historyColdSnap.totals.activeDays, expectedMonths)
+  historyCold.close()
+
   if (failures.length > 0) {
     console.error("synthetic data regressions:")
     for (const failure of failures) console.error(`  - ${failure}`)

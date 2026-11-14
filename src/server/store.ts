@@ -40,6 +40,12 @@ const DETAIL_PAGE = 60
  */
 const DAY_CACHE_LIMIT = 600
 const DAY_FILE_MAX_BYTES = 32 * 1024 * 1024
+/**
+ * 全部历史（方案 B）：不设固定天数上限。逐日缓存让历史天的读取成本接近
+ * O(天数)，真正现算的只有今天；分段批处理按月打包逐日请求，避免一次把
+ * 数千天的 dayAgg 调用全部排开。
+ */
+const HISTORY_BATCH_DAYS = 366
 const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 /**
  * Trae CN serves the account's credit usage on its own API host. The
@@ -1094,23 +1100,28 @@ export class UsageStore {
     const today = localDate(Date.now())
 
     // 找出范围覆盖的每一天，逐日取聚合（历史天走缓存，只有今天现算）。
-    // 「全部」必须语义真实：逐日缓存让跨多年历史也可控，不再用 400 天
-    // 保护性截断（1.0 发布门槛 §5.3）。安全上限 5 年（1825 天）防御
-    // 异常时间戳导致的死循环，触达时在快照里标注截断。
-    const MAX_RANGE_DAYS = 1825
+    // 方案 B：全部历史不设固定天数上限——起始点取范围内最早的有效
+    // Assistant 记录，逐日聚合由磁盘缓存支撑（历史天毫秒级）。
+    // 异常时间戳（如 1970）由数据库实际数据兜底：范围由真实消息日期
+    // 决定，不存在无界循环；分段批处理控制单次合并的内存峰值。
     const firstDay = input.from === 0 ? undefined : localDate(input.from)
     const lastDay = localDate(Math.min(input.to, Date.now()))
     const dates: string[] = []
     let truncated = false
     if (firstDay) {
       let cursor = firstDay
+      // 上限只防异常时间戳造成的无界循环（约 5 万年），正常历史远达不到。
       let guard = 0
-      while (cursor <= lastDay && guard < MAX_RANGE_DAYS) {
+      const guardLimit = 20_000_000
+      while (cursor <= lastDay) {
         dates.push(cursor)
         cursor = nextDate(cursor)
         guard += 1
+        if (guard >= guardLimit) {
+          truncated = true
+          break
+        }
       }
-      truncated = cursor <= lastDay
     } else {
       // 「全部」范围没有明确的起点：先查数据库里最早的消息日期。
       const scopeFilter = scope !== "all" ? " AND s.project_id = ?" : ""
@@ -1124,15 +1135,23 @@ export class UsageStore {
       if (earliestTime > 0) {
         let cursor = localDate(earliestTime)
         let guard = 0
-        while (cursor <= lastDay && guard < MAX_RANGE_DAYS) {
+        const guardLimit = 20_000_000
+        while (cursor <= lastDay) {
           dates.push(cursor)
           cursor = nextDate(cursor)
           guard += 1
+          if (guard >= guardLimit) {
+            truncated = true
+            break
+          }
         }
-        truncated = cursor <= lastDay
       }
     }
 
+    // 分批合并（要求 D：不一次性展开全部日期）：每批最多 HISTORY_BATCH_DAYS
+    // 天，逐批 mergeDays，控制单次对象展开的内存峰值。series 在循环内即时
+    // 采集——长历史会超出内存缓存容量（DAY_CACHE_LIMIT），事后从 dayMemory
+    // 回读会丢失被淘汰的日期。
     const total = mergeDays(
       {
         date: `${firstDay ?? "all"}~${lastDay}`,
@@ -1147,20 +1166,36 @@ export class UsageStore {
         latencyByModel: {},
         prompts: 0,
       },
-      dates.map((date) => this.dayAgg(db, scope, date, today)),
+      [],
     )
+    const seriesByDate = new Map<string, SeriesPoint>()
+    for (let start = 0; start < dates.length; start += HISTORY_BATCH_DAYS) {
+      const batch = dates.slice(start, start + HISTORY_BATCH_DAYS).map((date) => {
+        const day = this.dayAgg(db, scope, date, today)
+        seriesByDate.set(date, {
+          date,
+          requests: day.requests,
+          cost: day.cost,
+          input: day.tokens.input,
+          output: day.tokens.output,
+          cacheRead: day.tokens.cacheRead,
+        })
+        return day
+      })
+      mergeDays(total, batch)
+    }
 
-    const series: SeriesPoint[] = dates.map((date) => {
-      const day = this.dayMemory.get(scope)?.get(date)
-      return {
-        date,
-        requests: day?.requests ?? 0,
-        cost: day?.cost ?? 0,
-        input: day?.tokens.input ?? 0,
-        output: day?.tokens.output ?? 0,
-        cacheRead: day?.tokens.cacheRead ?? 0,
-      }
-    })
+    const series: SeriesPoint[] = dates.map(
+      (date) =>
+        seriesByDate.get(date) ?? {
+          date,
+          requests: 0,
+          cost: 0,
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+        },
+    )
     const models: ModelRow[] = Object.values(total.models).sort(
       (a, b) => b.input + b.output - (a.input + a.output),
     )
