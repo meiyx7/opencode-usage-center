@@ -33,11 +33,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Build
+        run: npm run build
+
+      # check-plugin.ts imports dist/index.js，必须在 build 之后执行。
       - name: Plugin wire tests
         run: npm run test:plugin
 
       - name: Synthetic data tests
         run: npm run test:synthetic
-
-      - name: Build
-        run: npm run build
