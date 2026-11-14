@@ -125,7 +125,9 @@ export function ModelsExplorer(props: {
 
   const hiddenCount = createMemo(() => Object.values(hidden()).filter(Boolean).length)
 
-  const accents = ["#6d4aff", "#3b82f6", "#0ea5a4", "#b45309", "#d92d20", "#0f7b4f", "#7c3aed", "#c2410c"]
+  // provider 分组配色：全部走主题变量，深浅色自动适配；后 4 个用 hue-rotate
+  // 从主色派生，避免硬编码色值在深色主题下刺眼。
+  const accents = ["var(--uc-accent)", "var(--uc-blue)", "var(--uc-teal)", "var(--uc-amber)", "var(--uc-red)", "var(--uc-green)", "var(--uc-purple)", "var(--uc-orange)"]
   const accentOf = (providerID: string) => {
     let hash = 0
     for (let index = 0; index < providerID.length; index++) hash = (hash * 31 + providerID.charCodeAt(index)) >>> 0

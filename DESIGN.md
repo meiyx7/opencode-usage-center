@@ -170,7 +170,9 @@ Server（Plugin.define）
 
 ## 8. 版本计划
 
-### P0 · 已实现（0.1.0）
+> 详细路线见 [ROADMAP.md](ROADMAP.md)。
+
+### P0 · 已实现（0.1.0 / 0.2.x / 0.3.x）
 
 - 总览：KPI、Token 趋势、模型分布、费用构成
 - 额度与时效：OpenCode Go 三档额度、Trae CN（个人 / 企业）Credits、Qoder CN 套餐 + 加油包，多供应商 meters 列表 + 重置倒计时、凭据到期列表
@@ -181,6 +183,7 @@ Server（Plugin.define）
 - 独立 x-large 弹窗 + Settings 页 + 顶栏胶囊 + `⌥U`
 - 全部项目 / 当前项目 / 指定项目筛选
 - 手动刷新 + 事件触发刷新 + 60 秒兜底轮询
+- 0.3.x 稳定化：凭据与额度合并页签（登录状态 + 窗口额度同卡）、凭据数据源统一（RPC 为准）、DB Schema 兼容检测、快照样本数、指标口径入口
 
 ### P1 · 监控闭环
 
