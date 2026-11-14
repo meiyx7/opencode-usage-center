@@ -62,6 +62,7 @@
     "test:data": "bun scripts/check-data.ts",
     "test:plugin": "bun scripts/check-plugin.ts",
     "test:synthetic": "bun scripts/check-synthetic.ts",
+    "test:scale": "bun scripts/check-scale.ts base",
     "prepublishOnly": "node scripts/ensure-ci-publish.mjs && npm run typecheck && npm run build"
   }
 }

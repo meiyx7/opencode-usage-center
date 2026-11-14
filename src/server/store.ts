@@ -107,6 +107,14 @@ function nextDate(date: string): string {
   return localDate(value.getTime())
 }
 
+/** 一天的本地毫秒区间，左闭右开 [from, to)，按本地日历推次日零点（DST 安全）。 */
+function dayBoundsOf(date: string): { from: number; to: number } {
+  const start = new Date(`${date}T00:00:00`)
+  const next = new Date(start)
+  next.setDate(next.getDate() + 1)
+  return { from: start.getTime(), to: next.getTime() }
+}
+
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0
   const sorted = [...values].sort((a, b) => a - b)
@@ -943,7 +951,9 @@ export class UsageStore {
   private schemaProbe(): void {
     const required: Record<string, string[]> = {
       session_v2: ["id", "project_id", "time_created", "time_updated"],
-      session_message: ["id", "session_id", "type", "seq", "time_created", "data"],
+      // time_updated 供缓存指纹（dayFingerprint）使用；缺列时指纹查询
+      // 直接抛错，必须纳入探测，宁可降级也不静默失败。
+      session_message: ["id", "session_id", "type", "seq", "time_created", "time_updated", "data"],
       credential: ["id", "integration_id", "value"],
       project: ["id", "name"],
     }
@@ -1003,11 +1013,13 @@ export class UsageStore {
     return project || "all"
   }
 
-  /** 一天的本地毫秒区间。 */
+  /**
+   * 一天的本地毫秒区间，左闭右开 [from, to)。按本地日历推到次日零点而不是
+   * 固定 +86400000：DST 开始日只有 23 小时、结束日有 25 小时，固定毫秒数
+   * 会让切换日的边界偏 1 小时，导致当天消息漏算或被计入相邻日。
+   */
   private dayBounds(date: string): { from: number; to: number } {
-    const start = new Date(`${date}T00:00:00`)
-    const from = start.getTime()
-    return { from, to: from + DAY }
+    return dayBoundsOf(date)
   }
 
   /** 取一天的聚合：内存 → 磁盘 → 现算。今天总是现算（消息还在增长）。 */

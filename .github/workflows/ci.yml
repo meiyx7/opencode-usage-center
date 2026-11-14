@@ -42,3 +42,8 @@ jobs:
 
       - name: Synthetic data tests
         run: npm run test:synthetic
+
+      # 大规模性能回归只跑基准档（CI 内存有限）；medium/large 档本地跑
+      # `npm run test:scale -- medium|large`。
+      - name: Scale regression (base)
+        run: npm run test:scale

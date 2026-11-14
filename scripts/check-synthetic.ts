@@ -287,6 +287,121 @@ function main(): void {
   expect("history cold-start active days", historyColdSnap.totals.activeDays, expectedMonths)
   historyCold.close()
 
+  // 13. DST 夏令时日期边界（本批任务 1）：dayBounds 必须按本地日历推次日
+  // 零点。在美国 DST 结束日（11/1，25 小时）与开始日（3/8，23 小时）前后
+  // 各放消息，固定 +86400000 的旧实现会把边界偏 1 小时：25th hour 那条
+  // 漏算、3/9 凌晨那条被重复统计。测试块内固定运行时区为纽约，期望值
+  // 与 CI 的时区无关。
+  {
+    const prevTZ = process.env.TZ
+    process.env.TZ = "America/New_York"
+    try {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const dstFile = `${process.env.TMPDIR ?? "/tmp"}/uc-dst-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db = new Database(dstFile)
+    db.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+    `)
+    db.exec(`INSERT INTO project VALUES ('pd', NULL, '/tmp/dst', 1)`)
+    db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s-dst', 'pd', 'DST', NULL, NULL)").run()
+    const insert = db.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
+    )
+    // 用带固定偏移的 UTC 时间反向构造各时区的本地时刻：先查该时区在该
+    // 时刻的偏移量，再从 UTC 减掉偏移。避免依赖运行环境时区。
+    const makeStamp = (y: number, m: number, d: number, hh: number, mm: number, tz: string) => {
+      const iso = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`
+      // 该时区 `${iso}Z` 时刻的偏移（分钟）：local = utc + offset
+      const offsetMinutes = new Date(`${iso}Z`).toLocaleString("en-US", { timeZone: tz, timeZoneName: "longOffset" })
+      const match = /GMT([+-]\d{2}):(\d{2})/.exec(offsetMinutes)
+      const sign = match?.[1].startsWith("-") ? -1 : 1
+      const oh = parseInt(match?.[1].slice(1) ?? "0", 10)
+      const om = parseInt(match?.[2] ?? "0", 10)
+      const utcGuess = new Date(`${iso}Z`).getTime()
+      // local(utcGuess) 显示为 hh:mm，实际本地时刻 = utcGuess + offset。
+      // 我们要 local 显示为 iso，即 utc = utcGuess - offset。
+      return utcGuess - sign * (oh * 60 + om) * 60_000
+    }
+    // 2026 年美国 DST：3 月 8 日 02:00 开始（当天 23 小时），11 月 1 日
+    // 02:00 结束（当天 25 小时）。消息特意放在新旧实现的差异缝隙上：
+    // - DST 结束日的最后一小时（11/1 23:30 EST）：旧实现 [from+24h) 漏算
+    // - DST 开始日的次日凌晨（3/9 00:30 EDT）：旧实现把 3/8 的 to 多撑 1
+    //   小时，与 3/9 重叠，重复统计
+    const ny = "America/New_York"
+    const stamps = [
+      ["end-day-noon", makeStamp(2026, 11, 1, 12, 0, ny)], // 25 小时那天中午
+      ["end-day-late", makeStamp(2026, 11, 1, 23, 30, ny)], // 25th hour，旧实现漏算
+      ["end-next-early", makeStamp(2026, 11, 2, 0, 30, ny)], // 次日凌晨
+      ["start-day-noon", makeStamp(2026, 3, 8, 12, 0, ny)], // 23 小时那天中午
+      ["start-next-early", makeStamp(2026, 3, 9, 0, 30, ny)], // 次日凌晨，旧实现重复
+    ]
+    stamps.forEach(([id, stamp], index) => {
+      insert.run(id, "s-dst", index + 1, stamp, stamp, JSON.stringify({
+        model: { providerID: "prov", id: "model-a" },
+        agent: "build",
+        cost: 0.1,
+        tokens: { input: 100, output: 50 },
+        time: { created: stamp, completed: stamp + 100 },
+      }))
+    })
+    db.close()
+
+    const dstStore = new UsageStore(dstFile, () => {})
+    const dstSnap = dstStore.snapshot({ from: 0, to: now, projectID: undefined, force: true })
+    // 5 条消息各统计一次：旧实现漏算 25th hour 那条、重复统计 3/9 凌晨那条
+    expect("DST requests", dstSnap.totals.requests, 5)
+    expect("DST cost", dstSnap.totals.cost, 0.5, 1e-6)
+    const byDate = new Map(dstSnap.series.filter((p) => p.requests > 0).map((p) => [p.date, p.requests]))
+    // 11/1：中午 + 23:30（25th hour 的本地日仍是 11/1）；11/2：凌晨 00:30
+    expect("DST end day (11/1)", byDate.get("2026-11-01") ?? -1, 2)
+    expect("DST day after end (11/2)", byDate.get("2026-11-02") ?? -1, 1)
+    expect("DST start day (3/8)", byDate.get("2026-03-08") ?? -1, 1)
+    expect("DST day after start (3/9)", byDate.get("2026-03-09") ?? -1, 1)
+    dstStore.close()
+    require("node:fs").rmSync(dstFile)
+    } finally {
+      if (prevTZ === undefined) delete process.env.TZ
+      else process.env.TZ = prevTZ
+    }
+  }
+
+  // 14. Schema 兼容（本批任务 2）：缺 session_message.time_updated（缓存
+  // 指纹依赖的列）时，schemaProbe 必须拦截并降级为空快照，不允许任何
+  // SQL 崩溃或错误统计。
+  {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const legacyFile = `${process.env.TMPDIR ?? "/tmp"}/uc-legacy-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db = new Database(legacyFile)
+    // 旧结构：session_message 无 time_updated 列
+    db.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+    `)
+    db.exec(`INSERT INTO project VALUES ('p1', NULL, '/tmp/legacy', 1)`)
+    db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('s1', 'p1', '旧', ?, ?)").run(yesterday, yesterday)
+    db.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES ('m1', 's1', 'assistant', 1, ?, ?)").run(
+      yesterday,
+      JSON.stringify({ model: { providerID: "prov", id: "m" }, agent: "build", cost: 1.23, tokens: { input: 10, output: 5 }, time: { created: yesterday } }),
+    )
+    db.close()
+
+    const logs: string[] = []
+    const legacyStore = new UsageStore(legacyFile, (message, detail) => logs.push(`${message} ${detail ?? ""}`))
+    const legacySnap = legacyStore.snapshot({ from: todayStart - DAY, to: now, projectID: undefined, force: true })
+    // 降级：空快照而非崩溃或错误数据
+    expect("legacy schema snapshot empty", legacySnap.totals.requests, 0)
+    expect("legacy schema snapshot cost", legacySnap.totals.cost, 0)
+    // 诊断信息能定位到具体缺的列
+    expect("legacy schema error mentions column", logs.some((l) => l.includes("time_updated")), true)
+    legacyStore.close()
+    require("node:fs").rmSync(legacyFile)
+  }
+
   if (failures.length > 0) {
     console.error("synthetic data regressions:")
     for (const failure of failures) console.error(`  - ${failure}`)
