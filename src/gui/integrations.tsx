@@ -7,7 +7,9 @@ import type {
   ModelInfo,
   ProviderInfo,
 } from "@opencode/client/promise"
-import { expiryLabel } from "./format"
+import type { Quota, QuotaProvider } from "../contract"
+import type { Meter } from "../contract"
+import { expiryLabel, meterAmount, percent, resetLabel } from "./format"
 
 /**
  * 凭据与模型页。数据全部来自 `ctx.client`（认证过的服务端 API），不在窗口里碰
@@ -21,8 +23,9 @@ type AuthRow = {
   integrationID: string
   name: string
   methods: IntegrationMethod[]
-  connections: readonly import("@opencode/client/promise").ConnectionInfo[]
   credentials: CredentialEntry[]
+  /** 插件 RPC 快照的凭据行：登录状态展示以此为准，与总览页同源。 */
+  serverCredentials: import("../contract").CredentialRow[]
   /** 该集成下模型数量（没有 provider 的集成是 undefined） */
   modelCount?: number
   providerActivation?: ProviderInfo["activation"]
@@ -138,7 +141,15 @@ function readableActionError(cause: unknown): string {
   return raw
 }
 
-export function IntegrationsPage(props: { ctx: Context }) {
+export function IntegrationsPage(props: {
+  ctx: Context
+  quota?: Quota
+  onRetryQuota?: () => void
+  /** 插件 RPC 快照里的凭据行：与总览页「凭据有效期」同源，登录状态以此为准。 */
+  serverCredentials?: readonly import("../contract").CredentialRow[]
+  /** 凭据发生变化（登录/删除/启用）后调用，让宿主页面强制刷新 RPC 快照。 */
+  onCredentialsChanged?: () => void
+}) {
   const client = props.ctx.client
   const ui = props.ctx.ui
   const [integrations, setIntegrations] = createSignal<IntegrationInfo[]>([])
@@ -152,6 +163,21 @@ export function IntegrationsPage(props: { ctx: Context }) {
   const [flow, setFlow] = createSignal<LoginFlow>()
   const [flowState, setFlowState] = createSignal<"waiting" | "complete" | "failed" | "expired">("waiting")
   const [flowMessage, setFlowMessage] = createSignal("")
+
+  /**
+   * 登录状态以 serverCredentials（插件 RPC，与总览页同源）为准：卡片行的
+   * 存在性、active、到期时间都用它。host 的 credential.list() 只在展开时
+   * 补充账号提示 / Key 尾号这类 RPC 契约里没有的字段，以及供写操作刷新。
+   */
+  const serverByIntegration = createMemo<Map<string, import("../contract").CredentialRow[]>>(() => {
+    const map = new Map<string, import("../contract").CredentialRow[]>()
+    for (const credential of props.serverCredentials ?? []) {
+      const list = map.get(credential.integrationID) ?? []
+      list.push(credential)
+      map.set(credential.integrationID, list)
+    }
+    return map
+  })
 
   async function load(quiet = false) {
     if (!quiet) setLoading(true)
@@ -186,6 +212,8 @@ export function IntegrationsPage(props: { ctx: Context }) {
         })) {
           if (controller.signal.aborted) break
           void load(true)
+          // 凭据事件意味着 RPC 快照里的凭据行也过期了，让宿主页面静默刷新。
+          props.onCredentialsChanged?.()
         }
       } catch {
         // 事件订阅失败时靠手动刷新兜底
@@ -228,12 +256,14 @@ export function IntegrationsPage(props: { ctx: Context }) {
   /** 只显示有登录方式或有凭据的集成，246 个里绝大多数与本机无关。 */
   const rows = createMemo<AuthRow[]>(() => {
     const credentialMap = byIntegration()
+    const serverMap = serverByIntegration()
     const providerMap = providerByIntegration()
     const out: AuthRow[] = []
     for (const integration of integrations()) {
       const list = credentialMap.get(integration.id)
+      const serverList = serverMap.get(integration.id)
       const integrationProviders = providerMap.get(integration.id)
-      if (!list?.length && !integrationProviders?.length) continue
+      if (!list?.length && !serverList?.length && !integrationProviders?.length) continue
       const modelCount = integrationProviders?.reduce(
         (sum, provider) => sum + (modelCountByProvider().get(provider.id) ?? 0),
         0,
@@ -242,16 +272,69 @@ export function IntegrationsPage(props: { ctx: Context }) {
         integrationID: integration.id,
         name: integration.name,
         methods: integration.methods,
-        connections: integration.connections,
         credentials: list ?? [],
+        serverCredentials: serverList ?? [],
         modelCount,
         providerActivation: integrationProviders?.[0]?.activation,
         providerPackage: integrationProviders?.[0]?.package,
       })
     }
     // 有凭据的在前，其余按名称
-    out.sort((a, b) => Number(b.credentials.length > 0) - Number(a.credentials.length > 0) || a.name.localeCompare(b.name))
+    out.sort((a, b) => Number(b.credentials.length > 0 || b.serverCredentials.length > 0) - Number(a.credentials.length > 0 || a.serverCredentials.length > 0) || a.name.localeCompare(b.name))
     return out
+  })
+
+  /**
+   * 供应商额度（来自插件自己的 quota RPC）按 integrationID 分组，供卡片头部
+   * 展示概要、展开区展示完整 meters。与凭据数据源独立，任一侧失败互不阻塞。
+   */
+  const quotaByIntegration = createMemo<Map<string, QuotaProvider>>(() => {
+    const map = new Map<string, QuotaProvider>()
+    for (const provider of props.quota?.providers ?? []) map.set(provider.id, provider)
+    return map
+  })
+  /** 有额度的供应商但没有任何凭据/集成行时（如凭据已删但接口仍在返回），补一张展示卡。 */
+  const quotaOnlyRows = createMemo<AuthRow[]>(() => {
+    const out: AuthRow[] = []
+    for (const provider of props.quota?.providers ?? []) {
+      if (rows().some((row) => row.integrationID === provider.id)) continue
+      out.push({
+        integrationID: provider.id,
+        name: provider.name,
+        methods: [],
+        credentials: [],
+        serverCredentials: serverByIntegration().get(provider.id) ?? [],
+      })
+    }
+    return out
+  })
+
+  /**
+   * 合并页签的卡片顺序：有额度 meters 的最前（默认展开），已登录次之，
+   * 未登录（无凭据也无可用额度）靠后。
+   */
+  const sortedRows = createMemo<AuthRow[]>(() => {
+    const rank = (row: AuthRow) => {
+      const quota = quotaByIntegration().get(row.integrationID)
+      if (quota && quota.meters.length > 0) return 0
+      if (row.credentials.length > 0) return 1
+      return 2
+    }
+    return [...rows(), ...quotaOnlyRows()].sort(
+      (a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name),
+    )
+  })
+
+  /** 有额度 meters 的卡片默认展开；用户手动收起后记入 dismissed，不再自动弹开。 */
+  const [dismissed, setDismissed] = createSignal<ReadonlySet<string>>(new Set<string>())
+  /** 默认展开所有有额度 meters 且未被手动收起的卡片。 */
+  const autoOpen = createMemo<ReadonlySet<string>>(() => {
+    const open = new Set<string>()
+    for (const row of sortedRows()) {
+      const quota = quotaByIntegration().get(row.integrationID)
+      if (quota && quota.meters.length > 0 && !dismissed().has(row.integrationID)) open.add(row.integrationID)
+    }
+    return open
   })
 
   async function startOAuth(row: AuthRow, method: IntegrationMethod, answers?: Record<string, string>) {
@@ -312,6 +395,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
       await client.integration.connect.key({ integrationID: row.integrationID, key, answer: Object.keys(answers).length ? answers : undefined })
       props.ctx.toast.show({ title: `${row.name} 的 API Key 已保存`, variant: "success" })
       void load(true)
+      props.onCredentialsChanged?.()
     } catch (cause) {
       props.ctx.toast.show({
         title: `保存失败`,
@@ -346,6 +430,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
         if (status.data.status !== "pending") break
       }
       void load(true)
+      props.onCredentialsChanged?.()
     } catch (cause) {
       props.ctx.toast.show({
         title: `无法发起命令行登录`,
@@ -370,6 +455,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
       await client.credential.remove({ credentialID: credential.id })
       props.ctx.toast.show({ title: "凭据已删除", variant: "success" })
       void load(true)
+      props.onCredentialsChanged?.()
     } catch (cause) {
       props.ctx.toast.show({
         title: "删除失败",
@@ -387,6 +473,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
       await client.credential.activate({ credentialID: credential.id })
       props.ctx.toast.show({ title: "已切换为当前使用的凭据", variant: "success" })
       void load(true)
+      props.onCredentialsChanged?.()
     } catch (cause) {
       props.ctx.toast.show({
         title: "切换失败",
@@ -412,6 +499,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
           setFlowState("complete")
           setFlowMessage("登录成功，凭据已保存")
           void load(true)
+          props.onCredentialsChanged?.()
         } else if (status.data.status === "failed") {
           setFlowState("failed")
           setFlowMessage(status.data.message || "登录失败")
@@ -430,15 +518,38 @@ export function IntegrationsPage(props: { ctx: Context }) {
     <div class="uc-integrations">
       <div class="uc-card-head">
         <div>
-          <div class="uc-card-title">凭据与登录</div>
+          <div class="uc-card-title">凭据与额度</div>
           <div class="uc-card-sub">
-            登录状态与多账号 · 实时来自 OpenCode 服务
+            登录状态、多账号与订阅额度 · 点开供应商卡片看各窗口用量
           </div>
         </div>
+        <Show
+          when={props.quota && !props.quota.available}
+          fallback={
+            props.quota ? undefined : (
+              <button type="button" class="uc-text-button" onClick={props.onRetryQuota} title="额度接口最长 8 秒，超时后可重试">
+                额度读取中，点此重试
+              </button>
+            )
+          }
+        >
+          <span class="uc-badge uc-badge-muted">额度未连接</span>
+        </Show>
         <ui.Button variant="ghost" size="small" icon="refresh" busy={loading()} onClick={() => void load(true)}>
           刷新
         </ui.Button>
       </div>
+
+      <Show when={props.quota && props.quota.error && !props.quota.available}>
+        <div class="uc-quota-error">
+          <span>{props.quota!.error}</span>
+          <Show when={props.onRetryQuota}>
+            <button type="button" class="uc-text-button" onClick={props.onRetryQuota}>
+              重试
+            </button>
+          </Show>
+        </div>
+      </Show>
 
       <Show when={error()}>
         <div class="uc-notice" data-tone="error">
@@ -463,19 +574,37 @@ export function IntegrationsPage(props: { ctx: Context }) {
         </div>
       </Show>
 
-      <Show when={!loading() && rows().length === 0}>
+      <Show when={!loading() && rows().length === 0 && quotaOnlyRows().length === 0}>
         <div class="uc-empty-line">还没有任何登录或凭据。点右上角「刷新」或先在 TUI 里 /login。</div>
       </Show>
 
       <Show when={!loading()}>
       <div class="uc-int-grid">
-        <For each={rows()}>
+        <For each={sortedRows()}>
           {(row) => {
-            const open = () => expanded() === row.integrationID
+            /** 手动点过头部就用手动状态；否则有额度 meters 的卡片默认展开。 */
+            const open = () => (expanded() !== undefined ? expanded() === row.integrationID : autoOpen().has(row.integrationID))
+            /**
+             * 登录状态以 server 凭据（插件 RPC，与总览页同源）为准；host 数据
+             * 只补充展开区的账号提示 / Key 尾号。server 没返回时（弹窗刚打开、
+             * 快照未到）回退 host 数据，避免闪「未登录」。
+             */
+            const signed = () =>
+              props.serverCredentials ? row.serverCredentials.length > 0 : row.credentials.length > 0
+            const serverActive = () => row.serverCredentials.find((credential) => credential.active)
             const active = () => row.credentials.find((credential) => credential.active)
+            const quotaProvider = () => quotaByIntegration().get(row.integrationID)
+            const summary = () => (quotaProvider() ? quotaSummary(quotaProvider()!) : undefined)
             const tag = () => {
-              if (!row.credentials.length) {
+              if (!signed()) {
+                // 有额度数据说明服务端凭据仍在，只是不在本机集成列表里；不显示「未登录」。
+                if (quotaProvider() && quotaProvider()!.available) return { text: "已登录", tone: "ok" as const }
                 return { text: "未登录", tone: "none" as const }
+              }
+              if (props.serverCredentials) {
+                const serverOAuth = row.serverCredentials.find((credential) => credential.type === "oauth")
+                if (row.serverCredentials.length > 1) return { text: `${row.serverCredentials.length} 个账号`, tone: "ok" as const }
+                return expiryLabel(serverOAuth?.expires)
               }
               const oauth = row.credentials.find((credential) => credential.value.type === "oauth")
               const expires = oauth && "expires" in credentialValueOf(oauth) ? credentialValueOf(oauth).expires : undefined
@@ -483,12 +612,23 @@ export function IntegrationsPage(props: { ctx: Context }) {
               if (row.credentials.length > 1) return { text: `${row.credentials.length} 个账号`, tone: "ok" as const }
               return { text: label.text, tone: label.tone }
             }
+            const toggle = () => {
+              const next = open() ? undefined : row.integrationID
+              setExpanded(next)
+              // 手动收起一张默认展开的卡后不再自动弹开；展开其它卡时也一并记录。
+              setDismissed((prev) => {
+                const merged = new Set(prev)
+                for (const id of autoOpen()) merged.add(id)
+                if (next) merged.delete(next)
+                return merged
+              })
+            }
             return (
-              <div class="uc-int-card" data-open={open() ? "true" : undefined} data-signed={row.credentials.length > 0 ? "true" : undefined}>
+              <div class="uc-int-card" data-open={open() ? "true" : undefined} data-signed={signed() ? "true" : undefined}>
                 <button
                   type="button"
                   class="uc-int-head"
-                  onClick={() => setExpanded(open() ? undefined : row.integrationID)}
+                  onClick={toggle}
                 >
                   <span class="uc-int-top">
                     <span class="uc-int-icon">{row.name.slice(0, 1).toUpperCase()}</span>
@@ -496,25 +636,32 @@ export function IntegrationsPage(props: { ctx: Context }) {
                       <b>{row.name}</b>
                       <span>
                         {row.modelCount ? `${row.modelCount} 个模型` : row.integrationID}
-                        {active() ? ` · ${accountHint(active()!) ?? active()!.label}` : ""}
+                        {signed() ? ` · ${(serverActive() ?? active())?.label ?? "已登录"}` : ""}
                       </span>
                     </span>
                     <span class="uc-exp-tag" data-tone={tag().tone}>
                       {tag().text}
                     </span>
+                    <Show when={summary()}>
+                      {(value) => (
+                        <span class="uc-exp-tag uc-int-quota-tag" data-tone={value().tone} title={quotaProvider()?.plan}>
+                          {value().text}
+                        </span>
+                      )}
+                    </Show>
                   </span>
-                  <Show when={row.credentials.length > 0}>
+                  <Show when={signed()}>
                     <span class="uc-int-meta">
-                      <For each={row.credentials.slice(0, 3)}>
+                      <For each={row.serverCredentials.slice(0, 3)}>
                         {(credential) => (
                           <span class="uc-int-chip" data-active={credential.active ? "true" : undefined}>
                             <i />
-                            {accountHint(credential) ?? credential.label}
+                            {credential.label}
                           </span>
                         )}
                       </For>
-                      <Show when={row.credentials.length > 3}>
-                        <span class="uc-int-chip">+{row.credentials.length - 3}</span>
+                      <Show when={row.serverCredentials.length > 3}>
+                        <span class="uc-int-chip">+{row.serverCredentials.length - 3}</span>
                       </Show>
                     </span>
                   </Show>
@@ -530,22 +677,46 @@ export function IntegrationsPage(props: { ctx: Context }) {
 
                 <Show when={open()}>
                   <div class="uc-int-body">
-                    <Show when={row.credentials.length > 0}>
+                    <Show
+                      when={quotaProvider()}
+                      fallback={
+                        <Show when={props.quota === undefined}>
+                          <div class="uc-int-quota-note">订阅额度读取中…</div>
+                        </Show>
+                      }
+                    >
+                      <Show when={quotaProvider()!.meters.length > 0}>
+                        <div class="uc-int-section-title">订阅额度</div>
+                        <QuotaMeters provider={quotaProvider()!} />
+                      </Show>
+                      <Show when={quotaProvider()!.meters.length === 0}>
+                        <div class="uc-int-quota-note">
+                          {quotaProvider()!.note || quotaProvider()!.error || "未暴露额度"}
+                        </div>
+                      </Show>
+                    </Show>
+                    <Show when={serverCredentialsOf(row).length > 0 || row.credentials.length > 0}>
                       <div class="uc-int-section-title">凭据</div>
-                      <For each={row.credentials}>
+                      <For each={serverCredentialsOf(row).length > 0 ? serverCredentialsOf(row) : row.credentials}>
                         {(credential) => {
-                          const isOAuth = () => credential.value.type === "oauth"
-                          const expires = () =>
-                            isOAuth() ? (credential.value as { expires?: number }).expires : undefined
+                          /** server 行没有 value 字段；host 行才有完整对象。 */
+                          const host = () => "value" in credential ? (credential as CredentialEntry) : undefined
+                          const isOAuth = () => (host() ? host()!.value.type === "oauth" : (credential as import("../contract").CredentialRow).type === "oauth")
+                          const expires = () => ("expires" in credential ? credential.expires : host() && host()!.value.type === "oauth" ? (host()!.value as { expires?: number }).expires : undefined)
                           const label = () => expiryLabel(expires() || undefined)
-                          const hint = () => accountHint(credential)
+                          const hint = () => (host() ? accountHint(host()!) : undefined)
+                          const name = () => hint() ?? credential.label
                           return (
                             <div class="uc-cred-row">
                               <span class="uc-cred-dot" data-active={credential.active ? "true" : undefined} />
                               <span class="uc-cred-main">
-                                <b title={credential.id}>{hint() ?? credential.label}</b>
+                                <b title={credential.id}>{name()}</b>
                                 <span>
-                                  {isOAuth() ? "OAuth" : credential.value.type === "key" ? `API Key ${secretTail((credential.value as { key?: string }).key)}` : "外部"}
+                                  {isOAuth()
+                                    ? "OAuth"
+                                    : host() && host()!.value.type === "key"
+                                      ? `API Key ${secretTail((host()!.value as { key?: string }).key)}`
+                                      : "API Key"}
                                   {expires() ? ` · ${new Date(expires()!).toLocaleDateString("zh-CN")} 到期` : ""}
                                   {credential.active ? " · 使用中" : ""}
                                 </span>
@@ -558,7 +729,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
                                   size="small"
                                   variant="ghost"
                                   busy={busyID() === credential.id}
-                                  onClick={() => void activateCredential(credential)}
+                                  onClick={() => void activateCredential(credential as CredentialEntry)}
                                 >
                                   启用
                                 </ui.Button>
@@ -566,7 +737,7 @@ export function IntegrationsPage(props: { ctx: Context }) {
                               <ui.IconButton
                                 icon="trash"
                                 label="删除凭据"
-                                onClick={() => void removeCredential(credential)}
+                                onClick={() => void removeCredential(credential as CredentialEntry)}
                               />
                             </div>
                           )
@@ -677,4 +848,50 @@ export function IntegrationsPage(props: { ctx: Context }) {
 /** OAuth 凭据的 expires 字段访问，兼容类型收窄。 */
 function credentialValueOf(credential: CredentialEntry): { expires?: number } {
   return credential.value.type === "oauth" ? credential.value : {}
+}
+
+/** 展开区凭据行：server 行（RPC）优先，host 行兜底。 */
+function serverCredentialsOf(row: AuthRow): import("../contract").CredentialRow[] {
+  return row.serverCredentials
+}
+
+/** 卡片头部的额度概要：占用最高的窗口 + 剩余窗口数。 */
+function quotaSummary(provider: QuotaProvider): { text: string; tone: "ok" | "warn" | "danger" | "none" } {
+  const worst = provider.meters.reduce<Meter | undefined>((best, meter) => (!best || meter.percent > best.percent ? meter : best), undefined)
+  if (!worst) return { text: provider.note || provider.error || "未暴露额度", tone: "none" }
+  const tone = worst.percent >= 90 ? "danger" : worst.percent >= 70 ? "warn" : "ok"
+  const more = provider.meters.length > 1 ? ` 等 ${provider.meters.length} 项` : ""
+  return { text: `${worst.label} ${percent(worst.percent)}${more}`, tone }
+}
+
+/** 展开区里的完整额度 meters，复用额度页的仪表行样式。 */
+function QuotaMeters(props: { provider: QuotaProvider }) {
+  return (
+    <div class="uc-int-quota">
+      <For each={props.provider.meters}>
+        {(meter) => (
+          <div class="uc-meter-row">
+            <div class="uc-meter-top">
+              <span>
+                {meter.label}
+                <small>{meter.resetsAt ? resetLabel(meter.resetsAt) : meterAmount(meter.used, meter.limit, meter.unit)}</small>
+              </span>
+              <b style={{ color: meter.percent >= 90 ? "var(--uc-red)" : undefined }}>{percent(meter.percent)}</b>
+            </div>
+            <div class="uc-meter">
+              <i
+                style={{
+                  width: `${Math.max(1, Math.min(100, meter.percent))}%`,
+                  background: meter.percent >= 90 ? "var(--uc-red)" : meter.percent >= 70 ? "var(--uc-amber)" : "var(--uc-accent)",
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </For>
+      <Show when={props.provider.meters.length === 0}>
+        <div class="uc-int-quota-note">{props.provider.note || props.provider.error || "未暴露额度"}</div>
+      </Show>
+    </div>
+  )
 }

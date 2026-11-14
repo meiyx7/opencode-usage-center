@@ -133,6 +133,31 @@ function CacheBar(props: { tokens: SessionDetail["tokens"] }) {
   )
 }
 
+/** 统一的长内容块：pre + 右上角复制按钮。截断状态由调用方标注。 */
+function CopyBlock(props: { text: string; class?: string; label?: string }) {
+  const [copied, setCopied] = createSignal(false)
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(props.text)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // 剪贴板不可用时静默失败（宿主可能未授权）
+    }
+  }
+  return (
+    <div class="uc-copy" data-with-label={props.label ? "true" : undefined}>
+      <Show when={props.label}>
+        <span class="uc-copy-label">{props.label}</span>
+      </Show>
+      <button type="button" class="uc-copy-btn" onClick={() => void copy()} title="复制完整内容">
+        {copied() ? "已复制" : "复制"}
+      </button>
+      <pre class={props.class ?? "uc-pre"}>{props.text || "（空）"}</pre>
+    </div>
+  )
+}
+
 function ToolCall(props: { tool: SessionToolCall }) {
   const tone = () => (props.tool.status === "error" || props.tool.error ? "danger" : props.tool.status === "running" ? "warn" : "ok")
   return (
@@ -149,19 +174,19 @@ function ToolCall(props: { tool: SessionToolCall }) {
       </summary>
       <div class="uc-tool-body">
         <div class="uc-tool-label">输入</div>
-        <pre class="uc-pre">{props.tool.input || "（空）"}</pre>
+        <CopyBlock text={props.tool.input} />
         <Show when={props.tool.output}>
           <div class="uc-tool-label">
             输出
             <Show when={props.tool.outputTruncated}>
-              <span class="uc-tool-cut">已截断</span>
+              <span class="uc-tool-cut">已截断 · 复制的仍是预览内容，完整内容在本机数据库</span>
             </Show>
           </div>
-          <pre class="uc-pre uc-pre-output">{props.tool.output}</pre>
+          <CopyBlock text={props.tool.output} class="uc-pre uc-pre-output" />
         </Show>
         <Show when={props.tool.error}>
           <div class="uc-tool-label uc-danger">错误</div>
-          <pre class="uc-pre uc-pre-error">{props.tool.error}</pre>
+          <CopyBlock text={props.tool.error} class="uc-pre uc-pre-error" />
         </Show>
         <Show when={typeof props.tool.exitCode === "number"}>
           <div class="uc-tool-foot">退出码 {props.tool.exitCode}</div>
@@ -230,7 +255,7 @@ function RequestCard(props: { request: SessionRequest; index: number; initialOpe
                 <em>已截断</em>
               </Show>
             </summary>
-            <pre class="uc-pre uc-pre-reasoning">{props.request.reasoning}</pre>
+            <CopyBlock text={props.request.reasoning} class="uc-pre uc-pre-reasoning" />
           </details>
         </Show>
         <Show when={props.request.text}>
@@ -255,8 +280,72 @@ function RequestCard(props: { request: SessionRequest; index: number; initialOpe
   )
 }
 
-function DetailSkeleton() {
+/**
+ * 成本瀑布（0.5）：按回合显示估算费用柱状。费用全 0（订阅内调用）时按
+ * 有效 Token 显示并明确标注。点击柱子展开对应回合，定位高消耗回合。
+ */
+function CostWaterfall(props: {
+  turns: readonly SessionTurn[]
+  totalCost: number
+  onLocate: (index: number) => void
+}) {
+  const byCost = createMemo(() => props.turns.reduce((sum, turn) => sum + turn.cost, 0) > 0)
+  const metricOf = (turn: SessionTurn) =>
+    byCost()
+      ? turn.cost
+      : turn.tokens.input + turn.tokens.output
+  const max = createMemo(() => Math.max(1e-9, ...props.turns.map(metricOf)))
+  const top = createMemo(() => {
+    const sorted = [...props.turns].sort((a, b) => metricOf(b) - metricOf(a))
+    return sorted[0]
+  })
   return (
+    <Show when={props.turns.length > 1} fallback={null}>
+      <div class="uc-sd-panel">
+        <div class="uc-sd-panel-title">
+          费用瀑布
+          <span>
+            {byCost()
+              ? `${money(props.totalCost)} 总费用`
+              : `全部 $0 · 按 Token 显示`}
+          </span>
+        </div>
+        <div class="uc-sd-strip uc-cost-strip">
+          <For each={props.turns}>
+            {(turn) => {
+              const value = metricOf(turn)
+              const isTop = top()?.index === turn.index && value > 0
+              return (
+                <span
+                  class="uc-sd-strip-col uc-cost-col"
+                  data-tone={isTop ? "amber" : undefined}
+                  style={{ height: `${Math.max(6, (value / max()) * 100)}%` }}
+                  role="button"
+                  tabIndex={0}
+                  title={`回合 #${turn.index} · ${byCost() ? money(turn.cost) : `${compact(turn.tokens.input + turn.tokens.output)} 有效 Token`}${turn.requests.length ? ` · ${turn.requests.length} 请求` : ""} · 点击展开`}
+                  onClick={() => props.onLocate(turn.index)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      props.onLocate(turn.index)
+                    }
+                  }}
+                />
+              )
+            }}
+          </For>
+        </div>
+        <div class="uc-sd-strip-note">
+          {byCost()
+            ? `柱高为回合费用 · 最高回合 #${top()?.index}（${money(top()?.cost ?? 0)}）· 点击展开该回合`
+            : "柱高为回合有效 Token（费用未记录，订阅内调用可能为 $0）· 点击展开该回合"}
+        </div>
+      </div>
+    </Show>
+  )
+}
+
+function DetailSkeleton() {  return (
     <div class="uc-sd-skeleton">
       <div class="uc-sd-kpis">
         <For each={[0, 1, 2, 3, 4, 5]}>
@@ -298,6 +387,8 @@ export function SessionDetailView(props: {
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [error, setError] = createSignal("")
   const [query, setQuery] = createSignal("")
+  /** JSON 导出的脱敏开关：开启时剥掉提示词、回复、思考与工具内容，只留结构化数字。 */
+  const [sanitizeExport, setSanitizeExport] = createSignal(true)
   const [openTurns, setOpenTurns] = createSignal<Set<number>>(new Set())
   let request = 0
   let loadInFlight = 0
@@ -431,6 +522,117 @@ export function SessionDetailView(props: {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
+  /**
+   * 结构化 JSON 导出（1.0）：保留 Session → Turn → Request → Tool 层次。
+   * 脱敏模式剥掉 prompt / text / reasoning / tool input-output-error，只留
+   * 数字与元数据；完整模式保留全部内容并提醒文件含会话正文。
+   */
+  function exportJson(full: boolean) {
+    const current = detail()
+    if (!current) return
+    const turns = visibleTurns().map((turn) => {
+      const base = {
+        index: turn.index,
+        time: new Date(turn.time).toISOString(),
+        files: turn.files,
+        agents: turn.agents,
+        cost: turn.cost,
+        tokens: turn.tokens,
+        toolCount: turn.toolCount,
+        errorCount: turn.errorCount,
+        durationSeconds: turn.duration,
+        ttftSeconds: turn.ttft,
+        cacheHit: turn.cacheHit,
+      }
+      if (!full) return { ...base, requests: turn.requests.map(stripRequest) }
+      return {
+        ...base,
+        prompt: turn.prompt,
+        promptTruncated: turn.promptTruncated,
+        requests: turn.requests.map((request) => ({
+          id: request.id,
+          time: new Date(request.time).toISOString(),
+          agent: request.agent,
+          provider: request.providerID,
+          model: request.modelID,
+          variant: request.variant || undefined,
+          finish: request.finish,
+          cost: request.cost,
+          tokens: request.tokens,
+          ttftSeconds: request.ttft,
+          totalSeconds: request.total,
+          error: request.error || undefined,
+          text: request.text,
+          reasoning: request.reasoning || undefined,
+          tools: request.tools.map((tool) => ({
+            name: tool.name,
+            status: tool.status,
+            durationSeconds: tool.duration,
+            input: tool.input,
+            output: tool.output,
+            error: tool.error || undefined,
+            exitCode: tool.exitCode,
+          })),
+        })),
+      }
+    })
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      sanitized: !full,
+      note: full
+        ? "完整导出：包含提示词、回复与工具输出，请勿外发。"
+        : "脱敏导出：不含提示词、回复与工具内容。",
+      session: {
+        id: current.id,
+        title: current.title,
+        project: current.projectName,
+        directory: full ? current.directory : undefined,
+        provider: current.providerID,
+        model: current.modelID,
+        timeCreated: new Date(current.timeCreated).toISOString(),
+        timeUpdated: new Date(current.timeUpdated).toISOString(),
+        cost: current.cost,
+        tokens: current.tokens,
+        totalTurns: current.totalTurns,
+        requestCount: current.requestCount,
+        toolCount: current.toolCount,
+        errorCount: current.errorCount,
+        ttftP50: current.ttftP50,
+        ttftP95: current.ttftP95,
+        totalP95: current.totalP95,
+        slowRate: current.slowRate,
+        cacheHit: current.cacheHit,
+      },
+      /** 只包含已加载的回合；长会话可在界面继续加载后再导出。 */
+      turns,
+    }
+    const body = JSON.stringify(payload, null, 2)
+    const blob = new Blob([body], { type: "application/json;charset=utf-8" })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement("a")
+    anchor.href = url
+    anchor.download = `opencode-session-${props.session.id.slice(-8)}-${new Date().toISOString().slice(0, 10)}${full ? "" : "-sanitized"}.json`
+    anchor.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  /** 脱敏导出的请求行：只留数字与元数据。 */
+  function stripRequest(request: SessionRequest) {
+    return {
+      time: new Date(request.time).toISOString(),
+      agent: request.agent,
+      provider: request.providerID,
+      model: request.modelID,
+      finish: request.finish,
+      cost: request.cost,
+      tokens: request.tokens,
+      ttftSeconds: request.ttft,
+      totalSeconds: request.total,
+      toolCount: request.tools.length,
+      toolErrors: request.tools.filter((tool) => tool.status === "error" || tool.error).length,
+    }
+  }
+
   async function load(force = false, quiet = false) {
     const id = ++request
     loadInFlight += 1
@@ -522,6 +724,23 @@ export function SessionDetailView(props: {
               onClick={exportCsv}
             >
               导出 CSV
+            </button>
+            <button
+              type="button"
+              class="uc-sd-mini"
+              title={sanitizeExport() ? "导出结构化 JSON（已脱敏：不含提示词 / 回复 / 工具内容）" : "导出结构化 JSON（保留完整内容，含提示词与工具输出）"}
+              onClick={() => exportJson(!sanitizeExport())}
+            >
+              导出 JSON
+            </button>
+            <button
+              type="button"
+              class="uc-sd-mini"
+              data-tone={sanitizeExport() ? undefined : "warn"}
+              title={sanitizeExport() ? "当前脱敏导出：点击切换为完整内容" : "当前完整导出：点击切换为脱敏"}
+              onClick={() => setSanitizeExport(!sanitizeExport())}
+            >
+              {sanitizeExport() ? "脱敏 开" : "脱敏 关"}
             </button>
             <button type="button" class="uc-sd-mini" onClick={() => toggleAll(true)}>全部展开</button>
             <button type="button" class="uc-sd-mini" onClick={() => toggleAll(false)}>全部收起</button>
@@ -646,6 +865,11 @@ export function SessionDetailView(props: {
                 </div>
                 <div class="uc-sd-strip-note">按时间顺序 · 柱高为 Token · 绿色命中高，红色命中低</div>
               </div>
+              <CostWaterfall
+                turns={value().turns}
+                totalCost={value().cost}
+                onLocate={toggleTurn}
+              />
               <div class="uc-sd-panel">
                 <div class="uc-sd-panel-title">
                   工具分布
@@ -883,6 +1107,10 @@ const DETAIL_CSS = `
 .uc-sd-strip-col { flex: 1; min-width: 3px; border-radius: 2px 2px 0 0; background: var(--uc-green); opacity: 0.85; }
 .uc-sd-strip-col[data-tone="warn"] { background: var(--uc-amber); }
 .uc-sd-strip-col[data-tone="low"] { background: var(--uc-red); }
+/* 费用瀑布（0.5）：可点击的回合费用柱 */
+.uc-cost-col { background: color-mix(in srgb, var(--uc-accent) 68%, var(--uc-card)); cursor: pointer; transition: opacity 0.12s ease; }
+.uc-cost-col:hover, .uc-cost-col:focus-visible { opacity: 1; outline: 1px solid color-mix(in srgb, var(--uc-accent) 55%, transparent); }
+.uc-cost-col[data-tone="amber"] { background: var(--uc-amber); }
 .uc-sd-strip-note { color: var(--uc-faint); font-size: 9.5px; }
 .uc-toolstats { display: flex; flex-direction: column; gap: 3px; }
 .uc-toolstat { display: grid; grid-template-columns: minmax(54px, 88px) minmax(0, 1fr) auto; align-items: center; gap: 6px; font-size: 9.5px; }
@@ -1028,6 +1256,35 @@ const DETAIL_CSS = `
 .uc-tool-cut { color: var(--uc-amber); font-size: 8px; }
 .uc-pre { margin: 0; padding: 6px 7px; border: 1px solid var(--uc-border); border-radius: 5px; background: var(--uc-layer); color: var(--uc-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
 .uc-pre-output { max-height: 300px; }
+/* 统一复制块（P0）：长内容折叠 + 一键复制，复制的是预览内容并明确标注 */
+.uc-copy { position: relative; }
+.uc-copy-btn {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 1;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--uc-border);
+  border-radius: 4px;
+  background: var(--uc-card);
+  color: var(--uc-faint);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 560;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.uc-copy:hover .uc-copy-btn, .uc-copy-btn:focus-visible { opacity: 1; }
+.uc-copy-btn:hover { color: var(--uc-strong); border-color: color-mix(in srgb, var(--uc-accent) 40%, var(--uc-border)); }
+.uc-copy-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--uc-faint);
+  font-size: 9px;
+  font-weight: 600;
+}
 .uc-pre-error { color: var(--uc-red); background: color-mix(in srgb, var(--uc-red) 5%, var(--uc-layer)); }
 .uc-tool-foot { color: var(--uc-faint); font-size: 10px; }
 .uc-sd-error { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--uc-red) 24%, var(--uc-border)); border-radius: 8px; background: color-mix(in srgb, var(--uc-red) 6%, transparent); color: var(--uc-red); font-size: 9.5px; }

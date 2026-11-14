@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, Switch, Match } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import { Usage } from "../contract"
-import type { CredentialRow, LatencyModelRow, Meter, ModelRow, ProjectRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
+import type { AgentRow, CredentialRow, LatencyModelRow, Meter, ModelRow, ProjectRow, ProjectUsageRow, Quota, SeriesPoint, SessionRow, Snapshot } from "../contract"
 import {
   compact,
   csvCell,
@@ -26,20 +26,19 @@ import { IntegrationsPage } from "./integrations"
 import { ModelsExplorer } from "./models-explorer"
 
 type Alert = { title: string; detail: string; action: string; target: string }
-type Tab = "overview" | "quota" | "latency" | "sessions" | "integrations" | "models"
+type Tab = "overview" | "integrations" | "latency" | "sessions" | "models"
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "总览" },
-  { id: "quota", label: "额度与时效" },
+  { id: "integrations", label: "凭据与额度" },
   { id: "latency", label: "时延" },
   { id: "sessions", label: "会话明细" },
-  { id: "integrations", label: "凭据" },
   { id: "models", label: "模型" },
 ]
 
 /** What each tab badge means, in plain words. Shown as the tab's title tooltip. */
 function tabHint(id: Tab, quotaAlert: boolean, latencyAlert: boolean): string {
-  if (id === "quota" && quotaAlert) return "额度与时效 · 红点：某项订阅额度已用 ≥90%"
+  if (id === "integrations" && quotaAlert) return "凭据与额度 · 红点：某项订阅额度已用 ≥90%"
   if (id === "latency" && latencyAlert) return "时延 · 黄点：首字 P95 超过 30 秒，值得留意"
   return TABS.find((tab) => tab.id === id)?.label ?? ""
 }
@@ -53,7 +52,7 @@ function viewKey(range: RangeKind, projectID?: string): string {
   return `${range}|${projectID ?? "all"}`
 }
 
-const CHART_COLORS = ["#6d4aff", "#4f8cff", "#14b8a6", "#cbd5e1"]
+const CHART_COLORS = ["var(--uc-accent)", "var(--uc-blue)", "var(--uc-teal)", "var(--uc-track)"]
 
 function niceMax(value: number): { top: number; step: number } {
   if (!Number.isFinite(value) || value <= 0) return { top: 1, step: 0.25 }
@@ -269,7 +268,7 @@ function CostDonut(props: { models: readonly ModelRow[]; total: number }) {
   )
 }
 
-function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
+function QuotaCard(props: { quota?: Quota; onRetry: () => void }) {
   const providers = () => props.quota?.providers ?? []
   const liveProviders = createMemo(() => providers().filter((provider) => provider.available && provider.meters.length > 0))
   /** The most-consumed window across every provider drives the ring and the warning tone. */
@@ -287,7 +286,7 @@ function QuotaCard(props: { quota?: Quota; onRetry: () => void; id?: string }) {
   const circumference = 2 * Math.PI * 36
   const meterColor = (meter: Meter) => (meter.percent >= 90 ? "var(--uc-red)" : meter.percent >= 70 ? "var(--uc-amber)" : "var(--uc-accent)")
   return (
-    <section class="uc-card uc-quota" id={props.id}>
+    <section class="uc-card uc-quota">
       <div class="uc-card-head">
         <div>
           <div class="uc-card-title">订阅额度</div>
@@ -416,7 +415,7 @@ function ExpiryCard(props: { credentials: readonly CredentialRow[]; limit?: numb
           fallback={<span class="uc-card-sub" style={{ "padding-top": "2px" }}>{rows().length} 个凭据</span>}
         >
           {(credential) => (
-            <button type="button" class="uc-card-link" data-tone="warn" onClick={props.onOpenQuota} title="查看全部凭据与登录状态">
+            <button type="button" class="uc-card-link" data-tone="warn" onClick={props.onOpenQuota} title="查看凭据与额度">
               {expiryLabel(credential().expires).text}内到期 <span>→</span>
             </button>
           )}
@@ -489,7 +488,9 @@ function HealthCard(props: { latency: Snapshot["latency"]; insight?: { model: st
         <div class="uc-health-note">
           <i />
           <span>
-            <b>{percent(props.latency.slowRate * 100, 1)}</b> 的请求超过 30 秒，P95 总时延 {duration(props.latency.totalP95)}。
+            <b>{percent(props.latency.slowRate * 100, 1)}</b> 的请求超过 30 秒，P95 总时延 {duration(props.latency.totalP95)}（{compact(
+              props.latency.samples,
+            )} 个样本）。
             {props.insight
               ? ` ${props.insight.model} 占 ${percent(props.insight.costShare * 100, 1)} 费用，但只占 ${percent(
                   props.insight.tokenShare * 100,
@@ -546,93 +547,7 @@ function SkeletonDashboard() {
   )
 }
 
-function QuotaDetail(props: { quota?: Quota; credentials: readonly CredentialRow[]; onRetry: () => void; id?: string; expiryID?: string }) {
-  const providers = () => props.quota?.providers ?? []
-  return (
-    <div class="uc-detail-grid uc-quota-page">
-      <section class="uc-card uc-quota-detail" id={props.id}>
-        <div class="uc-card-head">
-          <div>
-            <div class="uc-card-title">订阅额度</div>
-            <div class="uc-card-sub">OpenCode Go · Trae · Qoder · 重置时间按本机时区显示</div>
-          </div>
-          <Show
-            when={props.quota?.available}
-            fallback={<span class="uc-badge uc-badge-muted">{props.quota ? "未连接" : "读取中"}</span>}
-          >
-            <span class="uc-card-sub" style={{ "padding-top": "2px" }}>数据来自供应商接口</span>
-          </Show>
-        </div>
-        <Show when={props.quota} fallback={<div class="uc-empty-line">正在读取额度…</div>}>
-          <Show
-            when={providers().length > 0}
-            fallback={
-              <div class="uc-quota-error">
-                <span>{props.quota!.error || "额度接口暂不可用"}</span>
-                <button type="button" class="uc-text-button" onClick={props.onRetry}>
-                  重试
-                </button>
-              </div>
-            }
-          >
-            <For each={providers()}>
-              {(provider) => (
-                <div class="uc-quota-block">
-                  <div class="uc-quota-block-head">
-                    <span>{provider.name}</span>
-                    <Show when={provider.plan}>
-                      <span class="uc-quota-plan">{provider.plan}</span>
-                    </Show>
-                    <Show when={!provider.available}>
-                      <span class="uc-badge uc-badge-muted">未连接</span>
-                    </Show>
-                  </div>
-                  <Show when={provider.meters.length > 0} fallback={<div class="uc-quota-block-note">{provider.note || provider.error || "未暴露额度"}</div>}>
-                    <div class="uc-quota-stats" style={{ "grid-template-columns": `repeat(${Math.min(provider.meters.length, 3)}, minmax(0, 1fr))` }}>
-                      <For each={provider.meters}>
-                        {(meter) => (
-                          <div
-                            class="uc-quota-stat"
-                            data-tone={meter.percent >= 90 ? "danger" : meter.percent >= 70 ? "warn" : "ok"}
-                          >
-                            <div class="uc-quota-stat-head">
-                              <span>{meter.label}</span>
-                              <b>{percent(meter.percent)}</b>
-                            </div>
-                            <div class="uc-meter uc-meter-lg">
-                              <i
-                                style={{
-                                  width: `${Math.max(1, Math.min(100, meter.percent))}%`,
-                                  background: meter.percent >= 90 ? "var(--uc-red)" : meter.percent >= 70 ? "var(--uc-amber)" : "var(--uc-accent)",
-                                }}
-                              />
-                            </div>
-                            <div class="uc-quota-stat-foot">
-                              <span>{meterAmount(meter.used, meter.limit, meter.unit) || (meter.limited ? "已限流" : "正常")}</span>
-                              <span>{meter.resetsAt ? resetLabel(meter.resetsAt) : "无重置时间"}</span>
-                            </div>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </div>
-              )}
-            </For>
-            <div class="uc-detail-note">
-              额度来自各供应商的实时接口；这里只读取额度百分比、用量和重置时间，不读取会话内容。凭据过期时请先在对应插件里重新登录。
-            </div>
-          </Show>
-        </Show>
-      </section>
-      <section id={props.expiryID}>
-        <ExpiryCard credentials={props.credentials} limit={20} />
-      </section>
-    </div>
-  )
-}
-
-function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly LatencyModelRow[] }) {
+function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly LatencyModelRow[]; usage?: readonly ModelRow[] }) {
   const sorted = createMemo(() => [...props.models].filter((model) => model.samples > 0).sort((a, b) => b.ttftP95 - a.ttftP95))
   const maxP95 = createMemo(() => Math.max(1, ...sorted().map((model) => model.ttftP95)))
   const slowest = createMemo(() => {
@@ -730,6 +645,8 @@ function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly Late
         </section>
       </div>
 
+      <ModelEfficiency latencyModels={sorted()} usage={props.usage} />
+
       <section class="uc-card">
         <div class="uc-card-head">
           <div>
@@ -765,6 +682,96 @@ function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly Late
   )
 }
 
+/**
+ * 模型效率对比（0.5）：横轴单请求平均成本、纵轴首字 P95，气泡大小 = 有效
+ * Token 用量。数据只含有时延样本且有成本记录的模型；样本 < 10 的模型不画
+ * （分位数不可信）。气泡位置手绘在归一化坐标里，不引图表库。
+ */
+function ModelEfficiency(props: { latencyModels: readonly LatencyModelRow[]; usage?: readonly ModelRow[] }) {
+  const rows = createMemo(() => {
+    const usage = new Map(props.usage?.map((row) => [`${row.providerID}:${row.modelID}`, row]) ?? [])
+    return props.latencyModels
+      .map((model) => {
+        const costRow = usage.get(`${model.providerID}:${model.modelID}`)
+        const tokens = (costRow?.input ?? 0) + (costRow?.output ?? 0)
+        return {
+          providerID: model.providerID,
+          modelID: model.modelID,
+          samples: model.samples,
+          ttftP95: model.ttftP95,
+          /** 单请求平均成本（估算）；无成本记录时为 0。 */
+          costPerRequest: costRow && model.samples > 0 ? costRow.cost / model.samples : 0,
+          tokens,
+        }
+      })
+      .filter((row) => row.samples >= 10)
+  })
+  const maxCost = createMemo(() => Math.max(1e-9, ...rows().map((row) => row.costPerRequest)))
+  const maxTtft = createMemo(() => Math.max(1e-9, ...rows().map((row) => row.ttftP95)))
+  const maxTokens = createMemo(() => Math.max(1e-9, ...rows().map((row) => row.tokens)))
+  /** 有任何成本记录才画横轴为成本的版本；否则退化为纯时延对比（没有成本轴）。 */
+  const hasCost = createMemo(() => rows().some((row) => row.costPerRequest > 0))
+  type ScatterRow = ReturnType<typeof rows>[number]
+  const position = (row: ScatterRow) => ({
+    x: hasCost() ? 8 + (row.costPerRequest / maxCost()) * 84 : 8 + (row.tokens / maxTokens()) * 84,
+    y: 8 + (row.ttftP95 / maxTtft()) * 84,
+    r: 3 + Math.sqrt(row.tokens / maxTokens()) * 9,
+  })
+  return (
+    <Show when={rows().length >= 2} fallback={null}>
+      <section class="uc-card">
+        <div class="uc-card-head">
+          <div>
+            <div class="uc-card-title">模型效率对比</div>
+            <div class="uc-card-sub">
+              {hasCost()
+                ? "横轴单请求成本（越左越省）· 纵轴首字 P95（越低越快）· 气泡 = 用量 · 样本 ≥ 10"
+                : "横轴有效 Token 用量（费用未记录）· 纵轴首字 P95（越低越快）· 样本 ≥ 10"}
+            </div>
+          </div>
+          <span class="uc-health-badge" data-tone="ok">{rows().length} 个模型</span>
+        </div>
+        <div class="uc-scatter">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <line x1="50" y1="4" x2="50" y2="96" stroke="var(--uc-border)" stroke-width="0.4" stroke-dasharray="2 2" />
+            <line x1="4" y1="50" x2="96" y2="50" stroke="var(--uc-border)" stroke-width="0.4" stroke-dasharray="2 2" />
+          </svg>
+          <For each={rows()}>
+            {(row) => {
+              const pos = position(row)
+              return (
+                <button
+                  type="button"
+                  class="uc-scatter-dot"
+                  style={{
+                    left: `${pos.x}%`,
+                    top: `${pos.y}%`,
+                    width: `${pos.r * 2}%`,
+                    // 气泡用固定纵横比：宽度按容器，高度按同一像素半径换算
+                    height: `${pos.r * 2}%`,
+                  }}
+                  title={`${shortModel(row.modelID)}\n样本 ${compact(row.samples)} · 首字 P95 ${duration(row.ttftP95)}\n单请求成本 ${row.costPerRequest > 0 ? `$${row.costPerRequest.toFixed(4)}` : "未记录"}\n有效 Token ${compact(row.tokens)}`}
+                />
+              )
+            }}
+          </For>
+        </div>
+        <div class="uc-scatter-labels">
+          <span>{hasCost() ? "← 成本低" : "← 用量小"}</span>
+          <span>{hasCost() ? "成本高 →" : "用量大 →"}</span>
+        </div>
+        <div class="uc-scatter-labels uc-scatter-v">
+          <span>↑ 慢</span>
+          <span>快 ↓</span>
+        </div>
+        <div class="uc-attr-note">
+          左下角理想：又快又省（或用量视角下少用）。右上角值得检查：又慢又贵（或用量集中）。分位数对样本量敏感，样本 ≥ 10 才纳入。
+        </div>
+      </section>
+    </Show>
+  )
+}
+
 function SessionsTab(props: {
   ctx: Context
   sessions: readonly SessionRow[]
@@ -774,28 +781,63 @@ function SessionsTab(props: {
   selected?: SessionRow
   onSelect: (session: SessionRow) => void
   onClose: () => void
+  /** 从总览钻取过来时预置的模型筛选（只初始化一次）。 */
+  initialModel?: string
 }) {
   const [query, setQuery] = createSignal("")
+  /** 组合筛选：项目 / 模型 / 日期。与搜索词叠加生效。 */
+  const [projectFilter, setProjectFilter] = createSignal("all")
+  const [modelFilter, setModelFilter] = createSignal(props.initialModel ?? "all")
+  const [dayFilter, setDayFilter] = createSignal("all")
   /** 一次只渲染一部分行：500 行 DOM 一次性挂上会拖慢首次切到本页签的速度。 */
   const [visibleCount, setVisibleCount] = createSignal(80)
   let listScroll = 0
   const projectName = (id: string) => props.projects.find((project) => project.id === id)?.name ?? "未命名项目"
+
+  /** 会话最后活动日期（本地时区），供日期筛选。 */
+  const dayOf = (session: SessionRow) => {
+    const date = new Date(session.timeUpdated)
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`
+  }
+  /** 筛选选项从数据里来，保持与统计范围一致。 */
+  const modelOptions = createMemo(() => {
+    const seen = new Map<string, string>()
+    for (const session of props.sessions) {
+      if (!seen.has(session.modelID)) seen.set(session.modelID, session.providerID)
+    }
+    return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  })
+  const dayOptions = createMemo(() => [...new Set(props.sessions.map(dayOf))].sort().reverse())
+  const filtersActive = createMemo(
+    () => projectFilter() !== "all" || modelFilter() !== "all" || dayFilter() !== "all" || Boolean(query().trim()),
+  )
+
   const filtered = createMemo(() => {
     const value = query().trim().toLowerCase()
-    if (!value) return props.sessions
-    return props.sessions.filter((session) =>
-      [session.title, session.modelID, session.providerID, projectName(session.projectID)]
+    return props.sessions.filter((session) => {
+      if (projectFilter() !== "all" && session.projectID !== projectFilter()) return false
+      if (modelFilter() !== "all" && session.modelID !== modelFilter()) return false
+      if (dayFilter() !== "all" && dayOf(session) !== dayFilter()) return false
+      if (!value) return true
+      return [session.title, session.modelID, session.providerID, projectName(session.projectID)]
         .join(" ")
         .toLowerCase()
-        .includes(value),
-    )
+        .includes(value)
+    })
   })
   const visibleSessions = createMemo(() => filtered().slice(0, visibleCount()))
-  // 搜索词或数据集变化后回到首批；副作用放在 createEffect 而不是 memo 里。
+  // 搜索词、筛选或数据集变化后回到首批；副作用放在 createEffect 而不是 memo 里。
   createEffect(() => {
     void filtered()
     setVisibleCount(80)
   })
+
+  function clearFilters() {
+    setQuery("")
+    setProjectFilter("all")
+    setModelFilter("all")
+    setDayFilter("all")
+  }
 
   function openSession(session: SessionRow, event: MouseEvent | KeyboardEvent) {
     const list = (event.currentTarget as HTMLElement | null)?.closest(".uc-session-list")
@@ -843,7 +885,14 @@ function SessionsTab(props: {
             按最后活动时间排序 · 搜索仅覆盖已载入的 {props.sessions.length} 条（统计范围：{props.rangeLabel}）· 点击会话查看完整历史
           </div>
         </div>
-        <button type="button" class="uc-export" title="导出当前筛选结果" onClick={exportCsv}>导出 CSV</button>
+        <button
+          type="button"
+          class="uc-export"
+          title={`导出当前筛选命中的 ${filtered().length} 条会话（CSV，含会话标题 / 项目 / 模型 / Token / 费用，不含提示词与回复）`}
+          onClick={exportCsv}
+        >
+          导出 CSV
+        </button>
       </div>
       <div class="uc-sessions-tools">
         <label class="uc-search">
@@ -860,6 +909,47 @@ function SessionsTab(props: {
             onInput={(event) => setQuery(event.currentTarget.value)}
           />
         </label>
+        <select
+          class="uc-filter-select"
+          data-active={projectFilter() !== "all" ? "true" : undefined}
+          aria-label="按项目筛选"
+          value={projectFilter()}
+          onChange={(event) => setProjectFilter(event.currentTarget.value)}
+        >
+          <option value="all">全部项目</option>
+          <For each={props.projects.filter((project) => props.sessions.some((session) => session.projectID === project.id))}>
+            {(project) => <option value={project.id}>{project.name}</option>}
+          </For>
+        </select>
+        <select
+          class="uc-filter-select"
+          data-active={modelFilter() !== "all" ? "true" : undefined}
+          aria-label="按模型筛选"
+          value={modelFilter()}
+          onChange={(event) => setModelFilter(event.currentTarget.value)}
+        >
+          <option value="all">全部模型</option>
+          <For each={modelOptions()}>
+            {([modelID]) => <option value={modelID}>{shortModel(modelID)}</option>}
+          </For>
+        </select>
+        <select
+          class="uc-filter-select"
+          data-active={dayFilter() !== "all" ? "true" : undefined}
+          aria-label="按日期筛选"
+          value={dayFilter()}
+          onChange={(event) => setDayFilter(event.currentTarget.value)}
+        >
+          <option value="all">全部日期</option>
+          <For each={dayOptions()}>
+            {(day) => <option value={day}>{day}</option>}
+          </For>
+        </select>
+        <Show when={filtersActive()}>
+          <button type="button" class="uc-text-button" onClick={clearFilters}>
+            清空筛选
+          </button>
+        </Show>
         <span class="uc-sessions-count">显示 {filtered().length} / {props.sessions.length} 条</span>
       </div>
       <Show when={filtered().length > 0} fallback={<div class="uc-empty-line">没有匹配的会话</div>}>
@@ -953,6 +1043,8 @@ const CSS = `
   --uc-amber: #b45309;
   --uc-red: #d92d20;
   --uc-green: #0f7b4f;
+  --uc-purple: #7c3aed;
+  --uc-orange: #c2410c;
   --uc-grid: color-mix(in srgb, var(--uc-muted) 17%, transparent);
   --uc-track: color-mix(in srgb, var(--uc-muted) 13%, transparent);
   --uc-bar: color-mix(in srgb, var(--uc-accent) 24%, var(--uc-card));
@@ -1136,6 +1228,15 @@ const CSS = `
   color: color-mix(in srgb, var(--uc-amber) 82%, var(--uc-strong));
   font-size: 11px;
 }
+/* 数据库不可用等错误级告警：红色，不提供冷却关闭（状态会变） */
+.uc-alert[data-tone="danger"] {
+  border-color: color-mix(in srgb, var(--uc-red) 26%, transparent);
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--uc-red) 9%, transparent),
+    color-mix(in srgb, var(--uc-red) 3%, transparent));
+  color: color-mix(in srgb, var(--uc-red) 85%, var(--uc-strong));
+}
+.uc-alert[data-tone="danger"] .uc-alert-icon { background: color-mix(in srgb, var(--uc-red) 13%, transparent); color: var(--uc-red); }
 .uc-alert-icon {
   width: 20px;
   height: 20px;
@@ -1323,7 +1424,10 @@ const CSS = `
 }
 .uc-model-head > span:nth-child(n+2), .uc-model-row > span:nth-child(n+2) { text-align: right; }
 .uc-model-list { display: flex; flex-direction: column; }
-.uc-model-row { min-height: 38px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 65%, transparent); font-size: 10.6px; font-variant-numeric: tabular-nums; }
+/* 模型行可点击（0.5/1.0 钻取）：hover 提示 + 键盘焦点环 */
+.uc-model-row { min-height: 38px; border-bottom: 1px solid color-mix(in srgb, var(--uc-border) 65%, transparent); font-size: 10.6px; font-variant-numeric: tabular-nums; cursor: pointer; }
+.uc-model-row:hover { background: color-mix(in srgb, var(--uc-accent) 4%, transparent); }
+.uc-model-row:focus-visible { outline: 2px solid color-mix(in srgb, var(--uc-accent) 45%, transparent); outline-offset: -2px; border-radius: 5px; }
 .uc-model-row:last-child { border-bottom: 0; }
 .uc-model-name { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .uc-model-icon {
@@ -1397,6 +1501,7 @@ const CSS = `
   color: var(--uc-muted);
   font-size: 10.5px;
 }
+.uc-integrations .uc-quota-error { min-height: 0; border: 1px dashed color-mix(in srgb, var(--uc-red) 35%, var(--uc-border)); border-radius: 9px; padding: 10px 12px; }
 .uc-quota-error > span { flex: 1; }
 
 /* expiry */
@@ -1441,6 +1546,21 @@ const CSS = `
 /* sessions */
 .uc-sessions-page { min-height: 420px; }
 .uc-sessions-tools { display: flex; align-items: center; gap: 10px; margin: 2px 0 10px; flex-wrap: wrap; }
+.uc-filter-select {
+  height: 28px;
+  max-width: 150px;
+  padding: 0 6px;
+  border: 1px solid var(--uc-border);
+  border-radius: 6px;
+  background: var(--uc-card);
+  color: var(--uc-muted);
+  font: inherit;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.uc-filter-select[data-active="true"] { border-color: color-mix(in srgb, var(--uc-accent) 45%, var(--uc-border)); color: var(--uc-strong); }
 .uc-search { position: relative; flex: 1; min-width: 200px; max-width: 420px; }
 .uc-search svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--uc-faint); }
 .uc-search input {
@@ -1511,22 +1631,6 @@ const CSS = `
   gap: 12px;
   align-items: start;
 }
-.uc-quota-page { grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr); }
-.uc-quota-detail { min-height: 0; }
-.uc-quota-block + .uc-quota-block { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--uc-border); }
-.uc-quota-block-head { display: flex; align-items: center; gap: 8px; color: var(--uc-strong); font-size: 11px; font-weight: 650; }
-.uc-quota-plan { color: var(--uc-faint); font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 4px; background: var(--uc-layer-2); }
-.uc-quota-block-note { margin-top: 8px; color: var(--uc-faint); font-size: 9.5px; }
-.uc-quota-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-.uc-quota-stat { padding: 12px; border: 1px solid var(--uc-border); border-radius: 9px; background: var(--uc-layer); }
-.uc-quota-stat[data-tone="danger"] { border-color: color-mix(in srgb, var(--uc-red) 26%, transparent); background: color-mix(in srgb, var(--uc-red) 5%, var(--uc-card)); }
-.uc-quota-stat[data-tone="warn"] { border-color: color-mix(in srgb, var(--uc-amber) 24%, transparent); background: color-mix(in srgb, var(--uc-amber) 5%, var(--uc-card)); }
-.uc-quota-stat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--uc-muted); font-size: 10px; }
-.uc-quota-stat-head b { color: var(--uc-strong); font-size: 19px; font-weight: 690; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-.uc-quota-stat[data-tone="danger"] .uc-quota-stat-head b { color: var(--uc-red); }
-.uc-quota-stat[data-tone="warn"] .uc-quota-stat-head b { color: var(--uc-amber); }
-.uc-meter-lg { height: 6px; margin-top: 12px; }
-.uc-quota-stat-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 8px; color: var(--uc-faint); font-size: 9.5px; }
 .uc-detail-note { margin-top: 12px; padding-top: 9px; border-top: 1px dashed var(--uc-border); color: var(--uc-faint); font-size: 10px; line-height: 1.5; }
 .uc-kpis-latency { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .uc-kpi-value[data-tone="warn"] { color: var(--uc-amber); }
@@ -1606,6 +1710,64 @@ const CSS = `
 .uc-foot b { color: var(--uc-muted); font-weight: 620; }
 .uc-foot-links { display: flex; align-items: center; gap: 12px; }
 .uc-foot-error { color: var(--uc-red); }
+/* 指标口径说明（P0）：页脚展开，逐条解释统计口径，不弹窗打断 */
+.uc-glossary { border: 1px dashed var(--uc-border); border-radius: 10px; background: var(--uc-layer); padding: 10px 12px; margin-top: 8px; }
+.uc-glossary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; }
+.uc-glossary-grid > div { display: flex; flex-direction: column; gap: 2px; font-size: 9.8px; line-height: 1.5; }
+.uc-glossary-grid b { color: var(--uc-muted); font-weight: 650; }
+.uc-glossary-grid span { color: var(--uc-faint); }
+@media (max-width: 760px) {
+  .uc-glossary-grid { grid-template-columns: 1fr; }
+}
+
+/* 成本归因卡（0.5）：agent / 项目两列占比 */
+.uc-attribution { grid-column: 1 / -1; }
+.uc-attr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; }
+.uc-attr-col-title { color: var(--uc-faint); font-size: 10px; font-weight: 650; padding-bottom: 4px; border-bottom: 1px solid var(--uc-border); }
+.uc-attr-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 62px;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  font-size: 10.3px;
+  font-variant-numeric: tabular-nums;
+}
+.uc-attr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--uc-muted); font-weight: 560; }
+.uc-attr-row .uc-share { min-width: 0; }
+.uc-attr-value { text-align: right; color: var(--uc-strong); font-weight: 620; }
+.uc-attr-note { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--uc-border); color: var(--uc-faint); font-size: 9.5px; line-height: 1.5; }
+/* 费用异常提示（0.5）：嵌在费用 KPI 的说明行里 */
+.uc-anomaly { display: block; margin-top: 3px; color: var(--uc-amber); font-weight: 600; cursor: help; }
+@media (max-width: 760px) {
+  .uc-attr-grid { grid-template-columns: 1fr; }
+}
+
+/* 模型效率散点（0.5）：归一化坐标 + 气泡 */
+.uc-scatter {
+  position: relative;
+  height: 220px;
+  margin: 8px 0 2px;
+  border-left: 1px solid var(--uc-border);
+  border-bottom: 1px solid var(--uc-border);
+  background:
+    linear-gradient(to right, transparent 99.5%, var(--uc-border) 100%),
+    linear-gradient(to top, transparent 99.5%, var(--uc-border) 100%);
+}
+.uc-scatter > svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.uc-scatter-dot {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--uc-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--uc-accent) 18%, transparent);
+  padding: 0;
+  cursor: default;
+  transition: background 0.12s ease;
+}
+.uc-scatter-dot:hover { background: color-mix(in srgb, var(--uc-accent) 35%, transparent); }
+.uc-scatter-labels { display: flex; justify-content: space-between; color: var(--uc-faint); font-size: 9px; }
+.uc-scatter-v { width: auto; position: absolute; right: -2px; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; }
 
 /* embedded dialog */
 .uc-root[data-embedded="true"] {
@@ -1637,7 +1799,7 @@ const CSS = `
   .uc-right { display: grid; grid-template-columns: 1fr 1fr; align-items: stretch; }
   .uc-right > section { min-width: 0; }
   .uc-health { grid-column: 1 / -1; }
-  .uc-detail-grid, .uc-quota-page, .uc-latency-top { grid-template-columns: 1fr; }
+  .uc-detail-grid, .uc-latency-top { grid-template-columns: 1fr; }
   .uc-kpis-latency { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
@@ -1650,7 +1812,6 @@ const CSS = `
   .uc-right { grid-template-columns: 1fr; }
   .uc-health { grid-column: auto; }
   .uc-kpis-latency { grid-template-columns: 1fr 1fr; }
-  .uc-quota-stats { grid-template-columns: 1fr; }
   .uc-tabs-scope { display: none; }
   .uc-session-head, .uc-session-row { grid-template-columns: minmax(0, 1.6fr) 64px 54px 76px; }
   .uc-session-head > span:nth-child(2), .uc-session-row > span:nth-child(2),
@@ -1661,6 +1822,9 @@ const CSS = `
 
 /* integrations: 凭据与登录页（卡片网格，渐变光晕视觉） */
 .uc-integrations { display: flex; flex-direction: column; gap: 10px; }
+.uc-int-quota-tag { margin-left: auto; }
+.uc-int-quota { display: flex; flex-direction: column; gap: 8px; }
+.uc-int-quota-note { color: var(--uc-faint); font-size: 9.5px; padding: 2px 0 6px; }
 .uc-int-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(238px, 1fr));
@@ -1737,6 +1901,9 @@ const CSS = `
 .uc-int-name { flex: 1; min-width: 0; }
 .uc-int-name b { display: block; font-size: 11.4px; font-weight: 680; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uc-int-name > span { display: block; color: var(--uc-faint); font-size: 10px; margin-top: 1.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 头部并排放凭据时效 + 额度概要两个标签，额度标签压住伸缩名区，不换行 */
+.uc-int-top .uc-exp-tag { flex: 0 0 auto; }
+.uc-int-top .uc-int-quota-tag { max-width: 46%; overflow: hidden; text-overflow: ellipsis; }
 .uc-int-more { display: flex; align-items: center; gap: 4px; color: var(--uc-faint); font-size: 10px; font-weight: 620; }
 .uc-int-card[data-open="true"] .uc-int-more { color: var(--int-glow); }
 .uc-int-meta { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -2021,14 +2188,39 @@ function OverviewPanels(props: {
   restTokens: number
   restCost: number
   delta: (read: (point: SeriesPoint) => number) => number | undefined
-  quotaID: string
-  expiryID: string
   onRetryQuota: () => void
   /** 「模型分布 → 全部 N 个」跳转模型页签。 */
   onOpenModels: () => void
   /** 总览右栏「凭据有效期」卡片的跳转目标。 */
   onOpenQuota: () => void
+  /** 模型分布行 → 会话列表（按该模型预筛选）。 */
+  onOpenSessions: (modelID: string) => void
 }) {
+  /** 0.5 成本归因：agent 与项目的用量排序（费用优先，零费用按 token）。 */
+  const agentRows = createMemo(() =>
+    [...props.snapshot.agents].sort((a, b) => b.cost - a.cost || b.input + b.output - (a.input + a.output)),
+  )
+  const projectRows = createMemo(() => {
+    const nameOf = (id: string) => props.snapshot.projects.find((project) => project.id === id)?.name ?? id
+    return props.snapshot.projectUsage
+      .map((row) => ({ ...row, name: nameOf(row.projectID) }))
+      .sort((a, b) => b.cost - a.cost || b.input + b.output - (a.input + a.output))
+  })
+  /**
+   * 费用异常检测（0.5）：最后一天（今天，未结束）的费用对照之前完整天的
+   * 日均基线。倍数 ≥ 3 且基线 > $0.01 才报——避免小基数误报。显示依据。
+   */
+  const costAnomaly = createMemo(() => {
+    const points = props.snapshot.series ?? []
+    if (points.length < 4) return undefined
+    const complete = points.slice(0, -1)
+    const baseline = complete.reduce((sum, point) => sum + point.cost, 0) / complete.length
+    const today = points[points.length - 1]!.cost
+    if (baseline < 0.01) return undefined
+    const ratio = today / baseline
+    if (ratio < 3) return undefined
+    return { today, baseline, ratio, days: complete.length }
+  })
   // 趋势图最多绘制最近 30 个数据点：范围更大时必须写明，不能让图和标题各说各的。
   const trendScopeNote = () => {
     const count = props.snapshot.series?.length ?? 0
@@ -2074,7 +2266,20 @@ function OverviewPanels(props: {
                 )}
               </Show>
             </div>
-            <div class="uc-kpi-sub">按量计费 · 不含订阅内调用与未记录价格的请求</div>
+            <div class="uc-kpi-sub">
+              按量计费 · 不含订阅内调用与未记录价格的请求
+              <Show when={costAnomaly()}>
+                {(value) => (
+                  <span
+                    class="uc-anomaly"
+                    title={`今天 $${value().today.toFixed(2)}，此前 ${value().days} 天日均 $${value().baseline.toFixed(2)}，为基线的 ${value().ratio.toFixed(1)} 倍。`}
+                  >
+                    ⚠ 今天 ${value().today.toFixed(2)}，是此前 {value().days} 天日均（${value().baseline.toFixed(2)}）的{" "}
+                    {value().ratio.toFixed(1)} 倍
+                  </span>
+                )}
+              </Show>
+            </div>
             <Sparkline values={(props.snapshot.series ?? []).map((point) => point.cost)} color="var(--uc-amber)" />
           </div>
           <div class="uc-kpi">
@@ -2175,7 +2380,19 @@ function OverviewPanels(props: {
                 <div class="uc-model-list">
                   <For each={props.topModels}>
                     {(model) => (
-                      <div class="uc-model-row">
+                      <div
+                        class="uc-model-row"
+                        role="button"
+                        tabIndex={0}
+                        title={`查看使用 ${shortModel(model.modelID)} 的会话`}
+                        onClick={() => props.onOpenSessions(model.modelID)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault()
+                            props.onOpenSessions(model.modelID)
+                          }
+                        }}
+                      >
                         <div class="uc-model-name">
                           <span class="uc-model-icon">{modelInitial(model.modelID)}</span>
                           <span class="uc-model-text">
@@ -2212,13 +2429,13 @@ function OverviewPanels(props: {
                 </div>
               </Show>
             </section>
+
+            <AttributionCard agents={agentRows()} projects={projectRows()} tokens={props.tokens} />
           </div>
 
           <div class="uc-right">
-            <QuotaCard quota={props.quota} onRetry={props.onRetryQuota} id={props.quotaID} />
-            <section id={props.expiryID}>
-              <ExpiryCard credentials={props.credentials} onOpenQuota={props.onOpenQuota} />
-            </section>
+            <QuotaCard quota={props.quota} onRetry={props.onRetryQuota} />
+            <ExpiryCard credentials={props.credentials} onOpenQuota={props.onOpenQuota} />
             <HealthCard latency={props.snapshot.latency} insight={props.insight} />
           </div>
         </div>
@@ -2241,6 +2458,87 @@ function cacheDeltaOf(points: readonly SeriesPoint[]): number | undefined {
   return calc(complete.slice(complete.length - half)) - calc(complete.slice(0, half))
 }
 
+/**
+ * 成本归因卡（0.5）：钱和 Token 花在哪个 agent、哪个项目上。两列并排，
+ * 行内占比条按费用（全为 0 时按有效 Token）计算。
+ */
+function AttributionCard(props: {
+  agents: readonly (AgentRow & { name?: string })[]
+  projects: readonly (ProjectUsageRow & { name: string })[]
+  tokens: number
+}) {
+  const hasData = () => props.agents.length > 1 || props.projects.length > 1
+  const share = (cost: number, tokenCount: number, all: readonly { cost: number }[]) => {
+    const totalCost = all.reduce((sum, row) => sum + row.cost, 0)
+    if (totalCost > 0) return totalCost > 0 ? (cost / totalCost) * 100 : 0
+    // 全部为 $0（订阅内调用）：按有效 Token 占比
+    const totalTokens = all.reduce((sum, row) => {
+      const r = row as unknown as { input?: number; output?: number }
+      return sum + (r.input ?? 0) + (r.output ?? 0)
+    }, 0)
+    return totalTokens > 0 ? ((tokenCount / totalTokens) * 100) : 0
+  }
+  const agentBase = () => props.agents.map((a) => ({ cost: a.cost }))
+  const projectBase = () => props.projects.map((p) => ({ cost: p.cost }))
+  return (
+    <Show when={hasData()} fallback={null}>
+      <section class="uc-card uc-attribution">
+        <div class="uc-card-head">
+          <div>
+            <div class="uc-card-title">成本归因</div>
+            <div class="uc-card-sub">按 agent 与项目拆分 · 条形为占比</div>
+          </div>
+        </div>
+        <div class="uc-attr-grid">
+          <div class="uc-attr-col">
+            <div class="uc-attr-col-title">Agent</div>
+            <For each={props.agents.slice(0, 6)}>
+              {(row) => {
+                const tokenCount = row.input + row.output
+                const pct = share(row.cost, tokenCount, agentBase())
+                return (
+                  <div class="uc-attr-row" title={`${row.agent} · ${compact(tokenCount)} 有效 Token · ${money(row.cost)}`}>
+                    <span class="uc-attr-name">{row.agent}</span>
+                    <span class="uc-share">
+                      <span class="uc-share-bar"><i style={{ width: `${Math.max(2, Math.min(100, pct))}%` }} /></span>
+                    </span>
+                    <span class="uc-attr-value">
+                      {row.cost > 0 ? money(row.cost) : <span class="uc-zero">$0</span>}
+                    </span>
+                  </div>
+                )
+              }}
+            </For>
+          </div>
+          <div class="uc-attr-col">
+            <div class="uc-attr-col-title">项目</div>
+            <For each={props.projects.slice(0, 6)}>
+              {(row) => {
+                const tokenCount = row.input + row.output
+                const pct = share(row.cost, tokenCount, projectBase())
+                return (
+                  <div class="uc-attr-row" title={`${row.name} · ${compact(tokenCount)} 有效 Token · ${money(row.cost)}`}>
+                    <span class="uc-attr-name" title={row.name}>{row.name}</span>
+                    <span class="uc-share">
+                      <span class="uc-share-bar"><i style={{ width: `${Math.max(2, Math.min(100, pct))}%` }} /></span>
+                    </span>
+                    <span class="uc-attr-value">
+                      {row.cost > 0 ? money(row.cost) : <span class="uc-zero">$0</span>}
+                    </span>
+                  </div>
+                )
+              }}
+            </For>
+          </div>
+        </div>
+        <div class="uc-attr-note">
+          费用为本地估算；全部为 $0 时条形按有效 Token 占比显示。Agent 由每次模型请求自带（build / explore / general 等）。
+        </div>
+      </section>
+    </Show>
+  )
+}
+
 export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   const api = props.ctx.client.rpc(Usage)
   const ui = props.ctx.ui
@@ -2259,6 +2557,8 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
    */
   const [visited, setVisited] = createSignal<ReadonlySet<Tab>>(new Set<Tab>(["overview"]))
   const [detailSession, setDetailSession] = createSignal<SessionRow>()
+  /** 总览模型行钻取：预置的会话模型筛选。null = 用户手动改过，不再覆盖。 */
+  const [drillModel, setDrillModel] = createSignal<string | null>(null)
   const [remoteModels, setRemoteModels] = createSignal<import("@opencode/client/promise").ModelInfo[]>([])
   const [providerNames, setProviderNames] = createSignal(new Map<string, string>())
   /** 模型页签首次打开才拉 host 的模型/provider 目录，首屏不背这两次 RPC。 */
@@ -2275,9 +2575,6 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     }
     return map
   })
-  const uid = Math.random().toString(36).slice(2, 8)
-  const quotaID = `uc-quota-${uid}`
-  const expiryID = `uc-expiry-${uid}`
   let request = 0
   let quotaRequest = 0
   let timer: number | undefined
@@ -2460,6 +2757,13 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     if (next === "models" && !hostDataDone()) void loadHostData()
   }
 
+  /** 钻取：总览模型行 → 会话列表（按该模型预筛选）。再次钻取覆盖上次预置。 */
+  function openSessions(modelID: string) {
+    setDetailSession(undefined)
+    setDrillModel(modelID)
+    openTab("sessions")
+  }
+
   const totals = () => snapshot()?.totals
   const tokens = () => {
     const value = totals()?.tokens
@@ -2515,8 +2819,11 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     }
   }
 
-  const [dismissedAlert, setDismissedAlert] = createSignal("")
-  const alert = createMemo<Alert | undefined>(() => {
+  /** 告警冷却：关闭后 15 分钟内同一标题不再弹出（数据仍会在页签红点上提示）。 */
+  const ALERT_COOLDOWN_MS = 15 * 60_000
+  const [alertCooldown, setAlertCooldown] = createSignal<Record<string, number>>({})
+  const [glossaryOpen, setGlossaryOpen] = createSignal(false)
+  const alertCandidate = createMemo<Alert | undefined>(() => {
     const current = quota()
     if (current?.available) {
       // Warn on whichever provider window is closest to exhaustion.
@@ -2545,14 +2852,20 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     }
     return undefined
   })
+  /** 候选告警在冷却期内则不展示；冷却计时用信号包裹让 memo 随刷新重算。 */
+  const alert = createMemo<Alert | undefined>(() => {
+    const candidate = alertCandidate()
+    if (!candidate) return undefined
+    const cooledUntil = alertCooldown()[candidate.title]
+    if (cooledUntil && Date.now() < cooledUntil) return undefined
+    return candidate
+  })
 
   function openTarget(target: string) {
-    if (target === "uc-quota" || target === "uc-expiry") openTab("quota")
-    window.setTimeout(() => {
-      const suffix = target === "uc-quota" ? quotaID : expiryID
-      document.getElementById(suffix)?.scrollIntoView({ behavior: "smooth", block: "center" })
-    }, 80)
+    // 合并后的「凭据与额度」页签按供应商展示卡片，没有独立锚点；切页签即可。
+    if (target === "uc-quota" || target === "uc-expiry") openTab("integrations")
   }
+
 
   const rangeLabel = () => RANGES.find((item) => item.id === range())?.label ?? "30 天"
   const scopeLabel = () => {
@@ -2666,16 +2979,36 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
         </div>
       </section>
 
-      <nav class="uc-tabs" role="tablist" aria-label="用量页面">
+      <nav
+        class="uc-tabs"
+        role="tablist"
+        aria-label="用量页面"
+        onKeyDown={(event) => {
+          // 方向键在页签间移动（tablist 惯例）；Home/End 跳到首尾。
+          const ids = TABS.map((item) => item.id)
+          const index = ids.indexOf(tab())
+          if (index < 0) return
+          let next = -1
+          if (event.key === "ArrowRight") next = (index + 1) % ids.length
+          else if (event.key === "ArrowLeft") next = (index - 1 + ids.length) % ids.length
+          else if (event.key === "Home") next = 0
+          else if (event.key === "End") next = ids.length - 1
+          if (next < 0) return
+          event.preventDefault()
+          openTab(ids[next]!)
+          document.querySelector<HTMLButtonElement>(`.uc-tab[data-active="true"]`)?.focus()
+        }}
+      >
         <For each={TABS}>
           {(item) => {
-            const quotaAlert = () => item.id === "quota" && Boolean(alert())
+            const quotaAlert = () => item.id === "integrations" && Boolean(alert())
             const latencyAlert = () => item.id === "latency" && (snapshot()?.latency.ttftP95 ?? 0) > 30
             return (
               <button
                 type="button"
                 class="uc-tab"
                 role="tab"
+                tabIndex={tab() === item.id ? 0 : -1}
                 data-active={tab() === item.id ? "true" : undefined}
                 aria-selected={tab() === item.id}
                 title={tabHint(item.id, quotaAlert(), latencyAlert())}
@@ -2701,7 +3034,19 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
         </span>
       </nav>
 
-      <Show when={alert() && dismissedAlert() !== alert()?.title ? alert() : undefined}>
+      <Show when={snapshot() && !snapshot()!.database.ok}>
+        <div class="uc-alert" data-tone="danger">
+          <span class="uc-alert-icon">
+            <ui.Icon name="circle-exclamation" size="small" />
+          </span>
+          <span>
+            <b>本机数据库读取受限</b>
+            <span class="uc-alert-detail"> · {snapshot()!.database.error}</span>
+          </span>
+        </div>
+      </Show>
+
+      <Show when={alert()}>
         {(item) => (
           <div class="uc-alert">
             <span class="uc-alert-icon">
@@ -2718,8 +3063,10 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
               type="button"
               class="uc-alert-close"
               aria-label="关闭提醒"
-              title="本次会话内不再提醒"
-              onClick={() => setDismissedAlert(item().title)}
+              title="15 分钟内不再提醒；额度或凭据状态变化时会重新提示"
+              onClick={() => {
+                setAlertCooldown((prev) => ({ ...prev, [item().title]: Date.now() + ALERT_COOLDOWN_MS }))
+              }}
             >
               <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
                 <path d="M3 3l6 6M9 3l-6 6" />
@@ -2777,18 +3124,14 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                       restTokens={restTokens()}
                       restCost={restCost()}
                       delta={delta}
-                      quotaID={quotaID}
-                      expiryID={expiryID}
                       onRetryQuota={() => void loadQuota(true)}
                       onOpenModels={() => openTab("models")}
-                      onOpenQuota={() => openTab("quota")}
+                      onOpenQuota={() => openTab("integrations")}
+                      onOpenSessions={openSessions}
                     />
                   </Match>
-                  <Match when={item.id === "quota"}>
-                    <QuotaDetail quota={quota()} credentials={credentials()} onRetry={() => void loadQuota(true)} id={quotaID} expiryID={expiryID} />
-                  </Match>
                   <Match when={item.id === "latency"}>
-                    <LatencyTab latency={snapshot()!.latency} models={latencyModels()} />
+                    <LatencyTab latency={snapshot()!.latency} models={latencyModels()} usage={models()} />
                   </Match>
                   <Match when={item.id === "sessions"}>
                     <SessionsTab
@@ -2799,10 +3142,17 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                       selected={detailSession()}
                       onSelect={setDetailSession}
                       onClose={() => setDetailSession(undefined)}
+                      initialModel={drillModel() ?? undefined}
                     />
                   </Match>
                   <Match when={item.id === "integrations"}>
-                    <IntegrationsPage ctx={props.ctx} />
+                    <IntegrationsPage
+                      ctx={props.ctx}
+                      quota={quota()}
+                      serverCredentials={credentials()}
+                      onRetryQuota={() => void loadQuota(true)}
+                      onCredentialsChanged={() => void load(true, true, false)}
+                    />
                   </Match>
                   <Match when={item.id === "models"}>
                     <Show
@@ -2850,10 +3200,25 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           </Show>
         </span>
         <span class="uc-foot-links">
+          <button type="button" class="uc-text-button" onClick={() => setGlossaryOpen(!glossaryOpen())}>
+            {glossaryOpen() ? "收起口径说明" : "指标口径"}
+          </button>
           <span>⌘⌥U 打开</span>
           <span>本地优先 · 不上传会话内容</span>
         </span>
       </footer>
+      <Show when={glossaryOpen()}>
+        <div class="uc-glossary">
+          <div class="uc-glossary-grid">
+            <div><b>有效 Token</b><span>input + output，不含缓存读写；缓存读取单独展示，避免淹没真实用量。</span></div>
+            <div><b>缓存命中率</b><span>cache.read ÷ (cache.read + input)，衡量重复上下文的复用程度。</span></div>
+            <div><b>费用</b><span>消息记录的估算价 × Token 数；订阅内调用可能记为 $0，不代表没有成本。</span></div>
+            <div><b>首字时延</b><span>请求开始到第一个流式事件（time.streamed − time.created）。</span></div>
+            <div><b>慢请求</b><span>总时延超过 30 秒的请求占比；阈值固定，用于跨模型粗略对比。</span></div>
+            <div><b>输出速度</b><span>输出 Token ÷ 总时延；受思考长度影响，仅作参考。</span></div>
+          </div>
+        </div>
+      </Show>
       </Show>
     </div>
   )
