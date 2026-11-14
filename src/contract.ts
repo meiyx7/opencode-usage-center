@@ -71,6 +71,20 @@ export const ProjectRow = Schema.Struct({
   lastActive: Schema.Number,
 })
 
+/**
+ * 成本归因行（0.5）：按 agent（build / explore / general…）聚合的用量。
+ * 与 ModelRow 同构，方便复用渲染；agent 为 `unknown` 时表示消息未标注。
+ */
+export const AgentRow = Schema.Struct({
+  agent: Schema.String,
+  requests: Schema.Number,
+  cost: Schema.Number,
+  input: Schema.Number,
+  output: Schema.Number,
+  cacheRead: Schema.Number,
+  cacheWrite: Schema.Number,
+})
+
 export const SessionRow = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
@@ -83,6 +97,16 @@ export const SessionRow = Schema.Struct({
   cacheRead: Schema.Number,
   timeCreated: Schema.Number,
   timeUpdated: Schema.Number,
+})
+
+/** 项目维度的成本归因行（0.5）：projectID 关联 ProjectRow 取显示名。 */
+export const ProjectUsageRow = Schema.Struct({
+  projectID: Schema.String,
+  requests: Schema.Number,
+  cost: Schema.Number,
+  input: Schema.Number,
+  output: Schema.Number,
+  cacheRead: Schema.Number,
 })
 
 export const SessionToolCall = Schema.Struct({
@@ -194,6 +218,8 @@ export const CredentialRow = Schema.Struct({
   id: Schema.String,
   provider: Schema.String,
   label: Schema.String,
+  /** Credential `integration_id`, e.g. `opencode-go`; matches the quota provider id. */
+  integrationID: Schema.String,
   /** `oauth`, `key` or `external`. */
   type: Schema.String,
   /** Milliseconds since epoch; absent for keys without an expiry. */
@@ -261,6 +287,15 @@ export const Snapshot = Schema.Struct({
   generatedAt: Schema.Number,
   range: Range,
   database: DatabaseInfo,
+  /** Aggregation sample sizes, so the UI can say "样本不足" instead of faking precision. */
+  samples: Schema.Struct({
+    /** Completed assistant messages with usable latency timestamps. */
+    latency: Schema.Number,
+    /** Sessions included in the range aggregate. */
+    sessions: Schema.Number,
+    /** Day buckets the series covers; below the full range means the DB has less history. */
+    days: Schema.Number,
+  }),
   totals: Schema.Struct({
     requests: Schema.Number,
     sessions: Schema.Number,
@@ -277,6 +312,9 @@ export const Snapshot = Schema.Struct({
   projects: Schema.Array(ProjectRow),
   sessions: Schema.Array(SessionRow),
   credentials: Schema.Array(CredentialRow),
+  /** 0.5 成本归因：按 agent 与按项目的用量聚合（范围同 totals）。 */
+  agents: Schema.Array(AgentRow),
+  projectUsage: Schema.Array(ProjectUsageRow),
 })
 
 export const SnapshotInput = Schema.Struct({
@@ -321,6 +359,8 @@ export type ModelRow = typeof ModelRow.Type
 export type Latency = typeof Latency.Type
 export type LatencyModelRow = typeof LatencyModelRow.Type
 export type ProjectRow = typeof ProjectRow.Type
+export type AgentRow = typeof AgentRow.Type
+export type ProjectUsageRow = typeof ProjectUsageRow.Type
 export type SessionRow = typeof SessionRow.Type
 export type SessionToolCall = typeof SessionToolCall.Type
 export type SessionRequest = typeof SessionRequest.Type

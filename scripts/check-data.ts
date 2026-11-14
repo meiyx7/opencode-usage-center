@@ -5,6 +5,8 @@ const store = new UsageStore(defaultDatabasePath(), (message, detail) => {
 })
 
 const now = Date.now()
+/** 各范围的聚合耗时，供末尾的性能基线断言。 */
+const timings: Record<string, number> = {}
 for (const [label, days] of [
   ["today", 1],
   ["7d", 7],
@@ -14,6 +16,7 @@ for (const [label, days] of [
   const started = performance.now()
   const snapshot = store.snapshot({ from, to: now, projectID: undefined, force: true })
   const elapsed = Math.round(performance.now() - started)
+  timings[label] = elapsed
   console.log(
     label,
     `${elapsed}ms`,
@@ -40,3 +43,22 @@ for (const [label, days] of [
 const quota = await store.quota(true)
 console.log("quota", JSON.stringify(quota))
 store.close()
+
+/**
+ * 性能回归基线（P0）：30 天聚合必须稳定在阈值内。超出即退出非零，CI 和
+ * 本机都能发现性能退化。阈值按方案 §5.5（30 天 P95 < 1.5s）放宽到 2s，
+ * 给 CI 机器留余量；「today」走今天现算路径，单独 300ms 上限。
+ */
+const BASELINES_MS: Record<string, number> = { today: 300, "7d": 800, "30d": 2000 }
+const regressions = Object.entries(BASELINES_MS).filter(([label, limit]) => {
+  const row = timings[label]
+  return row !== undefined && row > limit
+})
+if (regressions.length > 0) {
+  console.error(
+    "performance regression:",
+    regressions.map(([label, limit]) => `${label} ${timings[label]}ms > ${limit}ms`).join(", "),
+  )
+  process.exit(1)
+}
+console.log("perf ok", Object.entries(BASELINES_MS).map(([label, limit]) => `${label}<=${limit}ms`).join(" "))

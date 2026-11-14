@@ -3,12 +3,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { homedir } from "node:os"
 import { basename, join } from "node:path"
 import type {
+  AgentRow,
   CredentialRow,
   Latency,
   LatencyModelRow,
   Meter,
   ModelRow,
   ProjectRow,
+  ProjectUsageRow,
   Quota,
   QuotaProvider,
   SeriesPoint,
@@ -621,6 +623,8 @@ type DayAgg = {
   models: Record<string, { providerID: string; modelID: string; requests: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }>
   /** sessionID → 聚合 */
   sessions: Record<string, { requests: number; cost: number; input: number; output: number; cacheRead: number; providerID: string; modelID: string }>
+  /** agent（build / explore / general…）→ 聚合；0.5 成本归因 */
+  agents: Record<string, { requests: number; cost: number; input: number; output: number; cacheRead: number; cacheWrite: number }>
   /** 每个样本 [ttft, total, output]，保留原值供跨天分位数计算 */
   latency: [number, number, number][]
   /** 每个模型的时延样本：modelKey → [providerID, modelID, samples[]] */
@@ -634,6 +638,7 @@ type DayAgg = {
 function aggregateDay(date: string, rows: Row[]): DayAgg {
   const models: DayAgg["models"] = {}
   const sessions: DayAgg["sessions"] = {}
+  const agents: DayAgg["agents"] = {}
   const latency: [number, number, number][] = []
   const latencyByModel: DayAgg["latencyByModel"] = {}
   const tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
@@ -662,6 +667,16 @@ function aggregateDay(date: string, rows: Row[]): DayAgg {
     tokens.reasoning += reasoning
     tokens.cacheRead += cacheRead
     tokens.cacheWrite += cacheWrite
+
+    const agentKey = text(row.agent) || "unknown"
+    const agent = agents[agentKey] ?? { requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    agent.requests += 1
+    agent.cost += rowCost
+    agent.input += input
+    agent.output += output
+    agent.cacheRead += cacheRead
+    agent.cacheWrite += cacheWrite
+    agents[agentKey] = agent
 
     const sessionID = text(row.sessionID)
     const usage = sessions[sessionID] ?? {
@@ -711,7 +726,7 @@ function aggregateDay(date: string, rows: Row[]): DayAgg {
       latencyByModel[modelKey] = group
     }
   }
-  return { date, requests, cost, tokens, models, sessions, latency, latencyByModel, prompts }
+  return { date, requests, cost, tokens, models, sessions, agents, latency, latencyByModel, prompts }
 }
 
 /** 合并多天聚合。modelMap/sessionMap 可为传入的累计对象（增量合并）。 */
@@ -752,6 +767,19 @@ function mergeDays(target: DayAgg, days: readonly DayAgg[]): DayAgg {
         }
       } else {
         target.sessions[key] = { ...session }
+      }
+    }
+    for (const [key, agent] of Object.entries(day.agents)) {
+      const existing = target.agents[key]
+      if (existing) {
+        existing.requests += agent.requests
+        existing.cost += agent.cost
+        existing.input += agent.input
+        existing.output += agent.output
+        existing.cacheRead += agent.cacheRead
+        existing.cacheWrite += agent.cacheWrite
+      } else {
+        target.agents[key] = { ...agent }
       }
     }
     target.latency.push(...day.latency)
@@ -799,6 +827,12 @@ export class UsageStore {
       if (!existsSync(file)) return undefined
       const parsed = JSON.parse(readFileSync(file, "utf8")) as DayAgg
       if (parsed.date !== date || !Array.isArray(parsed.latency)) {
+        unlinkSync(file)
+        return undefined
+      }
+      // 结构演进（如 0.5 新增 agents 维度）后旧缓存缺字段：丢弃重算，而不是
+      // 让 mergeDays 在 undefined 上崩溃。
+      if (!parsed.agents || !parsed.models || !parsed.sessions || !parsed.latencyByModel) {
         unlinkSync(file)
         return undefined
       }
@@ -868,10 +902,56 @@ export class UsageStore {
       this.db = new Database(this.path, { readonly: true, create: false })
       this.db.query("PRAGMA busy_timeout = 4000").run()
       this.dbError = ""
+      this.schemaProbe()
       return this.db
     } catch (error) {
       this.dbError = `无法只读打开 OpenCode 数据库：${error instanceof Error ? error.message : String(error)}`
       return undefined
+    }
+  }
+
+  /**
+   * Schema 兼容检测（P0）：只读打开后校验插件依赖的表和关键字段。OpenCode
+   * 升级改了内部格式时，给出可理解的诊断而不是让每条 SQL 各自抛错。
+   * 只记录结论，不抛异常——缺字段时让查询走各自的空态降级。
+   */
+  private schemaProbe(): void {
+    const required: Record<string, string[]> = {
+      session_v2: ["id", "project_id", "time_created", "time_updated"],
+      session_message: ["id", "session_id", "type", "seq", "time_created", "data"],
+      credential: ["id", "integration_id", "value"],
+      project: ["id", "name"],
+    }
+    const missing: string[] = []
+    for (const [table, columns] of Object.entries(required)) {
+      let present: string[]
+      try {
+        present = (this.db!.query<Row>(`PRAGMA table_info(${table})`).all() as Row[]).map(
+          (row) => String(row.name ?? ""),
+        )
+      } catch {
+        missing.push(`表 ${table} 无法读取`)
+        continue
+      }
+      if (present.length === 0) {
+        missing.push(`缺少表 ${table}`)
+        continue
+      }
+      for (const column of columns) {
+        if (!present.includes(column)) missing.push(`${table}.${column}`)
+      }
+    }
+    if (missing.length > 0) {
+      this.dbError = `数据库结构可能与当前 OpenCode 版本不兼容（缺少 ${missing.slice(0, 4).join("、")}${missing.length > 4 ? " 等" : ""}）。插件已停止读取以避免报错；升级插件或回退 OpenCode 后可恢复。`
+      this.log("schema probe found missing columns", missing.join(", "))
+      // 关键结构缺失时任何 SQL 都可能抛错。关闭连接并按「数据库不可用」降级，
+      // 让 UI 走空态 + 诊断文案，而不是让单条查询崩溃。
+      try {
+        this.db!.close()
+      } catch {
+        // 关闭失败就随它去，进程退出时会释放
+      }
+      this.db = undefined
     }
   }
 
@@ -931,6 +1011,7 @@ export class UsageStore {
            m.type AS type,
            coalesce(json_extract(m.data, '$.model.providerID'), 'unknown') AS providerID,
            coalesce(json_extract(m.data, '$.model.id'), 'unknown') AS modelID,
+           coalesce(json_extract(m.data, '$.agent'), 'unknown') AS agent,
            coalesce(json_extract(m.data, '$.cost'), 0) AS cost,
            coalesce(json_extract(m.data, '$.tokens.input'), 0) AS input,
            coalesce(json_extract(m.data, '$.tokens.output'), 0) AS output,
@@ -1028,6 +1109,7 @@ export class UsageStore {
         tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
         models: {},
         sessions: {},
+        agents: {},
         latency: [],
         latencyByModel: {},
         prompts: 0,
@@ -1097,10 +1179,32 @@ export class UsageStore {
     const credentials = this.credentials(db)
     const days = series.filter((point) => point.requests > 0).map((point) => point.date)
     const filled = fillSeries(series, input.from, input.to)
+    /** 成本归因（0.5）：agent 维度直接来自聚合；项目维度把 session 聚合按 project 归组。 */
+    const agents: AgentRow[] = Object.entries(total.agents)
+      .map(([agent, usage]) => ({ agent, ...usage }))
+      .sort((a, b) => b.input + b.output - (a.input + a.output))
+    const usageByProject = new Map<string, { requests: number; cost: number; input: number; output: number; cacheRead: number }>()
+    for (const session of sessions) {
+      const bucket = usageByProject.get(session.projectID) ?? { requests: 0, cost: 0, input: 0, output: 0, cacheRead: 0 }
+      bucket.requests += 1
+      bucket.cost += session.cost
+      bucket.input += session.input
+      bucket.output += session.output
+      bucket.cacheRead += session.cacheRead
+      usageByProject.set(session.projectID, bucket)
+    }
+    const projectUsage: ProjectUsageRow[] = [...usageByProject.entries()]
+      .map(([projectID, usage]) => ({ projectID, ...usage }))
+      .sort((a, b) => b.cost - a.cost || b.input + b.output - (a.input + a.output))
     const value: Snapshot = {
       generatedAt: Date.now(),
       range: { from: input.from, to: input.to },
       database: this.fileInfo(),
+      samples: {
+        latency: total.latency.length,
+        sessions: Object.keys(total.sessions).length,
+        days: dates.length,
+      },
       totals: {
         requests: total.requests,
         sessions: Object.keys(total.sessions).length,
@@ -1117,6 +1221,8 @@ export class UsageStore {
       projects,
       sessions,
       credentials,
+      agents,
+      projectUsage,
     }
     this.rememberSnapshot(key, value)
     return value
@@ -1154,6 +1260,7 @@ export class UsageStore {
         id: text(row.id),
         provider,
         label: provider,
+        integrationID: text(row.integration_id),
         type,
         active: num(row.active) === 1,
         ...(expires !== undefined ? { expires } : {}),
@@ -1453,6 +1560,7 @@ export class UsageStore {
       generatedAt: Date.now(),
       range: { from: input.from, to: input.to },
       database: this.fileInfo(),
+      samples: { latency: 0, sessions: 0, days: 0 },
       totals: {
         requests: 0,
         sessions: 0,
@@ -1478,6 +1586,8 @@ export class UsageStore {
       projects: [],
       sessions: [],
       credentials: [],
+      agents: [],
+      projectUsage: [],
     }
   }
 
