@@ -3,7 +3,7 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 格式；版本发布只通过
 GitHub Actions（推送 `v*` tag），见 [README「发布」](README.md#发布)。
 
-## [0.3.2] — 待发布（发布准备完成，等待发布决策）
+## [0.3.2] — 2026-11-15
 
 > 对应 `7fa451b8d9360e3ef4221ff6d8f2678044abac47`。本节列出 `v0.3.1` 之后累积的
 > 全部变更；发布时 tag 必须与 package.json 版本一致（publish.yml 有硬校验）。
