@@ -310,6 +310,21 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
   json_each 虚拟表展开，由「无全表扫描」正则区分。敏感度：移除复合索引
   → 16 处断言失败；错误谓词退化为 IS NOT NULL → errorCount 断言失败。
 
+## 16. 阶段 A 最终补丁二（TASK-13：删除事件竞态收口）
+
+- **in-flight 请求失效**：`session.deleted` 到达时（markGone 动作）递增
+  `request` 计数——先前已发出的 load/loadMore 响应回来后 `id !== request`
+  判定失效，不再 setDetail/remember，已删除会话的数据不会重新写进前端缓存。
+- **`loadMore` 收口**：入口加 `sessionGone()` 判断；响应返回后同样二次检查；
+  「加载更早」按钮在删除状态下 disabled。
+- **消费循环终止**：`consumeDetailEvents`（从组件 onMount 提取的导出函数，
+  供测试直连）在 markGone 后 break——删除后的会话不会再有 revert 语义，
+  也杜绝误触 forceReload。
+- **15j 补强**：从「分支返回值」升级为「动作计数」——完整事件序列
+  （cleared → committed → 他会话 committed → deleted → 后续 committed）验证
+  invalidate=2 / forceReload=1 / markGone=1；无限事件源 + 卸载 abort 验证
+  消费终止。敏感度：移除 markGone-break → 计数断言立即失败。
+
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 
 - **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，

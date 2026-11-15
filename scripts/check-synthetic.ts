@@ -1121,6 +1121,12 @@ async function main(): Promise<void> {
         eventSession: string | undefined,
         ownSessionID: string,
       ) => { invalidate: boolean; forceReload: boolean; markGone: boolean }
+      consumeDetailEvents: (
+        events: AsyncIterable<{ type: string; data?: { sessionID?: string; id?: string } }>,
+        signal: AbortSignal,
+        sessionID: string,
+        actions: { invalidate: () => void; markGone: () => void; forceReload: () => void },
+      ) => Promise<void>
     }
     const own = "ses-own"
     // 缓存命中场景同样会建立订阅（订阅在 onMount 缓存判断之前）——分支函数
@@ -1171,6 +1177,55 @@ async function main(): Promise<void> {
     await consume()
     expect("15j 卸载（abort）后订阅循环退出", delivered, 1)
     expect("15j abort 生效", controller15j.signal.aborted, true)
+
+    // 15j 补强（TASK-13）：走生产消费函数 consumeDetailEvents 的完整行为——
+    // 动作计数（不是只看分支返回值）、卸载终止、删除事件在请求竞态中的角色。
+    const events15j: { type: string; data: { sessionID: string } }[] = [
+      { type: "session.revert.cleared", data: { sessionID: own } }, // 无动作
+      { type: "session.revert.committed", data: { sessionID: own } }, // invalidate + reload
+      { type: "session.revert.committed", data: { sessionID: "ses-foreign" } }, // 他会话：无动作
+      { type: "session.deleted", data: { sessionID: own } }, // invalidate + markGone
+      { type: "session.revert.committed", data: { sessionID: own } }, // markGone 后仍会到达？动作继续执行但 load 短路
+    ]
+    const counts = { invalidate: 0, markGone: 0, forceReload: 0 }
+    const lifecycle = new AbortController()
+    // 生产订阅的 abort 联动：signal 中止后 mock 源停止产出
+    const source15j = async function* () {
+      for (const event of events15j) {
+        if (lifecycle.signal.aborted) return
+        yield event
+      }
+    }
+    const consumePromise = detailModule.consumeDetailEvents(source15j(), lifecycle.signal, own, {
+      invalidate: () => (counts.invalidate += 1),
+      markGone: () => (counts.markGone += 1),
+      forceReload: () => (counts.forceReload += 1),
+    })
+    await consumePromise
+    expect("15j cleared 不触发任何动作后 committed 失效 1 次", counts.invalidate, 2)
+    expect("15j committed 强刷 1 次 + markGone 后不刷新", counts.forceReload, 1)
+    expect("15j deleted 标记删除 1 次", counts.markGone, 1)
+    // 卸载终止：标记为 gone 的事件流，abort 后不再消费剩余事件
+    const countsAbort = { invalidate: 0, markGone: 0, forceReload: 0 }
+    const lifecycle2 = new AbortController()
+    const endlessSource = async function* () {
+      for (let i = 0; ; i++) {
+        if (lifecycle2.signal.aborted) return
+        yield { type: "session.revert.committed", data: { sessionID: own } }
+      }
+    }
+    const consumeAbort = detailModule.consumeDetailEvents(endlessSource(), lifecycle2.signal, own, {
+      invalidate: () => (countsAbort.invalidate += 1),
+      markGone: () => (countsAbort.markGone += 1),
+      forceReload: () => {
+        countsAbort.forceReload += 1
+        if (countsAbort.forceReload === 1) lifecycle2.abort() // 模拟组件卸载
+      },
+    })
+    await consumeAbort
+    expect("15j 卸载后消费循环终止（动作不再执行）", countsAbort.invalidate > countsAbort.forceReload, false)
+    expect("15j 卸载后 forceReload 恰好 1 次", countsAbort.forceReload, 1)
+
 
     // 15h. 查询计划自动化回归（TASK-09，复审修正后）：直接引用 store.ts 导出的
     // SESSION_PAGE_SQLS——生产查询与测试共用同一份 SQL 文本，改生产不改测试

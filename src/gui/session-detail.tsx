@@ -415,6 +415,42 @@ export function handleDetailEvent(
   return { invalidate: false, forceReload: false, markGone: false }
 }
 
+/**
+ * 详情页事件订阅循环（TASK-13 提取供测试）：消费 revert/deleted 事件流，
+ * 按 handleDetailEvent 的决策执行动作。返回退出函数——组件 onCleanup 与
+ * 测试的模拟卸载都调用它；退出后消费循环终止，不再拉取事件。
+ */
+export function consumeDetailEvents(
+  events: AsyncIterable<{ type: string; data?: { sessionID?: string; id?: string } }>,
+  signal: AbortSignal,
+  sessionID: string,
+  actions: {
+    invalidate: () => void
+    markGone: () => void
+    forceReload: () => void
+  },
+): Promise<void> {
+  return (async () => {
+    try {
+      for await (const event of events) {
+        if (signal.aborted) break
+        const data = event.data
+        const action = handleDetailEvent(event.type, data?.sessionID ?? data?.id, sessionID)
+        if (action.invalidate) actions.invalidate()
+        if (action.markGone) {
+          actions.markGone()
+          // 会话已删除（TASK-13）：后续事件对本详情页无意义，停止消费。
+          // revert 等事件不会再有语义，也避免误触 forceReload。
+          break
+        }
+        if (action.forceReload) actions.forceReload()
+      }
+    } catch {
+      // 事件订阅失败时靠手动刷新兜底
+    }
+  })()
+}
+
 export function SessionDetailView(props: {
   ctx: Context
   session: SessionRow
@@ -692,6 +728,7 @@ export function SessionDetailView(props: {
     try {
       const next = await api.sessionDetail({ sessionID: props.session.id, force })
       if (id !== request) return
+      if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废，不得写入缓存
       const previous = detail()
       const previousTurns = previous?.id === next.id ? previous.turns : []
       // Keep older loaded pages, but replace the whole range covered by the
@@ -715,6 +752,7 @@ export function SessionDetailView(props: {
 
   async function loadMore() {
     const current = detail()
+    if (sessionGone()) return // 会话已删除（TASK-13）：不加载更多
     if (!current?.hasMore || loadingMore() || refreshing() || loadInFlight > 0) return
     const id = request
     setLoadingMore(true)
@@ -725,6 +763,7 @@ export function SessionDetailView(props: {
         beforeTurn: current.nextBefore,
       })
       if (id !== request) return
+      if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废
       if (!next.turns.length) {
         const empty = { ...current, hasMore: false, nextBefore: 0 }
         setDetail(empty)
@@ -746,27 +785,25 @@ export function SessionDetailView(props: {
   // 发生的 Revert 无人感知，旧回合会一直停留到手动刷新。
   const eventsController = new AbortController()
   onMount(() => {
-    void (async () => {
-      try {
-        for await (const event of props.ctx.client.event.subscribe({
-          types: ["session.revert.committed", "session.revert.cleared", "session.deleted"],
-          signal: eventsController.signal,
-        })) {
-          if (eventsController.signal.aborted) break
-          const data = event.data as { sessionID?: string; id?: string } | undefined
-          const action = handleDetailEvent(
-            event.type as string,
-            data?.sessionID ?? data?.id,
-            props.session.id,
-          )
-          if (action.invalidate) invalidateDetailCache(props.session.id)
-          if (action.markGone) setSessionGone(true)
-          if (action.forceReload) void load(true)
-        }
-      } catch {
-        // 事件订阅失败时靠手动刷新兜底
-      }
-    })()
+    void consumeDetailEvents(
+      props.ctx.client.event.subscribe({
+        types: ["session.revert.committed", "session.revert.cleared", "session.deleted"],
+        signal: eventsController.signal,
+      }),
+      eventsController.signal,
+      props.session.id,
+      {
+        invalidate: () => invalidateDetailCache(props.session.id),
+        markGone: () => {
+          setSessionGone(true)
+          // 递增 request 使已发出的 in-flight 请求结果失效（TASK-13）：
+          // 否则删除事件到达后，先前的 load/loadMore 响应仍会 setDetail
+          // + remember，把已删除会话的数据重新写进前端缓存。
+          request += 1
+        },
+        forceReload: () => void load(true),
+      },
+    )
     onCleanup(() => eventsController.abort())
   })
 
@@ -998,7 +1035,7 @@ export function SessionDetailView(props: {
             </div>
 
             <Show when={value().hasMore}>
-              <button type="button" class="uc-sd-more" onClick={() => void loadMore()} disabled={loadingMore()}>
+              <button type="button" class="uc-sd-more" onClick={() => void loadMore()} disabled={loadingMore() || sessionGone()}>
                 {loadingMore() ? "正在读取更早的回合…" : `加载更早的 ${value().nextBefore - 1} 个回合`}
               </button>
             </Show>
