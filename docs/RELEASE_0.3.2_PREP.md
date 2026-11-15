@@ -9,8 +9,9 @@
 | 0.3.2 占用状态 | **未占用**，可用于本次发布 |
 | 仓库 `package.json` 当前版本 | `1.0.0`（0.3.1 发布后仓库侧先行升到 1.0.0，但 1.0.0 **从未发布到 npm**） |
 
-**⚠️ 发布决策时必须处理的版本错位**：发布 0.3.2 前需把 `package.json` 的
-`version` 从 `1.0.0` 改为 `0.3.2`（publish.yml 有 tag↔version 硬校验，tag
+**⚠️ 发布决策时必须处理的版本错位**：发布 0.3.2 前需把 `package.json` 与
+`package-lock.json` 的根版本（顶层 `version` 与 `packages[""].version`）从
+`1.0.0` **同步**改为 `0.3.2`（publish.yml 有 tag↔package.json 版本硬校验，tag
 `v0.3.2` 必须匹配 package.json）。本轮按任务边界**未修改**。
 
 ## 2. 真实变更清单（`v0.3.1`（`ba6e113`）→ `7fa451b`）
@@ -58,6 +59,7 @@ tag 校验语义配合更直观的手工 tag 流程）。
 | 构建产物 | ✓ | `dist/index.js` 76.0 kB + `dist/gui-experimental.cjs` 220.8 kB（基线 7fa451b 内容一致，CI #47 构建通过） |
 | 本地发布封锁 | ✓ **实测** | `npm publish --dry-run` 被 `ensure-ci-publish.mjs` 以非零码拦截 |
 | `publish.yml`（Tag 触发） | ✓ 评审通过 | tag↔package.json 版本硬校验、OIDC（`id-token: write`）、`npm publish --access public --provenance`、已发布版本防重复、concurrency 串行 |
+| `publish.yml` 触发面收紧（本轮修正） | ✓ 修正后评审 | 移除 `workflow_dispatch`（原手动触发可带任意 ref 走到 Publish 步骤，构成绕过）；仅保留 `push: tags: ['v*']`；另加 Publish 前 ref 硬守卫（非 `refs/tags/v*` 直接失败），纵深防御不依赖触发器配置 |
 | `ci.yml`（push 门禁） | ✓ | CI #46/#47 全绿（Typecheck/Build/Wire/Synthetic/Scale×3） |
 | Trusted Publishing | ✓ **已验证生效** | npm registry 上 0.3.1 带 SLSA provenance attestation（`dist.attestations.provenance`），证明 OIDC 链路真实工作过；无存储令牌 |
 
@@ -75,14 +77,31 @@ tag 校验语义配合更直观的手工 tag 流程）。
 
 ## 7. 发布决策时的待办清单（本轮未执行）
 
-1. `package.json`：`1.0.0` → `0.3.2`（本轮禁止项，未动）
+1. 版本号**两处同步**：`package.json` 与 `package-lock.json` 根版本均 `1.0.0` →
+   `0.3.2`（本轮禁止项，未动；tag 校验只读 package.json，lockfile 同步靠
+   `npm version 0.3.2` 一条命令同时更新两处，或手工改后用
+   `node -p "require('./package-lock.json').version"` 核对）
 2. CHANGELOG.md：把 0.3.2 的「待发布」改为发布日期
 3. 确认 main 干净后 `git tag v0.3.2 && git push origin v0.3.2`
 4. 观察 publish.yml run：版本校验 → 构建门禁 → `--provenance` 发布
 5. 发布后验证：`npm view opencode-usage-center version` 返回 0.3.2、
    provenance 徽标存在、`opencode-usage-center@0.3.2` 安装示例可用
 
-## 8. 结论
+## 8. 发布安全修正（收尾批次）
+
+基线 `255de8e`。修复项：
+
+| 任务 | 内容 | 验证 |
+| --- | --- | --- |
+| TASK-01 触发面收紧 | publish.yml 移除 `workflow_dispatch`，仅保留 `push: tags: ['v*']`；Publish 前新增 ref 硬守卫步骤，非 `refs/tags/v*` 直接 `exit 1` | YAML 解析通过；触发器只剩 tag；守卫步骤位于 Publish 之前 |
+| TASK-02 版本同步要求 | 待办清单改为要求 `package.json` 与 `package-lock.json` 根版本同步更新（§1 警告与 §7 第 1 条）；本轮未修改两文件 | 两文件版本仍为 `1.0.0`（未动） |
+| TASK-03 过时注释清理 | 删除「0.1.0 首次发布需手动 CLI/token」注释；文件头改为现行 Trusted Publishing 流程说明，与 README「发布」章节一致 | 注释与 README 措辞核对一致 |
+
+OIDC（`id-token: write`）、`--provenance`、已发布版本防重复、concurrency
+`npm-publish` 串行、tag↔package.json 版本校验均未改动。本地发布守卫
+`ensure-ci-publish.mjs` 未触碰，封锁实测仍然有效。
+
+## 9. 结论
 
 **发布准备完成。** npm 侧 0.3.2 可用、变更清单真实完整、CHANGELOG 与 README 已
 修正、发布链路（本地封锁 / tag 校验 / OIDC Trusted Publishing）经实测或证据验证。

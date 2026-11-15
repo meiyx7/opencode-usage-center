@@ -1,6 +1,9 @@
 name: Publish to npm
 
-# Releases ship only from GitHub Actions: bump the version and push a `v*` tag.
+# Releases ship only from GitHub Actions: bump the version (package.json AND
+# package-lock.json root "version") and push a `v*` tag. The workflow fires on
+# `v*` tag pushes only — no manual dispatch — and the tag must match
+# package.json's version or the run fails before publishing.
 # `prepublishOnly` blocks local `npm publish`, so this workflow is the only path.
 #
 # Trusted Publishing:
@@ -8,14 +11,12 @@ name: Publish to npm
 #   Repository: meiyx7/opencode-usage-center
 #   Workflow:   publish.yml
 #
-# OIDC cannot create a package's first version. The first 0.1.0 publish must
-# be done once with a logged-in npm CLI (or a one-time publish token); after
-# that, tag pushes use the trusted publisher and no token is stored here.
+# Releases after v0.3.1 go through npm Trusted Publishing (OIDC, provenance).
+# See README "发布" for the full flow.
 
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -61,6 +62,13 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Guard — publish only from v* tags
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) echo "Publishing from $GITHUB_REF" ;;
+            *) echo "Refusing to publish from non-tag ref: $GITHUB_REF" >&2; exit 1 ;;
+          esac
 
       - name: Publish
         run: |
