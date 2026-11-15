@@ -568,3 +568,43 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
 - **尚未覆盖**：卸载后响应写入缓存（留 16.4）；真实 Solid 生命周期与 SDK
   网络时序；`schedule()` 列表刷新与 DOM 表现；缓存淘汰压力与 10,000 回合
   性能（留 TASK-17）。
+
+## 22. 阶段 B 第六轮（TASK-16.4：卸载、请求逻辑失效与缓存生命周期）
+
+- **现状结论**：`SessionDetailView` 卸载时只在 `onMount` 内 `onCleanup(() =>
+  eventsController.abort())`，**没有任何通知请求协调器的动作**；卸载不改变
+  `generation` / `sessionID` / `isGone()` / 载荷 id 中任何一项，因此迟到首屏、
+  refresh、loadMore 响应仍会判 `ok` → `setDetail` + `remember`，写模块级
+  `DETAIL_CACHE`、更新 `error`、在 `finally` 继续写 `refreshing` / `loadingMore`；
+  卸载后到达的 Revert 事件还能通过 `forceReload` 发出新请求。前端缓存容量
+  （4）、TTL（120s）、LRU 顺序本身正确，但没有自动化回归。详见
+  `docs/TASK16_4_BRIEF.md` §1。
+- **取消能力判断**：`Usage.sessionDetail` 的 wire 入参只有 `sessionID /
+  beforeTurn / limit / force`，**没有 AbortSignal**。本轮不伪造取消、不新增依赖，
+  采用逻辑失效：`createDetailLoader` 增加 `disposed` 与幂等 `dispose()`，
+  置位 + `generation += 1`，两个 checkpoint 首判、两个入口短路、两处 `finally`
+  静默、`cancelForGone()` 早退；保留全部既有 generation/会话/gone/id 校验。
+  每实例自有协调器，不清缓存、不影响其它实例，逻辑失效不作为业务错误展示。
+- **最小改动**：组件顶层新增 `onCleanup(() => loader.dispose())`（事件订阅的
+  abort 原样保留）；新增导出 `isDetailCacheFresh`（组件 `cachedFresh` 改调它，
+  TTL 常量与容量不变）。生产代码只改 `src/gui/session-detail.tsx` 一个文件。
+- **16q 自动化回归**（85 条断言，Deferred 驱动真实协调器与真实缓存）：
+  卸载后首屏 / refresh / loadMore 的成功与失败迟到、卸载后 Revert/Delete 事件、
+  dispose 幂等与短路、新旧实例隔离、正常请求与缓存复用、失败/旧请求/会话切换
+  的缓存保护、Revert/Delete 不回退、TTL/LRU/容量/失效三态。`eventHarness` 增加
+  `writes` / `cacheWrites` 计数探针，严格断言「卸载后零状态与缓存写入」。
+- **测试稳健性**：16q-c2 预防性加兜底 resolve 与 `hasMore=true` fixture，避免
+  16.3 出现过的「削弱短路 → 挂在未 resolve Deferred 上静默假绿」；验证脚本
+  改为每项结束立即恢复源码。
+- **敏感度验证**：9 项（M1–M9）全部检出（1–37 条失败断言不等），含联合
+  M9 验证「disposed 判定 + generation 递增」双层保护缺一不可；逐项恢复后全绿。
+- **覆盖层级**：未挂载 SolidJS 组件，不新增依赖；驱动生产协调器生命周期、
+  事件动作接线与真实缓存，**不是组件 E2E**。
+- **本地全套验收**：typecheck ✓ / build ✓ / test:plugin wire ✓ / test:synthetic ✓ /
+  scale base·medium·large ✓（冷 72 / 373 / 1482 ms，峰值 74 / 166 / 413 MB）。
+- **未改动**：服务端分页 SQL 与协议、R1/C1/C2 口径、500 条限制、Schema/索引、
+  搜索与 CSV/JSON 导出、脱敏、UI 结构与文案、缓存策略（TTL 120s / 容量 4 /
+  LRU 顺序 / 失效语义）、依赖、版本号、发布流程。
+- **尚未覆盖**：Solid 真实 `onCleanup` 触发与 `<Show>` 重建、组件级
+  `cachedFresh` 渲染分支、事件订阅 abort 后上游迭代器挂起、真实 RPC 时序与
+  DOM 表现；缓存淘汰压力与 10,000 回合性能留 TASK-17。

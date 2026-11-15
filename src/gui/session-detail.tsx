@@ -41,6 +41,16 @@ export function readDetailCache(sessionID: string): CachedDetail | undefined {
 }
 
 /**
+ * 详情缓存是否仍在 TTL 内（TASK-16.4：组件与测试共用同一判断）。
+ * 只判断新鲜度，不消费脏标记；组件另外用 consumeRevertedMarker 处理 Revert。
+ * 常量、容量与 LRU 顺序均未改变。
+ */
+export function isDetailCacheFresh(sessionID: string): boolean {
+  const entry = DETAIL_CACHE.get(sessionID)
+  return Boolean(entry && Date.now() - entry.at < DETAIL_FRESH_MS)
+}
+
+/**
  * 会话级缓存失效（TASK-08）：Revert / 删除会话后，已加载回合可能包含被
  * 删除的消息。由页面层在收到对应事件时调用——指定 ID 只清该会话（普通
  * 打开、翻页、刷新不动其他会话缓存），省略 ID 清空全部（保守兜底）。
@@ -137,9 +147,18 @@ export type DetailRequestInput = { sessionID: string; force?: boolean; beforeTur
  * `ok` 属于最新一代且仍是当前会话；`stale` 更新一代请求已发出；
  * `gone` 会话已删除；`switched` 请求发起后当前会话已切换；
  * `mismatch` 响应 id 与请求会话不一致（防串写缓存）；`error` 请求失败；
- * `skipped` 入口守卫拦下、未发出请求（仅 loadMore）。
+ * `skipped` 入口守卫拦下、未发出请求（仅 loadMore）；
+ * `disposed` 组件已卸载，协调器进入逻辑失效（TASK-16.4）。
  */
-export type DetailRejectReason = "ok" | "stale" | "gone" | "switched" | "mismatch" | "error" | "skipped"
+export type DetailRejectReason =
+  | "ok"
+  | "stale"
+  | "gone"
+  | "switched"
+  | "mismatch"
+  | "error"
+  | "skipped"
+  | "disposed"
 
 export type DetailLoadOutcome = { committed: boolean; reason: DetailRejectReason }
 
@@ -156,6 +175,10 @@ export type DetailLoadOutcome = { committed: boolean; reason: DetailRejectReason
  * loadMore 与 load 共用主 `generation`（刷新 / Revert / 删除会令旧分页作废），
  * 另有独立的 `moreGeneration` 区分分页请求自身的新旧：即便守卫状态被旧生命
  * 周期提前复位，旧分页也不会重复追加或清掉新请求的 loadingMore。
+ *
+ * 组件卸载（TASK-16.4）：底层 RPC 入参没有 AbortSignal，不能真正取消请求，
+ * 也不伪造取消成功。`dispose()` 置 `disposed` 并递增 generation，令所有在途
+ * 响应逻辑失效；判定、缓存写入与状态收尾全部静默，但有效缓存保留给其它实例。
  *
  * 测试用 Deferred 直接驱动本函数（与组件同一实现），精确控制返回顺序。
  */
@@ -182,9 +205,11 @@ export function createDetailLoader(options: {
   let generation = 0
   let inFlight = 0
   let moreGeneration = 0
+  let disposed = false
 
   /** 响应能否落到当前视图（不看载荷内容）。 */
   function checkpoint(ticket: { generation: number; sessionID: string }): DetailRejectReason {
+    if (disposed) return "disposed"
     if (ticket.generation !== generation) return "stale"
     if (options.isGone()) return "gone"
     if (ticket.sessionID !== options.currentSessionID()) return "switched"
@@ -212,6 +237,7 @@ export function createDetailLoader(options: {
 
   /** 分页响应能否落到当前视图：主代 + 分页代 + 删除 + 会话切换。 */
   function checkpointMore(ticket: MoreTicket): DetailRejectReason {
+    if (disposed) return "disposed"
     if (ticket.generation !== generation) return "stale"
     if (ticket.moreGeneration !== moreGeneration) return "stale"
     if (options.isGone()) return "gone"
@@ -247,16 +273,30 @@ export function createDetailLoader(options: {
       generation += 1
     },
     /**
+     * 组件卸载（TASK-16.4）：逻辑失效所有在途请求，之后完全静默。
+     * 幂等；不清缓存（有效缓存要能被其它实例复用）；卸载时刻一次性复位
+     * 加载态，此后任何迟到响应 / 事件都不再写入状态信号。
+     */
+    dispose() {
+      if (disposed) return
+      disposed = true
+      generation += 1
+      options.setRefreshing(false)
+      options.setLoadingMore(false)
+    },
+    /**
      * 会话已删除（TASK-16.3）：作废在途响应，并收尾它们的加载态。
      * 删除后 load/loadMore 会短路、不会再有新请求；在途请求也不再是最新代，
      * 其 finally 不会清 refreshing —— 不在这里复位就会永久停在「刷新中…」。
      */
     cancelForGone() {
+      if (disposed) return
       generation += 1
       options.setRefreshing(false)
       options.setLoadingMore(false)
     },
     async load(force = false, quiet = false): Promise<DetailLoadOutcome> {
+      if (disposed) return { committed: false, reason: "disposed" }
       if (options.isGone()) return { committed: false, reason: "gone" }
       const ticket = { generation: ++generation, sessionID: options.currentSessionID() }
       inFlight += 1
@@ -273,7 +313,8 @@ export function createDetailLoader(options: {
       } finally {
         inFlight = Math.max(0, inFlight - 1)
         // 只有最新一代能结束加载态：旧请求晚返回不得清掉新请求的 refreshing。
-        if (ticket.generation === generation) options.setRefreshing(false)
+        // 组件已卸载时完全静默，不再写状态信号（inFlight 是内部计数，照常归零）。
+        if (!disposed && ticket.generation === generation) options.setRefreshing(false)
       }
     },
     /**
@@ -282,6 +323,7 @@ export function createDetailLoader(options: {
      * 响应 id」判定；只有最新且匹配的分页才合并并写缓存。
      */
     async loadMore(): Promise<DetailLoadOutcome> {
+      if (disposed) return { committed: false, reason: "disposed" }
       if (options.isGone()) return { committed: false, reason: "gone" }
       const current = options.getDetail()
       if (
@@ -313,7 +355,8 @@ export function createDetailLoader(options: {
         return { committed: false, reason: reason === "ok" ? "error" : reason }
       } finally {
         // 只有最新一代分页能结束 loadingMore；旧请求晚返回不得清掉新请求的状态。
-        if (ticket.moreGeneration === moreGeneration) options.setLoadingMore(false)
+        // 组件已卸载时不再写状态信号。
+        if (!disposed && ticket.moreGeneration === moreGeneration) options.setLoadingMore(false)
       }
     },
   }
@@ -926,7 +969,7 @@ export function SessionDetailView(props: {
   const wasReverted = consumeRevertedMarker(props.session.id)
   const cachedEntry = wasReverted ? undefined : DETAIL_CACHE.get(props.session.id)
   const cached = cachedEntry?.value
-  const cachedFresh = Boolean(cachedEntry && Date.now() - cachedEntry.at < DETAIL_FRESH_MS)
+  const cachedFresh = wasReverted ? false : isDetailCacheFresh(props.session.id)
   const [detail, setDetail] = createSignal<SessionDetail | undefined>(cached)
   const [refreshing, setRefreshing] = createSignal(false)
   const [loadingMore, setLoadingMore] = createSignal(false)
@@ -1052,6 +1095,10 @@ export function SessionDetailView(props: {
   // Revert / 删除事件订阅（TASK-10）：必须在缓存判断之前建立——cachedFresh
   // 命中时跳过初始请求是缓存优化，但事件订阅不能跟着跳过，否则缓存展示期间
   // 发生的 Revert 无人感知，旧回合会一直停留到手动刷新。
+  // 组件卸载（TASK-16.4）：底层 RPC 不支持 AbortSignal，这里做逻辑失效——
+  // 在途响应不再提交视图 / 写缓存 / 更新状态，但有效缓存保留给其它实例。
+  // 事件订阅自身的 abort 仍由下面 onMount 内的 onCleanup 负责。
+  onCleanup(() => loader.dispose())
   const eventsController = new AbortController()
   onMount(() => {
     void consumeDetailEvents(

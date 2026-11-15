@@ -1944,7 +1944,7 @@ async function main(): Promise<void> {
     }
     type LoadOutcome = {
       committed: boolean
-      reason: "ok" | "stale" | "gone" | "switched" | "mismatch" | "error" | "skipped"
+      reason: "ok" | "stale" | "gone" | "switched" | "mismatch" | "error" | "skipped" | "disposed"
     }
     const requestModule = require("../src/gui/session-detail") as {
       createDetailLoader: (options: {
@@ -1965,11 +1965,13 @@ async function main(): Promise<void> {
         inFlight: number
         invalidate: () => void
         cancelForGone: () => void
+        dispose: () => void
         load: (force?: boolean, quiet?: boolean) => Promise<LoadOutcome>
         loadMore: () => Promise<LoadOutcome>
       }
       rememberDetail: (detail: SessionDetail) => void
-      readDetailCache: (sessionID: string) => { value: SessionDetail } | undefined
+      readDetailCache: (sessionID: string) => { value: SessionDetail; at: number } | undefined
+      isDetailCacheFresh: (sessionID: string) => boolean
       invalidateDetailCache: (sessionID?: string) => void
       markSessionReverted: (sessionID: string) => void
       consumeRevertedMarker: (sessionID: string) => boolean
@@ -2484,6 +2486,10 @@ async function main(): Promise<void> {
         cacheInvalidations: 0,
         goneMarks: 0,
         reloads: 0,
+        // TASK-16.4：记录状态信号写入与真实缓存写入次数。只看最终布尔值
+        // 无法检出「卸载后又清了一次本已为 false 的状态」。
+        writes: 0,
+        cacheWrites: 0,
       }
       const requests: Request16p[] = []
       const outcomes: Promise<LoadOutcome>[] = []
@@ -2498,22 +2504,29 @@ async function main(): Promise<void> {
         isGone: () => state.gone,
         getDetail: () => state.detail,
         setDetail: (next) => {
+          state.writes += 1
           state.detail = next
           state.committed.push(next)
         },
         setRefreshing: (value) => {
+          state.writes += 1
           state.refreshing = value
         },
         isRefreshing: () => state.refreshing,
         setLoadingMore: (value) => {
+          state.writes += 1
           state.loadingMore = value
         },
         isLoadingMore: () => state.loadingMore,
         setError: (message) => {
+          state.writes += 1
           state.error = message
         },
         describeError: (cause) => String(cause),
-        remember: requestModule.rememberDetail,
+        remember: (next) => {
+          state.cacheWrites += 1
+          requestModule.rememberDetail(next)
+        },
       })
       const load = (force = false) => {
         const pending = loader.load(force)
@@ -2847,6 +2860,304 @@ async function main(): Promise<void> {
       expect("16p-f4 页面级他会话不误伤 A 缓存", cacheTurns("sess-A"), beforeA)
       expect("16p-f4 页面级他会话不标脏 A", requestModule.consumeRevertedMarker("sess-A"), false)
       expect("16p-f4 页面级他会话标脏 B", requestModule.consumeRevertedMarker("sess-B"), true)
+    }
+    requestModule.invalidateDetailCache()
+
+    // 16q. 组件卸载、请求逻辑失效与缓存生命周期（TASK-16.4）。
+    // 底层 RPC 无 AbortSignal，不伪造取消：组件 onCleanup 调用的同一个
+    // loader.dispose() 在此驱动；测试覆盖生产协调器、真实 DETAIL_CACHE 与
+    // 组件共用的 isDetailCacheFresh。未挂载 SolidJS 组件，不是组件 E2E。
+    const writesOf = (h: Env16p) => `${h.state.writes}/${h.state.cacheWrites}`
+    /** 模拟组件卸载：调用与 onCleanup 相同的生产入口，并返回卸载后的写入快照。 */
+    const dispose16q = (h: Env16p) => {
+      h.loader.dispose()
+      return writesOf(h)
+    }
+
+    // 16q-a1. 首屏挂起 → 卸载 → 成功迟到：不提交、不写缓存、零状态写入。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const first = h.load()
+      expect("16q-a1 首屏在途", h.loader.inFlight, 1)
+      expect("16q-a1 首屏 refreshing", h.state.refreshing, true)
+      const snapshot = dispose16q(h)
+      expect("16q-a1 卸载复位 refreshing", h.state.refreshing, false)
+      h.requests[0]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      const outcome = await first
+      expect("16q-a1 迟到成功判 disposed", outcome.reason, "disposed")
+      expect("16q-a1 迟到成功不提交", outcome.committed, false)
+      expect("16q-a1 不调用 setDetail", h.state.committed.length, 0)
+      expect("16q-a1 不写缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16q-a1 卸载后零状态/缓存写入", writesOf(h), snapshot)
+      expect("16q-a1 错误态保持为空", h.state.error, "")
+      expect("16q-a1 inFlight 归零", h.loader.inFlight, 0)
+      expect("16q-a1 缓存写入计数为 0", h.state.cacheWrites, 0)
+    }
+
+    // 16q-a2. refresh 挂起 → 卸载 → 成功迟到：已提交详情与有效缓存都不被覆盖。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      const beforeDetail = indexes16p(h)
+      const beforeCache = cacheTurns("sess-A")
+      const refresh = h.load(true)
+      const snapshot = dispose16q(h)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [1, 2, 3].map(turnOf)))
+      const outcome = await refresh
+      expect("16q-a2 迟到刷新判 disposed", outcome.reason, "disposed")
+      expect("16q-a2 已提交详情不被覆盖", indexes16p(h), beforeDetail)
+      expect("16q-a2 有效缓存不被覆盖", cacheTurns("sess-A"), beforeCache)
+      expect("16q-a2 卸载后零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-a3. 卸载前已成功提交，卸载后另一个旧请求才返回。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      const late = h.load(true)
+      const snapshot = dispose16q(h)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [3, 4].map(turnOf)))
+      expect("16q-a3 卸载前已提交数据保留", indexes16p(h), "1,2")
+      expect("16q-a3 迟到请求判 disposed", (await late).reason, "disposed")
+      expect(
+        "16q-a3 迟到不改写缓存",
+        requestModule.readDetailCache("sess-A")?.value.turns.map((t) => t.index).join(",") ?? "",
+        "1,2",
+      )
+      expect("16q-a3 卸载后零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-a4. 请求失败迟到：不写 error，也不把逻辑失效当成业务错误。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const first = h.load()
+      const snapshot = dispose16q(h)
+      h.requests[0]!.d.reject(new Error("late-failure"))
+      const outcome = await first
+      expect("16q-a4 迟到失败判 disposed", outcome.reason, "disposed")
+      expect("16q-a4 迟到失败不写 error", h.state.error, "")
+      expect("16q-a4 逻辑失效不是业务错误", outcome.reason === "error", false)
+      expect("16q-a4 迟到失败不写缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16q-a4 卸载后零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-b1. loadMore 挂起 → 卸载 → 成功迟到：不追加、不写缓存、游标/hasMore 不变。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162])
+      const pending = h.more()
+      const beforeCursor = h.state.detail?.nextBefore ?? -1
+      const beforeHasMore = h.state.detail?.hasMore ?? false
+      const snapshot = dispose16q(h)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      const outcome = await pending
+      expect("16q-b1 迟到分页判 disposed", outcome.reason, "disposed")
+      expect("16q-b1 不追加回合", indexes16p(h), "161,162")
+      expect("16q-b1 游标未恢复/推进", h.state.detail?.nextBefore ?? -1, beforeCursor)
+      expect("16q-b1 hasMore 未改动", h.state.detail?.hasMore ?? false, beforeHasMore)
+      expect("16q-b1 缓存保持首屏", cacheTurns("sess-A"), 2)
+      expect("16q-b1 卸载后零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-b2. loadMore 失败迟到：错误态、回合与游标均不变。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162])
+      const pending = h.more()
+      const snapshot = dispose16q(h)
+      h.requests[1]!.d.reject(new Error("late-page-failure"))
+      const outcome = await pending
+      expect("16q-b2 迟到分页失败判 disposed", outcome.reason, "disposed")
+      expect("16q-b2 迟到失败不写 error", h.state.error, "")
+      expect("16q-b2 不追加回合", indexes16p(h), "161,162")
+      expect("16q-b2 游标不变", h.state.detail?.nextBefore ?? -1, 161)
+      expect("16q-b2 缓存不被改写", cacheTurns("sess-A"), 2)
+      expect("16q-b2 卸载后零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-b3. 分页在途 → 卸载 → 又到达 Revert/Delete 事件：事件不再发请求、
+    // 状态零写入，迟到分页不得把缓存写回。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162])
+      const pending = h.more()
+      const snapshot = dispose16q(h)
+      const beforeRequests = h.requests.length
+      await h.feed([committedEvent("sess-A"), deletedEvent("sess-A")])
+      expect("16q-b3 卸载后事件不再发请求", h.requests.length, beforeRequests)
+      expect("16q-b3 卸载后事件零状态写入", writesOf(h), snapshot)
+      expect("16q-b3 事件按语义清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      h.requests[1]!.d.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16q-b3 迟到分页判 disposed", (await pending).reason, "disposed")
+      expect("16q-b3 不追加回合", indexes16p(h), "161,162")
+      expect("16q-b3 迟到分页不写回缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16q-b3 迟到分页后仍零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-c1/c2. dispose 幂等；dispose 后 load/loadMore 短路，不发请求。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162]) // hasMore=true：短路断言不是被 hasMore 守卫挡住
+      const snapshot = dispose16q(h)
+      h.loader.dispose()
+      h.loader.dispose()
+      expect("16q-c1 重复 dispose 无额外写入", writesOf(h), snapshot)
+      const beforeRequests = h.requests.length
+      const afterLoad = h.load(true)
+      const afterMore = h.more()
+      // 兜底 resolve：短路被削弱时用例要跑完并报失败，不能挂在 Deferred 上假绿。
+      for (let i = beforeRequests; i < h.requests.length; i++) {
+        h.requests[i]!.d.resolve(detailOf("sess-A", [1].map(turnOf)))
+      }
+      expect("16q-c2 不再发请求", h.requests.length, beforeRequests)
+      expect("16q-c2 dispose 后 load 短路", (await afterLoad).reason, "disposed")
+      expect("16q-c2 dispose 后 loadMore 短路", (await afterMore).reason, "disposed")
+      expect("16q-c2 短路零写入", writesOf(h), snapshot)
+    }
+
+    // 16q-c3. 新实例不被旧实例的迟到请求影响。
+    {
+      requestModule.invalidateDetailCache()
+      const a = eventHarness("sess-A")
+      const b = eventHarness("sess-B")
+      const lateA = a.load()
+      const goodB = b.load()
+      a.loader.dispose()
+      b.requests[0]!.d.resolve(detailOf("sess-B", [7].map(turnOf)))
+      expect("16q-c3 B 正常提交", (await goodB).reason, "ok")
+      expect("16q-c3 B 正常写缓存", cacheTurns("sess-B"), 1)
+      a.requests[0]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      expect("16q-c3 A 迟到判 disposed", (await lateA).reason, "disposed")
+      expect("16q-c3 A 不写缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16q-c3 B 详情不受影响", indexes16p(b), "7")
+      expect("16q-c3 B 缓存 id 不受影响", requestModule.readDetailCache("sess-B")?.value.id ?? "", "sess-B")
+      expect("16q-c3 B 加载态已恢复", b.state.refreshing, false)
+    }
+
+    // 16q-d1. 未卸载的正常请求仍能提交并写缓存（防止保护过度）。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const loading = h.load()
+      h.requests[0]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      expect("16q-d1 正常提交", (await loading).reason, "ok")
+      expect("16q-d1 正常写缓存", cacheTurns("sess-A"), 2)
+      expect("16q-d1 缓存写入计数 1", h.state.cacheWrites, 1)
+      expect("16q-d1 加载态恢复", h.state.refreshing, false)
+      expect("16q-d1 缓存仍新鲜", requestModule.isDetailCacheFresh("sess-A"), true)
+    }
+
+    // 16q-d2. 请求失败不覆盖有效缓存与详情。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      const failed = h.load(true)
+      h.requests[1]!.d.reject(new Error("refresh-failed"))
+      expect("16q-d2 失败返回 error", (await failed).reason, "error")
+      expect("16q-d2 有效缓存保留", cacheTurns("sess-A"), 2)
+      expect("16q-d2 详情保留", indexes16p(h), "1,2")
+      expect("16q-d2 错误态可展示", h.state.error, "Error: refresh-failed")
+      expect("16q-d2 加载态恢复", h.state.refreshing, false)
+    }
+
+    // 16q-d3. 旧请求不覆盖新请求缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const old = h.load()
+      const newer = h.load(true)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [5, 6].map(turnOf)))
+      expect("16q-d3 新请求提交", (await newer).reason, "ok")
+      h.requests[0]!.d.resolve(detailOf("sess-A", [1, 2, 3].map(turnOf)))
+      expect("16q-d3 旧请求判 stale", (await old).reason, "stale")
+      expect(
+        "16q-d3 缓存为新请求",
+        requestModule.readDetailCache("sess-A")?.value.turns.map((t) => t.index).join(",") ?? "",
+        "5,6",
+      )
+    }
+
+    // 16q-d4. 会话切换不串缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const a = eventHarness("sess-A")
+      const b = eventHarness("sess-B")
+      const la = a.load()
+      const lb = b.load()
+      a.requests[0]!.d.resolve(detailOf("sess-A", [1].map(turnOf)))
+      b.requests[0]!.d.resolve(detailOf("sess-B", [2].map(turnOf)))
+      await la
+      await lb
+      expect("16q-d4 A 缓存为 A", requestModule.readDetailCache("sess-A")?.value.id ?? "", "sess-A")
+      expect("16q-d4 B 缓存为 B", requestModule.readDetailCache("sess-B")?.value.id ?? "", "sess-B")
+      expect("16q-d4 无第三 key", String(requestModule.readDetailCache("sess-C")), "undefined")
+    }
+
+    // 16q-d5. Revert 失效 + 强刷、Delete 清理 + 迟到保护不回退。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2, 3])
+      await h.feed([committedEvent("sess-A")])
+      expect("16q-d5 Revert 清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      h.requests[1]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      expect("16q-d5 强刷提交", (await h.outcomes[1]!).reason, "ok")
+      expect("16q-d5 强刷后缓存", cacheTurns("sess-A"), 2)
+      await h.feed([deletedEvent("sess-A")])
+      expect("16q-d5 Delete 清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16q-d5 Delete 状态", h.state.gone, true)
+      const after = h.load(true)
+      expect("16q-d5 Delete 后短路", (await after).reason, "gone")
+      expect("16q-d5 Delete 后不发请求", h.requests.length, 2)
+    }
+
+    // 16q-e1. TTL / LRU / 容量 / 失效：策略不变，只补生命周期回归。
+    {
+      requestModule.invalidateDetailCache()
+      const ids = ["q1", "q2", "q3", "q4", "q5"]
+      for (const key of ids) requestModule.rememberDetail(detailOf(key, [turnOf(1)]))
+      expect("16q-e1 容量 4：q1 被淘汰", String(requestModule.readDetailCache("q1")), "undefined")
+      expect(
+        "16q-e1 q2..q5 均在",
+        ["q2", "q3", "q4", "q5"].map((key) => String(requestModule.readDetailCache(key)) !== "undefined").join(","),
+        "true,true,true,true",
+      )
+      expect("16q-e1 刚写入 fresh", requestModule.isDetailCacheFresh("q2"), true)
+      // 通过探针返回的条目引用回拨 121s 模拟时间流逝（不修改断言结果）。
+      const staleEntry = requestModule.readDetailCache("q3")
+      if (staleEntry) staleEntry.at = Date.now() - 121_000
+      expect("16q-e1 超过 120s 不 fresh", requestModule.isDetailCacheFresh("q3"), false)
+      const at4 = requestModule.readDetailCache("q4")?.at ?? 0
+      expect("16q-e1 at 为近期时间戳", at4 > 0 && Date.now() - at4 < 120_000, true)
+      expect("16q-e1 读不改 at", requestModule.readDetailCache("q4")?.at ?? 0, at4)
+      // 重写 q2 把它移到 LRU 末尾；再写 q6 → 最旧的 q3 被淘汰。
+      requestModule.rememberDetail(detailOf("q2", [turnOf(2)]))
+      requestModule.rememberDetail(detailOf("q6", [turnOf(1)]))
+      expect("16q-e1 LRU 最旧 q3 被淘汰", String(requestModule.readDetailCache("q3")), "undefined")
+      expect("16q-e1 LRU 重写 q2 保活", String(requestModule.readDetailCache("q2")) !== "undefined", true)
+      expect(
+        "16q-e1 q4/q5/q6 仍在",
+        ["q4", "q5", "q6"].map((key) => String(requestModule.readDetailCache(key)) !== "undefined").join(","),
+        "true,true,true",
+      )
+      requestModule.invalidateDetailCache("q2")
+      expect("16q-e1 指定失效后不 fresh", requestModule.isDetailCacheFresh("q2"), false)
+      expect("16q-e1 指定失效不动其它", requestModule.isDetailCacheFresh("q6"), true)
+      requestModule.invalidateDetailCache()
+      expect(
+        "16q-e1 全清",
+        ["q4", "q5", "q6"].map((key) => String(requestModule.readDetailCache(key))).join(","),
+        "undefined,undefined,undefined",
+      )
     }
     requestModule.invalidateDetailCache()
   }
