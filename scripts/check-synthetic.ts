@@ -1245,6 +1245,18 @@ async function main(): Promise<void> {
         nextBefore: number,
       ) => { progress: boolean; reason: "ok" | "empty" | "stalled" }
       applyLoadMoreResult: (current: SessionDetail, next: SessionDetail) => SessionDetail
+      filterTurnsByQuery: (turns: readonly SessionTurn[], query: string) => readonly SessionTurn[]
+      CSV_HEADER: readonly string[]
+      buildCsvRows: (turns: readonly SessionTurn[]) => unknown[][]
+      buildCsvText: (turns: readonly SessionTurn[]) => string
+      buildJsonPayload: (
+        current: SessionDetail,
+        turns: readonly SessionTurn[],
+        full: boolean,
+      ) => {
+        sanitized: boolean
+        turns: Array<Record<string, unknown>>
+      }
     }
     // withTurns 只读 id/title 等展示字段之外的汇总字段——最小占位即可
     const emptyDetailLike = {
@@ -1471,6 +1483,377 @@ async function main(): Promise<void> {
     )
     store15k.close()
     require("node:fs").rmSync(file15k)
+
+    // 15l. 搜索与导出范围回归（TASK-15）：搜索只过滤 detail().turns 当前
+    // 已加载回合；CSV / JSON 导出与搜索可见回合同源，不触发任何分页读取。
+    // 生产函数 filterTurnsByQuery / buildCsvRows / buildCsvText /
+    // buildJsonPayload 与组件共用，测试验证实际导出数据而非按钮调用。
+    const pureTokens = { input: 10, output: 20, reasoning: 5, cacheRead: 3, cacheWrite: 1 }
+    const richTurn = {
+      ...mkTurn(7, 0.01),
+      prompt: "登录失败 排查",
+      files: ["截图-alpha.png"],
+      agents: ["build"],
+      requests: [
+        {
+          id: "req-rich",
+          seq: 7,
+          time: 1000,
+          agent: "explore",
+          providerID: "anthropic",
+          modelID: "claude-3.7",
+          variant: "",
+          finish: "stop",
+          cost: 0.01,
+          tokens: pureTokens,
+          ttft: 0.1,
+          total: 2,
+          error: "",
+          text: "回复内容 ALPHA",
+          textTruncated: false,
+          reasoning: "思考内容",
+          reasoningTruncated: false,
+          tools: [
+            {
+              id: "tool-rich",
+              name: "bash",
+              status: "error",
+              duration: 0.2,
+              summary: "ls -la",
+              input: '{"cmd":"pwd"}',
+              output: "/tmp/out",
+              outputTruncated: false,
+              error: "权限不足",
+            },
+          ],
+        },
+      ],
+      toolCount: 1,
+      errorCount: 1,
+    } as SessionTurn
+    // 搜索字段覆盖：提示词、附件、Agent、模型/供应商、回复/思考、工具四类内容
+    const searchFieldCases: [string, string][] = [
+      ["提示词", "登录失败"],
+      ["附件名", "截图-alpha"],
+      ["Agent 列表", "build"],
+      ["模型", "claude-3.7"],
+      ["供应商", "anthropic"],
+      ["请求 Agent", "explore"],
+      ["回复正文（大小写不敏感）", "alpha"],
+      ["思考内容", "思考内容"],
+      ["工具名称", "bash"],
+      ["工具摘要", "ls -la"],
+      ["工具输入（特殊字符）", '{"cmd":"pwd"}'],
+      ["工具输出", "/tmp/out"],
+      ["工具错误", "权限不足"],
+    ]
+    for (const [label, keyword] of searchFieldCases) {
+      expect(`15l 搜索字段-${label}`, front.filterTurnsByQuery([richTurn], keyword).length, 1)
+    }
+    // 索引缓存跟随回合对象：同 index 的新对象必须重新索引，不能复用旧内容
+    const staleTurn = { ...richTurn, prompt: "旧版内容" } as SessionTurn
+    const freshTurn = { ...richTurn, prompt: "新版内容" } as SessionTurn
+    expect("15l 旧对象命中旧内容", front.filterTurnsByQuery([staleTurn], "旧版内容").length, 1)
+    expect("15l 刷新后旧内容不再命中", front.filterTurnsByQuery([freshTurn], "旧版内容").length, 0)
+    expect("15l 刷新后新内容命中", front.filterTurnsByQuery([freshTurn], "新版内容").length, 1)
+    // 空关键词 / 清空搜索恢复全部已加载回合；无匹配返回空
+    const twoTurns = [richTurn, mkTurn(8, 0)]
+    expect("15l 空关键词返回全部", front.filterTurnsByQuery(twoTurns, "").length, 2)
+    expect("15l 空白关键词返回全部", front.filterTurnsByQuery(twoTurns, "   ").length, 2)
+    expect("15l 清空搜索恢复已加载回合", front.filterTurnsByQuery(twoTurns, "登录失败").length, 1)
+    expect("15l 无匹配返回空", front.filterTurnsByQuery(twoTurns, "绝对不存在的关键词").length, 0)
+
+    // CSV 契约：BOM、表头字段与顺序、引号转义、公式注入防护保持原样
+    const escapeTurn = {
+      ...mkTurn(9, 0),
+      prompt: "=SUM(1,2)\n第二行",
+      requests: [
+        {
+          ...richTurn.requests[0]!,
+          id: "req-escape",
+          modelID: 'model,"quoted"',
+          time: 2000,
+        },
+      ],
+      toolCount: 1,
+    } as SessionTurn
+    const escapeCsv = front.buildCsvText([escapeTurn])
+    expect("15l CSV 含 UTF-8 BOM", escapeCsv.charCodeAt(0), 0xfeff)
+    expect(
+      "15l CSV 表头字段与顺序",
+      front.CSV_HEADER.join(","),
+      "回合,时间,请求序号,模型,供应商,Agent,输入,缓存读取,缓存写入,输出,推理,费用,首字秒,总时延秒,工具数,工具错误,结束原因,提示词",
+    )
+    const headerLine = front.CSV_HEADER.map((name) => `"${name}"`).join(",")
+    expect("15l CSV 表头行", escapeCsv.split("\n")[0], "\ufeff" + headerLine)
+    expect("15l CSV 行尾保持 LF", escapeCsv.includes("\r"), false)
+    expect("15l CSV 引号转义", escapeCsv.includes('"model,""quoted"""'), true)
+    expect("15l CSV 公式注入防护", escapeCsv.includes('"\'=SUM(1,2) 第二行"'), true)
+
+    // JSON 契约：脱敏只影响导出副本，不修改回合对象；完整模式保留原内容
+    const richDetail = {
+      ...emptyDetailLike,
+      id: "fl-pure",
+      title: "纯函数导出",
+      projectName: "项目",
+      directory: "/tmp/secret-dir",
+      providerID: "anthropic",
+      modelID: "claude-3.7",
+      timeCreated: 1000,
+      timeUpdated: 2000,
+      cost: 0.01,
+      tokens: pureTokens,
+      totalTurns: 1,
+      requestCount: 1,
+      toolCount: 1,
+      errorCount: 1,
+      turns: [richTurn],
+    } as SessionDetail
+    const turnSnapshot = JSON.stringify(richTurn)
+    const sanitizedPure = front.buildJsonPayload(richDetail, [richTurn], false)
+    const sanitizedTurn = sanitizedPure.turns[0]!
+    const sanitizedRequest = (sanitizedTurn.requests as Array<Record<string, unknown>>)[0]!
+    expect("15l JSON 默认脱敏标记", sanitizedPure.sanitized, true)
+    expect("15l JSON 脱敏无 prompt", "prompt" in sanitizedTurn, false)
+    expect("15l JSON 脱敏无 files", "files" in sanitizedTurn, false)
+    expect("15l JSON 脱敏保留 agents", (sanitizedTurn.agents as string[]).join(","), "build")
+    expect("15l JSON 脱敏请求无 text", "text" in sanitizedRequest, false)
+    expect("15l JSON 脱敏请求无 reasoning", "reasoning" in sanitizedRequest, false)
+    expect("15l JSON 脱敏请求无 tools", "tools" in sanitizedRequest, false)
+    expect("15l JSON 脱敏保留工具计数", sanitizedRequest.toolCount, 1)
+    expect("15l JSON 脱敏保留工具错误计数", sanitizedRequest.toolErrors, 1)
+    const sanitizedText = JSON.stringify(sanitizedPure)
+    for (const sensitive of ["ALPHA", "思考内容", "截图-alpha", "pwd", "/tmp/out", "权限不足"]) {
+      expect(`15l JSON 脱敏剥离 ${sensitive}`, sanitizedText.includes(sensitive), false)
+    }
+    const fullPure = front.buildJsonPayload(richDetail, [richTurn], true)
+    const fullTurn = fullPure.turns[0]!
+    const fullRequest = (fullTurn.requests as Array<Record<string, unknown>>)[0]!
+    expect("15l JSON 完整模式标记", fullPure.sanitized, false)
+    expect("15l JSON 完整模式保留 prompt", fullTurn.prompt, "登录失败 排查")
+    expect("15l JSON 完整模式保留 files", (fullTurn.files as string[]).join(","), "截图-alpha.png")
+    expect("15l JSON 完整模式保留 text", fullRequest.text, "回复内容 ALPHA")
+    expect("15l JSON 完整模式保留 reasoning", fullRequest.reasoning, "思考内容")
+    const fullTools = fullRequest.tools as Array<Record<string, unknown>>
+    expect("15l JSON 完整模式保留工具输出", fullTools[0]!.output, "/tmp/out")
+    expect("15l 导出不修改回合对象", JSON.stringify(richTurn), turnSnapshot)
+
+    // 真实服务端分页：220 回合（60/页），标记分别落在首屏、第二页、第三页、第四页
+    const file15l = `${process.env.TMPDIR ?? "/tmp"}/uc-f15l-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db15l = new Database(file15l)
+    db15l.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    db15l.exec(`INSERT INTO project VALUES ('pfl', NULL, '/tmp/f15l', 1)`)
+    db15l
+      .prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('fl1', 'pfl', '搜索导出范围', 1, 1)")
+      .run()
+    const msg15l = db15l.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'fl1', ?, ?, ?, ?, ?)",
+    )
+    const simplePayload15l = (text: string) =>
+      JSON.stringify({
+        cost: 0.001,
+        model: { providerID: "prov-x", id: "model-a" },
+        agent: "build",
+        tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 1, streamed: 2, completed: 3 },
+        finish: "stop",
+        content: [{ type: "text", text }],
+      })
+    const richPayload15l = JSON.stringify({
+      cost: 0.002,
+      model: { providerID: "prov-rich", id: "model-rich" },
+      agent: "explore",
+      tokens: { input: 10, output: 20, reasoning: 5, cache: { read: 3, write: 1 } },
+      time: { created: 1000, streamed: 1500, completed: 3000 },
+      finish: "stop",
+      content: [
+        { type: "text", text: "首屏命中 alpha" },
+        { type: "reasoning", text: "首屏思考 beta" },
+        {
+          type: "tool",
+          id: "tool-rich-server",
+          name: "first-tool",
+          state: {
+            status: "error",
+            input: { command: "echo 首屏输入" },
+            content: [{ type: "text", text: "首屏输出 gamma" }],
+            error: "首屏错误 delta",
+          },
+          time: { created: 1100, completed: 1300 },
+        },
+      ],
+    })
+    const userPayload15l = (i: number) =>
+      JSON.stringify({
+        text: i === 19 ? "回合 20 最早期命中 eta" : `回合 ${i + 1}`,
+        ...(i === 199 ? { files: [{ name: "附件标记.png" }], agents: [{ name: "规划者" }] } : {}),
+      })
+    const assistantPayload15l = (i: number) => {
+      if (i === 199) return richPayload15l
+      if (i === 149) return simplePayload15l("第二页命中 epsilon")
+      if (i === 49) return simplePayload15l("较早历史命中 zeta")
+      return simplePayload15l(`回复 ${i + 1}`)
+    }
+    db15l.transaction(() => {
+      for (let i = 0; i < 220; i++) {
+        msg15l.run(`l${i}u`, "user", i * 2 + 1, i, i, userPayload15l(i))
+        msg15l.run(`l${i}a`, "assistant", i * 2 + 2, i, i, assistantPayload15l(i))
+      }
+    })()
+    db15l.close()
+    const store15l = new UsageStore(file15l, () => {})
+    const reads15l = { messages: 0, assistant: 0, bodyBytes: 0 }
+    ;(globalThis as { __ucPageReads?: typeof reads15l }).__ucPageReads = reads15l
+    const first15l = store15l.sessionDetail({ sessionID: "fl1", limit: 60, force: true })
+    let exportDetail15l = front.withTurns({ ...emptyDetailLike } as SessionDetail, [...first15l.turns])
+    const readsAfterFirst15l = reads15l.messages
+    expect("15l 首屏 60 回合", exportDetail15l.turns.length, 60)
+    expect("15l 首屏范围 161..220", `${exportDetail15l.turns[0]?.index}..${exportDetail15l.turns.at(-1)?.index}`, "161..220")
+    // 首屏搜索与导出最多覆盖 60 回合
+    expect("15l 首屏搜索最多 60", front.filterTurnsByQuery(exportDetail15l.turns, "回合").length, 60)
+    expect("15l 首屏命中首屏标记", front.filterTurnsByQuery(exportDetail15l.turns, "首屏命中").length, 1)
+    expect("15l 首屏不含第二页标记", front.filterTurnsByQuery(exportDetail15l.turns, "第二页命中").length, 0)
+    expect("15l 首屏不含较早历史标记", front.filterTurnsByQuery(exportDetail15l.turns, "较早历史命中").length, 0)
+    const csvFirst15l = front.buildCsvRows(exportDetail15l.turns)
+    expect("15l 首屏 CSV 数据行=60", csvFirst15l.length - 1, 60)
+    expect("15l 首屏 CSV 首回合 161", csvFirst15l[1]?.[0], 161)
+    expect("15l 首屏 CSV 末回合 220", csvFirst15l.at(-1)?.[0], 220)
+    const jsonFirst15l = front.buildJsonPayload(first15l, exportDetail15l.turns, true)
+    expect("15l 首屏 JSON 回合=60", jsonFirst15l.turns.length, 60)
+    expect("15l 首屏 JSON 首回合 161", jsonFirst15l.turns[0]?.index, 161)
+    expect("15l 首屏 JSON 末回合 220", jsonFirst15l.turns.at(-1)?.index, 220)
+    // 有搜索条件：CSV / JSON 都只导出命中的已加载回合
+    const hitFirst15l = front.filterTurnsByQuery(exportDetail15l.turns, "首屏命中")
+    const csvHitFirst15l = front.buildCsvRows(hitFirst15l)
+    expect("15l 首屏 CSV 搜索命中行数", csvHitFirst15l.length - 1, 1)
+    expect("15l 首屏 CSV 搜索命中回合 200", csvHitFirst15l[1]?.[0], 200)
+    const jsonHitFirst15l = front.buildJsonPayload(first15l, hitFirst15l, false)
+    expect("15l 首屏 JSON 搜索命中回合数", jsonHitFirst15l.turns.length, 1)
+    expect("15l 首屏 JSON 搜索命中回合 200", jsonHitFirst15l.turns[0]?.index, 200)
+    // 服务端数据的搜索字段覆盖（回复/思考/工具/附件/模型/供应商/agent）
+    const serverFieldCases: [string, string][] = [
+      ["首屏回复", "首屏命中"],
+      ["首屏思考", "首屏思考"],
+      ["工具名称", "first-tool"],
+      ["工具输入", "首屏输入"],
+      ["工具输出", "首屏输出"],
+      ["工具错误", "首屏错误"],
+      ["附件名", "附件标记"],
+      ["Agent 列表", "规划者"],
+      ["供应商", "prov-rich"],
+      ["模型", "model-rich"],
+      ["请求 Agent", "explore"],
+      ["大小写不敏感", "ALPHA"],
+      ["工具输入特殊字符", '"command"'],
+    ]
+    for (const [label, keyword] of serverFieldCases) {
+      expect(`15l 服务端搜索-${label}`, front.filterTurnsByQuery(exportDetail15l.turns, keyword).length, 1)
+    }
+    // JSON 脱敏：正文/思考/工具/附件名剥离，元数据与 agent 保留
+    const sanitizedServer15l = front.buildJsonPayload(first15l, hitFirst15l, false)
+    const sanitizedServerTurn =
+      sanitizedServer15l.turns[0] ?? ({} as Record<string, unknown>)
+    const sanitizedServerRequest =
+      ((sanitizedServerTurn.requests as Array<Record<string, unknown>> | undefined) ?? [])[0] ?? {}
+    const sanitizedServerText = JSON.stringify(sanitizedServer15l)
+    expect("15l 服务端 JSON 脱敏标记", sanitizedServer15l.sanitized, true)
+    expect("15l 服务端 JSON 脱敏无 prompt", "prompt" in sanitizedServerTurn, false)
+    expect("15l 服务端 JSON 脱敏无 files", "files" in sanitizedServerTurn, false)
+    expect("15l 服务端 JSON 脱敏保留 agents", (sanitizedServerTurn.agents as string[]).join(","), "规划者")
+    expect("15l 服务端 JSON 脱敏保留模型", sanitizedServerRequest.model, "model-rich")
+    expect("15l 服务端 JSON 脱敏保留工具计数", sanitizedServerRequest.toolCount, 1)
+    expect("15l 服务端 JSON 脱敏保留错误计数", sanitizedServerRequest.toolErrors, 1)
+    for (const sensitive of ["首屏命中", "首屏思考", "首屏输入", "首屏输出", "首屏错误", "附件标记"]) {
+      expect(`15l 服务端 JSON 脱敏剥离 ${sensitive}`, sanitizedServerText.includes(sensitive), false)
+    }
+    // JSON 完整模式：正文、思考、工具内容与附件名原样保留
+    const fullServer15l = front.buildJsonPayload(first15l, hitFirst15l, true)
+    const fullServerTurn = fullServer15l.turns[0] ?? ({} as Record<string, unknown>)
+    const fullServerRequest =
+      ((fullServerTurn.requests as Array<Record<string, unknown>> | undefined) ?? [])[0] ?? {}
+    const fullServerTools = (fullServerRequest.tools as Array<Record<string, unknown>> | undefined) ?? []
+    expect("15l 服务端 JSON 完整模式标记", fullServer15l.sanitized, false)
+    expect("15l 服务端 JSON 完整 prompt", fullServerTurn.prompt, "回合 200")
+    expect("15l 服务端 JSON 完整 files", (fullServerTurn.files as string[]).join(","), "附件标记.png")
+    expect("15l 服务端 JSON 完整 text", fullServerRequest.text, "首屏命中 alpha")
+    expect("15l 服务端 JSON 完整 reasoning", fullServerRequest.reasoning, "首屏思考 beta")
+    expect("15l 服务端 JSON 完整工具名", fullServerTools[0]?.name, "first-tool")
+    expect("15l 服务端 JSON 完整工具输出", fullServerTools[0]?.output, "首屏输出 gamma")
+    expect("15l 服务端 JSON 完整工具错误", fullServerTools[0]?.error, "首屏错误 delta")
+    // 无匹配：空结果且不发分页请求、不改变分页状态
+    const noHit15l = front.filterTurnsByQuery(exportDetail15l.turns, "根本不存在-9f3a")
+    expect("15l 无匹配搜索为空", noHit15l.length, 0)
+    expect("15l 无匹配 CSV 仅表头", front.buildCsvRows(noHit15l).length, 1)
+    expect("15l 无匹配 JSON 回合为空", front.buildJsonPayload(first15l, noHit15l, true).turns.length, 0)
+    expect("15l 无匹配不改变分页状态", exportDetail15l.hasMore && exportDetail15l.nextBefore === 161, true)
+    expect("15l 搜索与导出不额外读取消息", reads15l.messages, readsAfterFirst15l)
+    // 连续加载：每加载一页，搜索与导出范围随之扩展；导出本身不再读取
+    const load15l = () => {
+      const page = store15l.sessionDetail({
+        sessionID: "fl1",
+        beforeTurn: exportDetail15l.nextBefore,
+        limit: 60,
+        force: true,
+      })
+      exportDetail15l = front.applyLoadMoreResult(exportDetail15l, page)
+    }
+    const readsBeforeLoad15l = reads15l.messages
+    load15l()
+    expect("15l 第二页读取发生", reads15l.messages > readsBeforeLoad15l, true)
+    expect("15l 第二页后 120 回合", exportDetail15l.turns.length, 120)
+    expect("15l 第二页范围 101..220", `${exportDetail15l.turns[0]?.index}..${exportDetail15l.turns.at(-1)?.index}`, "101..220")
+    expect("15l 第二页后搜索范围 120", front.filterTurnsByQuery(exportDetail15l.turns, "回合").length, 120)
+    expect("15l 第二页标记进入搜索", front.filterTurnsByQuery(exportDetail15l.turns, "第二页命中").length, 1)
+    expect("15l 第二页仍不含第三页标记", front.filterTurnsByQuery(exportDetail15l.turns, "较早历史命中").length, 0)
+    const hitSecond15l = front.filterTurnsByQuery(exportDetail15l.turns, "第二页命中")
+    expect("15l 第二页 CSV 搜索命中行数", front.buildCsvRows(hitSecond15l).length - 1, 1)
+    expect("15l 第二页 JSON 搜索命中回合数", front.buildJsonPayload(first15l, hitSecond15l, true).turns.length, 1)
+    const readsBeforeExport15l = reads15l.messages
+    expect("15l 第二页 CSV=120", front.buildCsvRows(exportDetail15l.turns).length - 1, 120)
+    expect("15l 第二页 JSON=120", front.buildJsonPayload(first15l, exportDetail15l.turns, true).turns.length, 120)
+    expect("15l 第二页导出不额外读取", reads15l.messages, readsBeforeExport15l)
+    load15l()
+    expect("15l 第三页后 180 回合", exportDetail15l.turns.length, 180)
+    expect("15l 第三页范围 41..220", `${exportDetail15l.turns[0]?.index}..${exportDetail15l.turns.at(-1)?.index}`, "41..220")
+    expect("15l 第三页标记进入搜索", front.filterTurnsByQuery(exportDetail15l.turns, "较早历史命中").length, 1)
+    expect("15l 第三页仍不含第四页标记", front.filterTurnsByQuery(exportDetail15l.turns, "最早期命中").length, 0)
+    expect("15l 第三页 CSV=180", front.buildCsvRows(exportDetail15l.turns).length - 1, 180)
+    expect("15l 第三页 JSON=180", front.buildJsonPayload(first15l, exportDetail15l.turns, true).turns.length, 180)
+    load15l()
+    expect("15l 第四页后 220 回合", exportDetail15l.turns.length, 220)
+    expect("15l 第四页后到达终点", exportDetail15l.hasMore, false)
+    expect("15l 第四页后游标归零", exportDetail15l.nextBefore, 0)
+    expect("15l 第四页标记进入搜索", front.filterTurnsByQuery(exportDetail15l.turns, "最早期命中").length, 1)
+    expect("15l 终点搜索范围 220", front.filterTurnsByQuery(exportDetail15l.turns, "回合").length, 220)
+    // 连续加载后导出：不重复、不遗漏已加载回合
+    const readsBeforeFinalExport15l = reads15l.messages
+    const finalCsv15l = front.buildCsvRows(exportDetail15l.turns)
+    const finalJson15l = front.buildJsonPayload(first15l, exportDetail15l.turns, true)
+    const finalIndexes15l = exportDetail15l.turns.map((turn) => turn.index)
+    expect("15l 终点 CSV 数据行=220", finalCsv15l.length - 1, 220)
+    expect("15l 终点 JSON 回合=220", finalJson15l.turns.length, 220)
+    expect(
+      "15l 终点回合序号连续 1..220",
+      finalIndexes15l.join(","),
+      Array.from({ length: 220 }, (_, i) => i + 1).join(","),
+    )
+    expect("15l 终点 CSV 序号与回合一致", finalCsv15l.slice(1).map((row) => row[0]).join(","), finalIndexes15l.join(","))
+    expect(
+      "15l 终点 JSON 序号与回合一致",
+      finalJson15l.turns.map((turn) => turn.index).join(","),
+      finalIndexes15l.join(","),
+    )
+    expect("15l 终点导出不额外读取", reads15l.messages, readsBeforeFinalExport15l)
+    store15l.close()
+    delete (globalThis as { __ucPageReads?: typeof reads15l }).__ucPageReads
+    require("node:fs").rmSync(file15l)
 
     // 15h. 查询计划自动化回归（TASK-09，复审修正后）：直接引用 store.ts 导出的
     // SESSION_PAGE_SQLS——生产查询与测试共用同一份 SQL 文本，改生产不改测试

@@ -161,6 +161,188 @@ function matchesTurn(turn: SessionTurn, query: string): boolean {
   return turnSearchText(turn).includes(query)
 }
 
+/**
+ * 搜索范围（TASK-15）：只在传入的回合集合内过滤——生产调用方传入
+ * detail().turns（当前已加载回合），因此搜索永远不会触达未加载历史。
+ * 搜索索引以回合对象为 WeakMap 键：刷新/翻页产生的新对象自动重新索引，
+ * 旧对象随 GC 回收，不会把上一次的内容带进新结果。
+ */
+export function filterTurnsByQuery(turns: readonly SessionTurn[], query: string): readonly SessionTurn[] {
+  const value = query.trim().toLowerCase()
+  if (!value) return turns
+  return turns.filter((turn) => matchesTurn(turn, value))
+}
+
+/** CSV 表头（TASK-15：字段与列顺序是导出契约的一部分，抽为常量供测试断言）。 */
+export const CSV_HEADER = [
+  "回合",
+  "时间",
+  "请求序号",
+  "模型",
+  "供应商",
+  "Agent",
+  "输入",
+  "缓存读取",
+  "缓存写入",
+  "输出",
+  "推理",
+  "费用",
+  "首字秒",
+  "总时延秒",
+  "工具数",
+  "工具错误",
+  "结束原因",
+  "提示词",
+] as const
+
+/**
+ * CSV 导出数据构建（TASK-15）：只接收调用方给出的回合（生产为
+ * visibleTurns()，即已加载且匹配搜索的回合），不读取别的数据源、不发请求。
+ * 字段顺序、空回合补零、提示词压成单行并截断 300 字、csvCell 转义均保持原样。
+ */
+export function buildCsvRows(turns: readonly SessionTurn[]): unknown[][] {
+  const lines: unknown[][] = [[...CSV_HEADER]]
+  for (const turn of turns) {
+    const prompt = turn.prompt.replace(/\s+/g, " ").slice(0, 300)
+    if (turn.requests.length === 0) {
+      lines.push([turn.index, new Date(turn.time).toISOString(), "", "", "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", prompt])
+      continue
+    }
+    turn.requests.forEach((request, index) => {
+      lines.push([
+        turn.index,
+        new Date(request.time).toISOString(),
+        index + 1,
+        request.modelID,
+        request.providerID,
+        request.agent,
+        request.tokens.input,
+        request.tokens.cacheRead,
+        request.tokens.cacheWrite,
+        request.tokens.output,
+        request.tokens.reasoning,
+        request.cost,
+        request.ttft,
+        request.total,
+        request.tools.length,
+        request.tools.filter((tool) => tool.status === "error" || tool.error).length,
+        request.finish,
+        prompt,
+      ])
+    })
+  }
+  return lines
+}
+
+/** 完整 CSV 文本（含 Excel 兼容 BOM）。组件下载与测试共用这一份实现。 */
+export function buildCsvText(turns: readonly SessionTurn[]): string {
+  return "\ufeff" + buildCsvRows(turns).map((line) => line.map(csvCell).join(",")).join("\n")
+}
+
+/** 脱敏导出的请求行：只留数字与元数据。 */
+function stripRequest(request: SessionRequest) {
+  return {
+    time: new Date(request.time).toISOString(),
+    agent: request.agent,
+    provider: request.providerID,
+    model: request.modelID,
+    finish: request.finish,
+    cost: request.cost,
+    tokens: request.tokens,
+    ttftSeconds: request.ttft,
+    totalSeconds: request.total,
+    toolCount: request.tools.length,
+    toolErrors: request.tools.filter((tool) => tool.status === "error" || tool.error).length,
+  }
+}
+
+/**
+ * JSON 导出载荷（TASK-15）：只序列化调用方给出的回合（生产为
+ * visibleTurns()），不触发任何读取。脱敏只影响返回的新对象——回合、
+ * 请求、工具对象均不修改，页面当前数据与后续导出不受影响。
+ * 结构与字段名保持 1.0 契约：Session → Turn → Request → Tool。
+ */
+export function buildJsonPayload(current: SessionDetail, turns: readonly SessionTurn[], full: boolean) {
+  const exportedTurns = turns.map((turn) => {
+    const base = {
+      index: turn.index,
+      time: new Date(turn.time).toISOString(),
+      cost: turn.cost,
+      tokens: turn.tokens,
+      toolCount: turn.toolCount,
+      errorCount: turn.errorCount,
+      durationSeconds: turn.duration,
+      ttftSeconds: turn.ttft,
+      cacheHit: turn.cacheHit,
+    }
+    // 脱敏模式同时剥离附件名（files 可能含文件路径）；agents 是通用
+    // agent 类型名（build / explore），非用户标识，保留。
+    if (!full) return { ...base, agents: turn.agents, requests: turn.requests.map(stripRequest) }
+    return {
+      ...base,
+      files: turn.files,
+      agents: turn.agents,
+      prompt: turn.prompt,
+      promptTruncated: turn.promptTruncated,
+      requests: turn.requests.map((request) => ({
+        id: request.id,
+        time: new Date(request.time).toISOString(),
+        agent: request.agent,
+        provider: request.providerID,
+        model: request.modelID,
+        variant: request.variant || undefined,
+        finish: request.finish,
+        cost: request.cost,
+        tokens: request.tokens,
+        ttftSeconds: request.ttft,
+        totalSeconds: request.total,
+        error: request.error || undefined,
+        text: request.text,
+        reasoning: request.reasoning || undefined,
+        tools: request.tools.map((tool) => ({
+          name: tool.name,
+          status: tool.status,
+          durationSeconds: tool.duration,
+          input: tool.input,
+          output: tool.output,
+          error: tool.error || undefined,
+          exitCode: tool.exitCode,
+        })),
+      })),
+    }
+  })
+  return {
+    exportedAt: new Date().toISOString(),
+    sanitized: !full,
+    note: full
+      ? "完整导出：包含提示词、回复、工具输出与附件名，请勿外发。"
+      : "内容脱敏导出：去除提示词、回复、思考、工具内容与附件名；仍保留会话标题、项目、模型、时间等元数据。",
+    session: {
+      id: current.id,
+      title: current.title,
+      project: current.projectName,
+      directory: full ? current.directory : undefined,
+      provider: current.providerID,
+      model: current.modelID,
+      timeCreated: new Date(current.timeCreated).toISOString(),
+      timeUpdated: new Date(current.timeUpdated).toISOString(),
+      cost: current.cost,
+      tokens: current.tokens,
+      totalTurns: current.totalTurns,
+      requestCount: current.requestCount,
+      toolCount: current.toolCount,
+      errorCount: current.errorCount,
+      ttftP50: current.ttftP50,
+      ttftP95: current.ttftP95,
+      totalP95: current.totalP95,
+      slowRate: current.slowRate,
+      cacheHit: current.cacheHit,
+    },
+    /** 只包含已加载的回合；长会话可在界面继续加载后再导出。 */
+    turns: exportedTurns,
+  }
+}
+
 function statusLabel(status: string): string {
   if (status === "completed") return "完成"
   if (status === "error") return "失败"
@@ -529,12 +711,7 @@ export function SessionDetailView(props: {
     return tokens ? effectiveTokens(tokens) : 0
   }
   const allRequests = createMemo(() => detail()?.turns.flatMap((turn) => turn.requests) ?? [])
-  const visibleTurns = createMemo(() => {
-    const value = query().trim().toLowerCase()
-    const turns = detail()?.turns ?? []
-    if (!value) return turns
-    return turns.filter((turn) => matchesTurn(turn, value))
-  })
+  const visibleTurns = createMemo(() => filterTurnsByQuery(detail()?.turns ?? [], query()))
   createEffect(() => {
     if (!query().trim()) return
     const matches = visibleTurns()
@@ -590,59 +767,8 @@ export function SessionDetailView(props: {
   function exportCsv() {
     const rows = visibleTurns()
     if (rows.length === 0) return
-    const lines: unknown[][] = [
-      [
-        "回合",
-        "时间",
-        "请求序号",
-        "模型",
-        "供应商",
-        "Agent",
-        "输入",
-        "缓存读取",
-        "缓存写入",
-        "输出",
-        "推理",
-        "费用",
-        "首字秒",
-        "总时延秒",
-        "工具数",
-        "工具错误",
-        "结束原因",
-        "提示词",
-      ],
-    ]
-    for (const turn of rows) {
-      const prompt = turn.prompt.replace(/\s+/g, " ").slice(0, 300)
-      if (turn.requests.length === 0) {
-        lines.push([turn.index, new Date(turn.time).toISOString(), "", "", "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", prompt])
-        continue
-      }
-      turn.requests.forEach((request, index) => {
-        lines.push([
-          turn.index,
-          new Date(request.time).toISOString(),
-          index + 1,
-          request.modelID,
-          request.providerID,
-          request.agent,
-          request.tokens.input,
-          request.tokens.cacheRead,
-          request.tokens.cacheWrite,
-          request.tokens.output,
-          request.tokens.reasoning,
-          request.cost,
-          request.ttft,
-          request.total,
-          request.tools.length,
-          request.tools.filter((tool) => tool.status === "error" || tool.error).length,
-          request.finish,
-          prompt,
-        ])
-      })
-    }
-    const csv = lines.map((line) => line.map(csvCell).join(",")).join("\n")
-    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })
+    const csv = buildCsvText(rows)
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement("a")
     anchor.href = url
@@ -659,85 +785,7 @@ export function SessionDetailView(props: {
   function exportJson(full: boolean) {
     const current = detail()
     if (!current) return
-    const turns = visibleTurns().map((turn) => {
-      const base = {
-        index: turn.index,
-        time: new Date(turn.time).toISOString(),
-        cost: turn.cost,
-        tokens: turn.tokens,
-        toolCount: turn.toolCount,
-        errorCount: turn.errorCount,
-        durationSeconds: turn.duration,
-        ttftSeconds: turn.ttft,
-        cacheHit: turn.cacheHit,
-      }
-      // 脱敏模式同时剥离附件名（files 可能含文件路径）；agents 是通用
-      // agent 类型名（build / explore），非用户标识，保留。
-      if (!full) return { ...base, agents: turn.agents, requests: turn.requests.map(stripRequest) }
-      return {
-        ...base,
-        files: turn.files,
-        agents: turn.agents,
-        prompt: turn.prompt,
-        promptTruncated: turn.promptTruncated,
-        requests: turn.requests.map((request) => ({
-          id: request.id,
-          time: new Date(request.time).toISOString(),
-          agent: request.agent,
-          provider: request.providerID,
-          model: request.modelID,
-          variant: request.variant || undefined,
-          finish: request.finish,
-          cost: request.cost,
-          tokens: request.tokens,
-          ttftSeconds: request.ttft,
-          totalSeconds: request.total,
-          error: request.error || undefined,
-          text: request.text,
-          reasoning: request.reasoning || undefined,
-          tools: request.tools.map((tool) => ({
-            name: tool.name,
-            status: tool.status,
-            durationSeconds: tool.duration,
-            input: tool.input,
-            output: tool.output,
-            error: tool.error || undefined,
-            exitCode: tool.exitCode,
-          })),
-        })),
-      }
-    })
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      sanitized: !full,
-      note: full
-        ? "完整导出：包含提示词、回复、工具输出与附件名，请勿外发。"
-        : "内容脱敏导出：去除提示词、回复、思考、工具内容与附件名；仍保留会话标题、项目、模型、时间等元数据。",
-      session: {
-        id: current.id,
-        title: current.title,
-        project: current.projectName,
-        directory: full ? current.directory : undefined,
-        provider: current.providerID,
-        model: current.modelID,
-        timeCreated: new Date(current.timeCreated).toISOString(),
-        timeUpdated: new Date(current.timeUpdated).toISOString(),
-        cost: current.cost,
-        tokens: current.tokens,
-        totalTurns: current.totalTurns,
-        requestCount: current.requestCount,
-        toolCount: current.toolCount,
-        errorCount: current.errorCount,
-        ttftP50: current.ttftP50,
-        ttftP95: current.ttftP95,
-        totalP95: current.totalP95,
-        slowRate: current.slowRate,
-        cacheHit: current.cacheHit,
-      },
-      /** 只包含已加载的回合；长会话可在界面继续加载后再导出。 */
-      turns,
-    }
-    const body = JSON.stringify(payload, null, 2)
+    const body = JSON.stringify(buildJsonPayload(current, visibleTurns(), full), null, 2)
     const blob = new Blob([body], { type: "application/json;charset=utf-8" })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement("a")
@@ -745,23 +793,6 @@ export function SessionDetailView(props: {
     anchor.download = `opencode-session-${props.session.id.slice(-8)}-${new Date().toISOString().slice(0, 10)}${full ? "" : "-sanitized"}.json`
     anchor.click()
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-  }
-
-  /** 脱敏导出的请求行：只留数字与元数据。 */
-  function stripRequest(request: SessionRequest) {
-    return {
-      time: new Date(request.time).toISOString(),
-      agent: request.agent,
-      provider: request.providerID,
-      model: request.modelID,
-      finish: request.finish,
-      cost: request.cost,
-      tokens: request.tokens,
-      ttftSeconds: request.ttft,
-      totalSeconds: request.total,
-      toolCount: request.tools.length,
-      toolErrors: request.tools.filter((tool) => tool.status === "error" || tool.error).length,
-    }
   }
 
   async function load(force = false, quiet = false) {
@@ -1101,8 +1132,8 @@ export function SessionDetailView(props: {
                 <input
                   id="uc-session-detail-search"
                   name="uc-session-detail-search"
-                  aria-label="搜索当前会话"
-                  placeholder="搜索回合、提示词、模型、工具或输出"
+                  aria-label="搜索已加载回合"
+                  placeholder="搜索已加载回合、提示词、模型、工具或输出"
                   value={query()}
                   onInput={(event) => setQuery(event.currentTarget.value)}
                 />
