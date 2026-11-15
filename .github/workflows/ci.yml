@@ -43,8 +43,14 @@ jobs:
       - name: Synthetic data tests
         run: npm run test:synthetic
 
-      # 大规模性能回归只跑基准档（CI 内存有限）；medium/large 档本地跑
-      # `npm run test:scale:medium` / `npm run test:scale:large`（独立脚本，
-      # `-- 传参` 会被 base 档吃掉）。
+      # 三档规模回归全部进 CI（2026-11-15 实测：全程 ~30s，worker 峰值
+      # 403MB，在 ubuntu-latest 限额内）。三档独立脚本，`-- 传参` 会被
+      # base 档吃掉，不要改回 `test:scale -- medium` 的写法。
       - name: Scale regression (base)
         run: npm run test:scale
+
+      - name: Scale regression (medium)
+        run: npm run test:scale:medium
+
+      - name: Scale regression (large)
+        run: npm run test:scale:large
