@@ -636,7 +636,7 @@ export function IntegrationsPage(props: {
                     <span class="uc-int-name">
                       <b>{row.name}</b>
                       <span>
-                        {row.modelCount ? `${row.modelCount} 个模型` : row.integrationID}
+                        {row.modelCount === undefined ? row.integrationID : `${row.modelCount} 个模型`}
                         {signed() ? ` · ${(serverActive() ?? active())?.label ?? "已登录"}` : ""}
                       </span>
                     </span>
