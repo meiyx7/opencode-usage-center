@@ -1,7 +1,8 @@
 # TASK-16 请求并发与会话切换稳定性
 
-基线：`f99a265`（main，工作区干净，无 tag）。本轮只做 **TASK-16.1（首次加载与会话切换）**，
-不碰 TASK-16.2–16.5，不碰 TASK-17。
+基线：`f99a265`（main，工作区干净，无 tag）。16.1 已完成于 `e036ff4`（`main` 与
+`origin/main` 同步）。本文 §1–§3 是 16.1 的执行前分析与测试设计，§4 起为
+**TASK-16.2（刷新与加载更多并发）**。本轮只做 16.2，不碰 16.3–16.5，不碰 TASK-17。
 
 ## 1. 现状分析（执行前核查）
 
@@ -89,3 +90,104 @@
 - 文档：本文 + `docs/STATS_AUDIT.md`。
 - 不动：服务端分页、R1/C1/C2 口径、500 条限制、Schema/索引、搜索与导出、
   UI 结构、依赖、版本号。
+
+---
+
+## 4. TASK-16.2 现状分析（执行前核查，`e036ff4`）
+
+### 4.1 两条请求路径的判定能力对比
+
+| 路径 | 请求身份 | 响应回来后的判定 | 状态收尾 | 缓存写入 |
+| --- | --- | --- | --- | --- |
+| `loader.load()`（首次加载 / 刷新 / 重试 / Revert 强刷） | `{generation: ++generation, sessionID}` | `stale` → `gone` → `switched` → `mismatch`（响应 id） | 仅最新代清 `refreshing` | 仅 `commit` 判定通过后 `setDetail` + `remember` |
+| `loadMore()`（组件内联，未走协调器） | `const id = loader.generation`（**只读取，不递增**） | 仅 `id !== generation`、`sessionGone()` | `catch` 无条件 `setError`；`finally` 无条件 `setLoadingMore(false)` | `applyLoadMoreResult(current, next)` → `setDetail` + `rememberDetail`，按**载荷 id** 分槽 |
+
+`loadMore` 入口守卫沿用 `canLoadMore({ sessionGone, hasMore, loadingMore, refreshing,
+inFlight: loader.inFlight })`；`inFlight` 只统计 `load()`，loadMore 自身不改变它，
+因此 loadMore 在途时刷新按钮仍可触发（刷新会递增 `generation`，令旧分页作废）。
+这一条是**既有语义，本轮保持不变**。
+
+### 4.2 真实缺陷与风险（按可复现性排序）
+
+| ID | 问题 | 触发路径 | 后果 |
+| --- | --- | --- | --- |
+| D1 | `loadMore` 无会话一致性判定 | 同一实例 `props.session` A→B 且未发新请求（16.1 指出的 `Show` 隐含假设）；`generation` 不变、`sessionGone` 为 false | 旧 A 分页被 `setDetail(merged)` 写回 B 的视图，并按 A 的 id 写缓存 |
+| D2 | `loadMore` 无响应 id 判定 | 服务端返回 `next.id` 与请求会话不一致 | `rememberDetail(merged)` 按载荷 id 串写别的会话缓存槽；16.1 已修 `load`，此处未修 |
+| D3 | `catch` 无 checkpoint | loadMore 在途时点刷新 / 收到 Revert / 会话被删除，随后旧请求失败 | 旧请求把 `error` 写到新视图，覆盖最新请求刚清空的错误态；失败不破坏有效数据的要求被破坏 |
+| D4 | `finally` 无请求身份 | 两个 loadMore 生命周期交叠（外部提前复位 `loadingMore` 即可构造） | 旧请求清掉新请求的 `loadingMore`，按钮提前可点 → 重复请求 / 重复追加 |
+| D5 | 没有「loadMore 代」概念 | 两次 loadMore 之间，主 `generation` 只由 `load`/`invalidate` 推进 | 守卫 `loadingMore()` 是唯一屏障，且是外部信号而非请求身份；一旦屏障失效，两个响应都会提交 |
+| D6 | 用发起时快照 `current` 合并 | 同代内 detail 被其它路径改写 | 旧快照覆盖较新结果（现由 `generation` 间接挡住，但结构上无防护） |
+| D7 | 卸载后响应仍写入 | `onCleanup` 只 abort 事件订阅，无卸载标志 | 视图信号写入无 DOM 影响，但**模块级 `DETAIL_CACHE` 写入是真实副作用**。按任务划分留 TASK-16.4，本轮不改 |
+
+正常分页语义本身（`applyLoadMoreResult` 的重复页 / 空页 / 游标无进展判定、15k 已验证）
+没有发现缺陷，本轮只补「这些响应在并发下能否被正确丢弃或提交」的覆盖，不改判定实现。
+
+### 4.3 当前无法被自动化测试覆盖的真实异步路径
+
+1. **Solid `Show` 的真实重建 / 卸载时机**：无 DOM 与测试渲染器，且不新增依赖；
+   用「两个独立协调器实例」模拟重建路径、「同一实例改 `currentSessionID()`」模拟
+   原地切换，覆盖的是协调器判定，不是框架行为。
+2. **真实 RPC 时序**：用 Deferred 精确控制返回顺序替代，不依赖 `setTimeout`。
+3. **按钮 `disabled` 的 DOM 表现**：只断言 `loadingMore` / `refreshing` 信号值。
+4. **卸载后写入**：真实存在（见 D7），按任务划分留 16.4。
+
+## 5. TASK-16.2 测试设计
+
+### 5.1 覆盖层级声明
+
+**不是组件 E2E。** 不挂载 SolidJS 组件，不新增依赖。测试驱动的是组件**实际调用**
+的生产路径：`createDetailLoader`（本轮把 `loadMore` 也接入，组件首次加载 / 刷新 /
+重试 / Revert 强刷 / 加载更早回合全部经由它）、`canLoadMore` 入口守卫、
+`applyLoadMoreResult` 归并，以及真实的 `DETAIL_CACHE` 写入 / 读取 / 失效函数。
+断言对象是协调器的视图提交、状态信号与缓存副作用，不是独立 helper 的返回值复刻。
+
+### 5.2 可控异步机制
+
+沿用 16m 的手写 `Deferred<T>` 与 `harness`（`fetch` 注入、状态记录）。新增
+`reject` 能力用于失败路径。每个用例独立 Deferred，用例开始先
+`invalidateDetailCache()`，用例间不共享缓存与协调器状态；返回顺序由测试的
+`resolve` / `reject` 调用顺序决定，结果可重复。
+
+### 5.3 用例清单（16n）
+
+| ID | 场景 | 关键断言 |
+| --- | --- | --- |
+| 16n-a | 同一会话连续两次刷新，#1 晚于 #2 返回 | #1 判 `stale`；视图与缓存只保留 #2；#1 返回时 #2 的 `refreshing` 仍为 true，#2 完成后恢复 |
+| 16n-b | loadMore 在途，同一实例切到 B（未发新请求） | 判 `switched`；A 分页不追加；A/B 缓存都不写 |
+| 16n-m | 重建路径：A 实例 loadMore 挂起，切到 B 实例；B 先回、A 后回 | B 视图无 A 分页；A 只写 A 缓存、B 只写 B 缓存，互不污染 |
+| 16n-c | 连续触发两次 loadMore | 第 2 次被守卫拦下（`skipped`）、请求数 1；#1 返回只追加一次 |
+| 16n-d | loadMore 与 refresh 同时触发（loadMore 先在途） | refresh 提交；loadMore 判 `stale` 不追加、不推进游标；`loadingMore` / `refreshing` 均恢复 |
+| 16n-e | loadMore 返回重复页（首回合 index == 游标） | `hasMore=false`、`nextBefore=0`、回合数与对象引用不变；缓存与视图一致 |
+| 16n-f | loadMore 返回空页 | 已加载回合不丢，终止分页 |
+| 16n-g | loadMore 返回游标倒退页（index > 游标） | 同 e，异常页不合并 |
+| 16n-l | 连续两页正常有进展的 loadMore | 游标单调前移、无重复 index、缓存回合数与视图一致 |
+| 16n-h | loadMore 失败后重试 | `error` 有值、`loadingMore=false`、detail 与缓存保持失败前有效数据；再次 loadMore 成功且只追加一次 |
+| 16n-i | 连续刷新中 #1 失败、#2 成功 | #1 失败不写 `error`、不破坏 #2 数据；`refreshing` 正确恢复 |
+| 16n-j | 过期 loadMore 失败（refresh 已发起） | 不 `setError`，错误态保持空 |
+| 16n-k | loadMore 响应 id 与请求会话不一致 | 判 `mismatch`；不提交、不写别的会话缓存 |
+| 16n-o | 构造两次 loadMore 生命周期交叠（外部提前复位 `loadingMore`），#2 先回、#1 后回 | #1 判 `stale`、不重复追加、不清 #2 的 `loadingMore`；游标只由 #2 推进 |
+
+> 16n-o 只为验证「响应身份兜底」：守卫语义与生产代码不变，测试显式复位的是
+> 状态信号（模拟旧生命周期提前清状态），不是让生产绕过守卫。
+
+### 5.4 敏感度（mutation）计划
+
+- 去掉 `loadMore` 会话一致性判定 → 16n-b 提交 A 分页并写缓存。
+- 去掉响应 id 判定 → 16n-k 提交并串写缓存。
+- 去掉主 `generation` 判定 → 16n-d 旧分页覆盖刷新结果。
+- 去掉 `moreGeneration` 判定 → 16n-o 重复追加。
+- `catch` 无条件 `setError` → 16n-j / 16n-i 失败。
+- `finally` 无条件清 `loadingMore` → 16n-o 失败。
+- 去掉缓存写入 → 16n-m / 16n-e 隔离与一致性断言失败。
+
+每项恢复后重跑全套，结果记入 `docs/STATS_AUDIT.md` §20。
+
+### 5.5 本轮改动范围与边界
+
+- `src/gui/session-detail.tsx`：`createDetailLoader` 增加 `loadMore()` 生产路径；
+  组件 `loadMore` 改为调用它；新增 `isLoadingMore` / `isRefreshing` / `setLoadingMore`
+  注入项；`DetailRejectReason` 增加 `skipped`（守卫拦下、未发请求）。
+- `scripts/check-synthetic.ts`：新增 16n 用例组（复用 16m 的 Deferred / harness）。
+- 文档：本文 §4–§5 + `docs/STATS_AUDIT.md` §20。
+- **不动**：服务端分页算法、R1/C1/C2 统计口径、会话列表 500 条限制、Schema/索引、
+  搜索与导出、UI 结构与文案、既有 loadMore 守卫语义与游标判定、依赖、版本号、发布流程。
