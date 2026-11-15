@@ -90,15 +90,22 @@
 
 ### 2.3 mutation 计划（逐项削弱 → 对应用例失败 → 恢复）
 
-| 削弱项 | 预期检出用例 |
-| --- | --- |
-| 去掉 `cancelForGone()` 的 generation 递增 | 16p-d1（旧请求提交并写缓存） |
-| 去掉 `load()` / `loadMore()` 的 `isGone()` 短路 | 16p-d1（删除后仍发请求） |
-| 去掉 `cancelForGone()` 的加载态复位 | 16p-d1（`refreshing` 卡 true） |
-| 去掉详情页 `invalidate` 动作 | 16p-a1（旧缓存复活） |
-| `handlePageEvent` 把 cleared 当 committed | 16p-f2 / f3 |
-| 去掉 `consumeDetailEvents` 的 markGone-break | 16p-e1 |
-| 去掉 `checkpoint` 的 generation 判定 | 16p-a1 / c1（旧响应覆盖新状态） |
+| # | 削弱项 | 预期检出用例 |
+| --- | --- | --- |
+| M1 | 去掉 `checkpoint` 的 generation 判定 | 16p-a1 / c1（旧首屏、旧刷新覆盖 Revert 后状态） |
+| M2 | 去掉 `load()` 入口 `isGone()` 短路 | 16p-d1/d2/d3（删除后主动 load 仍发请求） |
+| M3 | 去掉 `loadMore()` 入口 `isGone()` 短路 | 16p-d1/d2/d3（删除后主动 loadMore 仍发请求） |
+| M4 | 去掉 `cancelForGone()` 的 `setRefreshing(false)` | 16p-d1（删除后 `refreshing` 卡 true） |
+| M5 | 去掉 `cancelForGone()` 的 `setLoadingMore(false)` | 16p-d3（删除后 `loadingMore` 未即时恢复） |
+| M6 | 去掉 `consumeDetailEvents` 的 markGone-break | 16p-e1（重复 delete 产生重复副作用） |
+| M7 | `handlePageEvent` 把 cleared 当 committed | 16p-f2 / f3（缓存被清、脏标记被设） |
+| M8 | 去掉 `consumeDetailEvents` 的 `invalidate` 动作 | 16p-a2（Revert 后旧缓存未失效） |
+| M9 | 去掉 `commit` 的缓存写入 | 16p-a1（强刷后缓存缺失） |
+| M10 | 联合：去掉 `cancelForGone()` 的 generation 递增 **且** 去掉两个 checkpoint 的 `isGone()` 判定 | 16p-d1（迟到响应提交并写缓存） |
+
+> M10 之所以要联合：删除后的迟到响应受「generation 失效」与「isGone 判定」
+> 双重保护，单独去掉任一层仍由另一层兜底。M10 验证两层同时失效时测试确实
+> 会失败，也说明单独 M2/M3 的检出点落在「删除后短路」而非「迟到响应」。
 
 ## 3. 本轮改动范围与边界
 
@@ -114,3 +121,116 @@
 - **不动**：`checkpoint` / `checkpointMore` 判定顺序（D4）、服务端分页与 SQL、R1/C1/C2
   口径、500 条限制、Schema/索引、搜索与 CSV/JSON 导出、脱敏规则、UI 结构与文案、
   `canLoadMore` 守卫与游标判定、缓存容量、依赖、版本号、发布流程；不新增依赖。
+
+---
+
+## 4. 实施结果
+
+执行顺序：`44f1f47`（现状分析与测试设计）→ 生产最小修复 + 16p 用例 → 全套回归 →
+本提交。基线 `14ce9ca` 的 16.1 / 16.2 代码未被改写，只在协调器上新增方法、
+把页面级事件决策最小提取为导出函数。
+
+### 4.1 变更文件清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/gui/session-detail.tsx` | 新增导出 `handlePageEvent` / `PageEventAction`（页面级事件决策）、`consumeRevertedMarker`（组件与测试共用脏标记消费）、`createDetailLoader.cancelForGone()`；组件打开详情改调 `consumeRevertedMarker()`、删除动作改调 `cancelForGone()`；注释同步 |
+| `src/gui/page.tsx` | import `handlePageEvent`；订阅循环改调它，cleared 不再 `invalidateDetailCache` / `markSessionReverted`；`schedule()` 列表刷新保留；注释对齐 |
+| `scripts/check-synthetic.ts` | 手写类型签名同步新入口；新增 16p 用例组（138 条断言语句，含参数化复用），把 `consumeDetailEvents` 动作接到真实协调器与真实缓存 |
+| `docs/TASK16_3_BRIEF.md` | 本文（现状分析、测试设计、执行结果、复审对照） |
+| `docs/STATS_AUDIT.md` | §21 审计记录 |
+
+### 4.2 两处生产修复
+
+1. **D1 cleared 语义对齐**：`page.tsx` 原先把 `session.revert.cleared` 与 `committed`
+   混在同一分支，同样清缓存 + 标脏，与 `handleDetailEvent`、15j 断言、
+   `STATS_AUDIT.md` §15 全部冲突。改为只对 `committed` 失效 + 标脏；`deleted`
+   仍按 `id ?? sessionID` 失效（缺省时全清兜底这一既有行为也保留）；cleared
+   返回空动作。页面级 `schedule()` 列表刷新是既有实时性机制，未改动。
+2. **D2 删除后加载态收尾**：`cancelForGone()` 在递增 generation 作废在途响应的
+   同时复位 `refreshing` / `loadingMore`。原实现只递增 generation，旧请求不再是
+   最新代、其 `finally` 不会清 `refreshing`，删除后刷新按钮会永久停在「刷新中…」。
+
+`checkpoint` 判定顺序未改（D4）：删除后迟到响应仍判 `stale`，功能上不提交、
+不写缓存；16p-d1/d2/d3 如实断言 `stale`，不强求 `gone`。
+
+### 4.3 关键竞态测试清单及结果
+
+`npm run test:synthetic` **通过，零失败断言**。全部由 Deferred 固定「事件处理完成 →
+旧请求返回」的顺序，重复运行结果一致。
+
+| 用例 | 覆盖 | 结果 |
+| --- | --- | --- |
+| 16p-a1 | 首屏挂起 → committed → 旧首屏晚返回 → 强刷 | 旧判 `stale`，不提交、不写过期缓存；强刷提交 Revert 后数据，视图/缓存均无被截断回合 |
+| 16p-a2 | 首屏先提交 → committed → 强刷 | Revert 立即清缓存；`commit` 保留更早分页未把截断回合拼回（D6 推论验证） |
+| 16p-b | loadMore 挂起 → committed → 旧分页 → 强刷 → 继续 loadMore | 旧分页 `stale`、游标/hasMore 不变；后续分页使用强刷后的新游标 101，无重复追加 |
+| 16p-c1 | refresh 挂起 → committed，旧刷新与强刷两种返回顺序 | 旧请求不覆盖、不污染缓存、不清强刷的 `refreshing` |
+| 16p-c2 | loadMore + Revert + 再刷新，三个旧请求先后返回 | 只有最后请求提交，提交次数 2，缓存与视图一致，两状态恢复 |
+| 16p-d1/d2/d3 | 首屏 / refresh / loadMore 挂起时删除，处理后旧请求返回 | 删除状态保持；无 `setDetail`、无缓存写入；删除后 load/loadMore 短路不再发请求；`refreshing`/`loadingMore` 即时恢复 |
+| 16p-e1 | deleted 后停止消费、重复 delete | `markGone` 1 次、失效 1 次、强刷 0 次、无新请求 |
+| 16p-e2 | Abort 后停止消费 | 真实 `consumeDetailEvents` + 真实动作，abort 后事件不产生副作用 |
+| 16p-f1 | cleared 经详情页消费循环 | 不失效、不刷新、不标删除、缓存仍在、不发请求 |
+| 16p-f2/f3 | `handlePageEvent` 页面级决策 + 真实缓存 / 脏标记 | cleared 空动作；committed 失效 + 标脏；deleted 只失效；`consumeRevertedMarker` 验证 cleared 不会导致下次打开强制刷新 |
+| 16p-e3/f4 | 他会话 Revert/Delete/cleared | 详情页与页面级都不误伤 A 的缓存、状态、请求数与脏标记 |
+
+### 4.4 缓存隔离与失效验证
+
+所有用例起始 `invalidateDetailCache()` 清空模块级 `DETAIL_CACHE`，断言全部读真实
+`readDetailCache`。Revert 立刻失效；过期响应、删除后迟到响应、cleared 都不创建或
+改写缓存条目；强刷 / 有效分页后缓存回合数与视图逐项一致；他会话事件只作用于
+自身 ID。缓存容量 4 条与淘汰策略未变，本轮未做容量压力验证。
+
+### 4.5 敏感度验证（10/10 检出，逐项恢复后全绿）
+
+| # | 削弱项 | 检出用例 | 失败断言数 |
+| --- | --- | --- | --- |
+| M1 | 去掉 `checkpoint` 的 generation 判定 | 16p-a1 | 21 |
+| M2 | 去掉 `load()` 入口 `isGone()` 短路 | 16p-d1 | 3 |
+| M3 | 去掉 `loadMore()` 入口 `isGone()` 短路 | 16p-d1 | 3 |
+| M4 | 去掉 `cancelForGone()` 的 `setRefreshing(false)` | 16p-d1 | 4 |
+| M5 | 去掉 `cancelForGone()` 的 `setLoadingMore(false)` | 16p-d3 | 1 |
+| M6 | 去掉 `consumeDetailEvents` 的 markGone-break | 16p-e1 | 5 |
+| M7 | 把 cleared 当 committed | 16p-f2 | 4 |
+| M8 | 去掉 `consumeDetailEvents` 的 `invalidate` 动作 | 16p-a2 | 9 |
+| M9 | 去掉 `commit` 的缓存写入 | 16p-a1 | 24 |
+| M10 | 联合去掉 generation 失效 + 两个 checkpoint 的 `isGone()` | 16p-d1 | 15 |
+
+**测试基础设施的一处真实修复**：M2 首次运行返回 `exit=0 / 0 failures`（假绿）。
+根因是削弱短路后「删除后主动触发的 load」会发出一个永不 resolve 的 Deferred，
+`await afterLoad` 挂起，Bun 静默退出且 `failures` 为空。已在 `deleteCase` 加兜底
+resolve（把短路失效时新出现的请求也返回，让用例跑完并报失败），修复后基线全绿、
+M2 检出 3 条失败。此项不是生产代码改动，但决定了「缺陷能否被发现」。
+
+### 4.6 本地全套验收
+
+`typecheck` ✓ · `build` ✓（vite 220.54 kB / esbuild 74.2 kB）· `test:plugin` wire ✓ ·
+`test:synthetic` ✓（10,000 回合首屏 292ms、全链 167 页 51569ms、单页最大 120 行）·
+三档规模 ✓（base 冷 71ms / 峰值 75MB，medium 380ms / 165MB，large 1532ms /
+404MB；独立预期值与三维度对账全部一致）。
+
+CI Run ID、对应 SHA 与各步骤结果以本轮交付报告为准（推送后核对）。
+
+### 4.7 覆盖层级与尚未覆盖的风险
+
+**不是组件 E2E**：未挂载 SolidJS 组件、不新增依赖。测试驱动的是组件实际调用的
+`consumeDetailEvents`、`createDetailLoader`、页面级 `handlePageEvent` 与真实
+`DETAIL_CACHE` / 脏标记，不是独立纯函数复刻。
+
+| 风险 | 原因 / 归属 |
+| --- | --- |
+| 卸载后响应仍写 `DETAIL_CACHE` | 真实存在（`onCleanup` 只 abort 事件订阅），留 TASK-16.4 |
+| Solid `onMount` / `onCleanup` 真实执行时机、真实 SDK 事件网络时序 | 无 DOM 渲染器；用可控 AsyncIterable + Deferred 替代 |
+| 页面级 `schedule()` 列表刷新、按钮 `disabled` 的 DOM 表现 | 只断言信号状态与缓存 |
+| 删除后迟到响应原因只能判 `stale` 而非 `gone` | D4，判定顺序未改（避免扩大范围），功能不受影响 |
+| 缓存淘汰压力、10,000 回合长会话性能验收 | 留 TASK-17 |
+| 事件流在 abort 后若上游迭代器长期挂起，`consumeDetailEvents` 的 Promise 不 resolve | 既有行为；abort 后已到达的事件不产生动作（16p-e2 覆盖），但迭代器结束依赖上游 `signal`，未额外引入 race 层 |
+
+## 5. 独立复审对照表
+
+| 复审关注点 | 证据位置 |
+| --- | --- |
+| 真实源码改动是否符合范围 | §4.1 文件清单；相对 `14ce9ca` 仅 5 个文件，`src/server/`、`src/contract.ts`、`package.json`、`.github/` 零改动 |
+| 事件与请求竞态是否真的被覆盖 | §4.3 用例表；`scripts/check-synthetic.ts` 16p 段（`eventHarness` 把三条生产路径接在一起） |
+| 是否存在缓存写入遗漏 | §4.4 + 16p 每个用例的 `readDetailCache` 断言 + M9（去掉缓存写入即检出） |
+| 测试是否真正驱动生产路径 | §2.1 / §4.7；`consumeDetailEvents`、`createDetailLoader`、`handlePageEvent`、`consumeRevertedMarker` 均为组件实际调用的导出函数 |
+| Actions 是否与本次 SHA 对应且全通过 | 交付报告给出 Run ID / SHA / 逐步结论；CI 工作流 `.github/workflows/ci.yml` 未改动 |

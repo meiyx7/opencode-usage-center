@@ -523,3 +523,48 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
 - **尚未覆盖**：卸载后响应写入缓存（D7，留 16.4）；Revert / Delete /
   cleared 事件竞态（留 16.3）；缓存淘汰压力与长会话 10,000 回合性能
   （留 TASK-17）。
+
+## 21. 阶段 B 第五轮（TASK-16.3：Revert / Delete / cleared 事件竞态）
+
+- **现状结论**：三层生产路径分别是页面级订阅（`page.tsx` 内联循环）、详情页
+  事件决策与消费（`handleDetailEvent` / `consumeDetailEvents`）、请求协调器
+  （`createDetailLoader`）与模块级 `DETAIL_CACHE` / 脏标记。执行前审计
+  （`docs/TASK16_3_BRIEF.md` §1）列出 6 项发现，其中两项是真实缺陷：
+  **D1** `page.tsx:2715` 把 `session.revert.cleared` 与 `committed` 混同处理，
+  同样清缓存 + 标脏，与 `handleDetailEvent`、15j 断言及本文 §15 的既有语义
+  「cleared 数据未变、不失效、不刷新」冲突，会导致下次打开详情被强制
+  `force=true` 走网络；**D2** 删除时 `markGone` 只调 `loader.invalidate()`
+  递增 generation，而 `load()` 的 `finally` 只清最新代的 `refreshing`，删除后
+  旧请求不再属于最新代 → `refreshing` 永久停在 true。其余 D3–D6 为现状正确
+  或覆盖缺口（详见简报）。
+- **最小修复**：新增导出 `handlePageEvent`（页面级事件决策，cleared 返回空动作，
+  `deleted` 保留 `id ?? sessionID` 与缺省全清兜底）、`consumeRevertedMarker`
+  （组件打开详情与测试共用脏标记消费）、`createDetailLoader.cancelForGone()`
+  （作废在途 + 复位 `refreshing` / `loadingMore`）；`page.tsx` 订阅循环改调
+  `handlePageEvent`，组件删除动作改调 `cancelForGone()`。`schedule()` 列表
+  刷新与 checkpoint 判定顺序（删除后仍判 `stale`）保持原样。
+- **16p 自动化回归**（138 条断言语句，Deferred 固定事件/响应顺序）：把真实
+  `consumeDetailEvents` 的动作接到真实 `createDetailLoader` 与真实
+  `DETAIL_CACHE`／脏标记上，覆盖 Revert×首屏（事件前/后返回）、Revert×loadMore
+  （含强刷后新游标与无重复追加）、Revert×refresh 双顺序与三请求交错、
+  Delete×首屏/refresh/loadMore（短路、无 setDetail、无缓存写入、状态即时恢复）、
+  消费循环停止与 abort、cleared 页面级与详情页级语义、他会话事件隔离。
+  `npm run test:synthetic` 零失败。
+- **测试基础设施修复**：M2 首次 mutation 出现 `exit=0 / 0 failures` 假绿——
+  削弱短路后删除后主动触发的 load 会挂在永不 resolve 的 Deferred 上，Bun
+  静默退出。已在 `deleteCase` 加兜底 resolve，修复后基线全绿、M2 检出 3 条失败。
+- **缓存验证**：每个用例起始清空真实缓存；Revert 立即失效，过期/删除/cleared
+  路径不创建也不改写条目，有效结果与视图逐项一致，他会话事件只作用于自身 ID。
+- **敏感度验证**：10 项（M1–M10，含 generation 判定、删除短路、状态复位、
+  markGone-break、cleared 语义、invalidate 动作、缓存写入、双层删除保护联合）
+  全部被对应用例检出（1–24 条失败断言不等），逐项恢复后重跑全绿。
+- **覆盖层级**：未挂载 SolidJS 组件，不新增依赖；驱动的是生产事件处理、请求
+  协调与真实缓存写入路径，**不是组件 E2E**。详见简报 §4.7。
+- **本地全套验收**：typecheck ✓ / build ✓ / test:plugin wire ✓ / test:synthetic ✓ /
+  scale base·medium·large ✓（冷 71 / 380 / 1532 ms，峰值 75 / 165 / 404 MB）。
+- **未改动**：服务端分页与 SQL、R1/C1/C2 口径、500 条限制、Schema/索引、
+  搜索与 CSV/JSON 导出、脱敏规则、UI 结构与文案、`canLoadMore` 守卫与游标
+  判定、缓存容量、依赖、版本号、发布流程。
+- **尚未覆盖**：卸载后响应写入缓存（留 16.4）；真实 Solid 生命周期与 SDK
+  网络时序；`schedule()` 列表刷新与 DOM 表现；缓存淘汰压力与 10,000 回合
+  性能（留 TASK-17）。

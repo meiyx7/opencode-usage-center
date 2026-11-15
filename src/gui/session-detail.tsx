@@ -63,6 +63,14 @@ export function markSessionReverted(sessionID: string) {
 }
 
 /**
+ * 详情页打开时消费脏标记（TASK-16.3：组件与测试共用同一生产路径）。
+ * 返回是否曾被标记；消费一次即移除，避免之后每次打开都强制走网络。
+ */
+export function consumeRevertedMarker(sessionID: string): boolean {
+  return revertDirtySessions.delete(sessionID)
+}
+
+/**
  * loadMore 游标进展判定（TASK-14 收尾提取，供测试直连）：服务端响应相对
  * 当前分页状态是否有进展。空页与「首回合 index ≥ 游标」都判为无进展——
  * 后者意味着服务端没有取到更早回合，重试只会请求同一页（无限加载）。
@@ -234,9 +242,19 @@ export function createDetailLoader(options: {
     get inFlight() {
       return inFlight
     },
-    /** 会话切换 / 删除：所有在途响应作废，且不再写入缓存。 */
+    /** 会话切换：所有在途响应作废，且不再写入缓存。 */
     invalidate() {
       generation += 1
+    },
+    /**
+     * 会话已删除（TASK-16.3）：作废在途响应，并收尾它们的加载态。
+     * 删除后 load/loadMore 会短路、不会再有新请求；在途请求也不再是最新代，
+     * 其 finally 不会清 refreshing —— 不在这里复位就会永久停在「刷新中…」。
+     */
+    cancelForGone() {
+      generation += 1
+      options.setRefreshing(false)
+      options.setLoadingMore(false)
     },
     async load(force = false, quiet = false): Promise<DetailLoadOutcome> {
       if (options.isGone()) return { committed: false, reason: "gone" }
@@ -833,6 +851,34 @@ export function handleDetailEvent(
 }
 
 /**
+ * 页面级事件决策（TASK-16.3）：从 page.tsx 订阅循环最小提取，组件与测试共用。
+ * cleared 只表示 Revert 标记被清除、回合未被截断，数据未变——不得失效缓存
+ * 或标脏，否则下次打开详情会被强制 force 刷新（不必要的详情重载）。
+ */
+export type PageEventAction = {
+  /** 失效缓存；sessionID 缺省时按既有保守兜底全清。 */
+  invalidate?: { sessionID?: string }
+  /** 标记该会话下次打开强制走网络。 */
+  reverted?: string
+}
+
+export function handlePageEvent(
+  kind: string,
+  data?: { sessionID?: string; id?: string },
+): PageEventAction {
+  if (kind === "session.revert.committed") {
+    const sessionID = data?.sessionID
+    return sessionID ? { invalidate: { sessionID }, reverted: sessionID } : {}
+  }
+  if (kind === "session.deleted") {
+    // 既有语义：id 优先；两者都缺省时 invalidateDetailCache(undefined) 全清兜底。
+    return { invalidate: { sessionID: data?.id ?? data?.sessionID } }
+  }
+  // session.revert.cleared 与其它事件：数据未变，不失效、不标脏、不重载。
+  return {}
+}
+
+/**
  * 详情页事件订阅循环（TASK-13 提取供测试）：消费 revert/deleted 事件流，
  * 按 handleDetailEvent 的决策执行动作。返回退出函数——组件 onCleanup 与
  * 测试的模拟卸载都调用它；退出后消费循环终止，不再拉取事件。
@@ -877,7 +923,7 @@ export function SessionDetailView(props: {
   const api = props.ctx.client.rpc(Usage)
   // Revert 过的会话：缓存里的回合可能包含已删除消息，视为未缓存，
   // 首次加载用 force 跳过服务端汇总 TTL。
-  const wasReverted = revertDirtySessions.delete(props.session.id)
+  const wasReverted = consumeRevertedMarker(props.session.id)
   const cachedEntry = wasReverted ? undefined : DETAIL_CACHE.get(props.session.id)
   const cached = cachedEntry?.value
   const cachedFresh = Boolean(cachedEntry && Date.now() - cachedEntry.at < DETAIL_FRESH_MS)
@@ -1019,10 +1065,11 @@ export function SessionDetailView(props: {
         invalidate: () => invalidateDetailCache(props.session.id),
         markGone: () => {
           setSessionGone(true)
-          // 递增 generation 使已发出的 in-flight 请求结果失效（TASK-13）：
+          // 作废在途响应并收尾加载态（TASK-13 建立，TASK-16.3 补状态收尾）：
           // 否则删除事件到达后，先前的 load/loadMore 响应仍会 setDetail
-          // + remember，把已删除会话的数据重新写进前端缓存。
-          loader.invalidate()
+          // + remember，把已删除会话的数据重新写进前端缓存；在途请求的
+          // refreshing 也会因为不再是最新代而永远无法恢复。
+          loader.cancelForGone()
         },
         forceReload: () => void loader.load(true),
       },

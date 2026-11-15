@@ -21,7 +21,7 @@ import {
   shortModel,
   type RangeKind,
 } from "./format"
-import { SessionDetailView, invalidateDetailCache, markSessionReverted } from "./session-detail"
+import { SessionDetailView, handlePageEvent, invalidateDetailCache, markSessionReverted } from "./session-detail"
 import { IntegrationsPage } from "./integrations"
 import { ModelsExplorer } from "./models-explorer"
 import { agentTokens, cacheHitRate, effectiveTokens, modelTokens, pointCacheHit, pointTokens, projectUsageTokens, sessionTokens } from "./metrics"
@@ -2702,8 +2702,9 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
             "session.execution.succeeded",
             "session.execution.failed",
             "session.execution.interrupted",
-            // Revert / 删除（TASK-08）：已加载回合与汇总可能引用被删除的消息，
-            // 立即失效对应会话的前端缓存；重新打开时 force 跳过服务端汇总 TTL。
+            // Revert / 删除（TASK-08 建立，TASK-16.3 对齐）：committed 与
+            // deleted 失效对应会话的前端缓存，重新打开时 force 跳过服务端汇总
+            // TTL；cleared 只清 Revert 标记、数据未变，不失效缓存也不标脏。
             "session.revert.committed",
             "session.revert.cleared",
             "session.deleted",
@@ -2711,17 +2712,15 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
           signal: controller.signal,
         })) {
           if (controller.signal.aborted) break
-          const kind = event.type as string
-          if (kind === "session.revert.committed" || kind === "session.revert.cleared") {
-            const sessionID = (event.data as { sessionID?: string } | undefined)?.sessionID
-            if (sessionID) {
-              invalidateDetailCache(sessionID)
-              markSessionReverted(sessionID)
-            }
-          } else if (kind === "session.deleted") {
-            const payload = event.data as { id?: string; sessionID?: string } | undefined
-            invalidateDetailCache(payload?.id ?? payload?.sessionID)
-          }
+          // TASK-16.3：页面级事件决策与详情页语义对齐。cleared 只表示 Revert
+          // 标记被清除、数据未变，不失效缓存也不标脏（否则下次打开详情会
+          // 被强制 force 刷新）；列表刷新 schedule() 是既有实时性机制，保留。
+          const action = handlePageEvent(
+            event.type as string,
+            event.data as { sessionID?: string; id?: string } | undefined,
+          )
+          if (action.invalidate) invalidateDetailCache(action.invalidate.sessionID)
+          if (action.reverted) markSessionReverted(action.reverted)
           schedule()
         }
       } catch {

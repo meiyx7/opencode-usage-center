@@ -1964,12 +1964,19 @@ async function main(): Promise<void> {
         generation: number
         inFlight: number
         invalidate: () => void
+        cancelForGone: () => void
         load: (force?: boolean, quiet?: boolean) => Promise<LoadOutcome>
         loadMore: () => Promise<LoadOutcome>
       }
       rememberDetail: (detail: SessionDetail) => void
       readDetailCache: (sessionID: string) => { value: SessionDetail } | undefined
       invalidateDetailCache: (sessionID?: string) => void
+      markSessionReverted: (sessionID: string) => void
+      consumeRevertedMarker: (sessionID: string) => boolean
+      handlePageEvent: (
+        kind: string,
+        data?: { sessionID?: string; id?: string },
+      ) => { invalidate?: { sessionID?: string }; reverted?: string }
     }
     expect("16m 请求协调器可导入", typeof requestModule.createDetailLoader, "function")
     expect("16m 缓存探针可导入", typeof requestModule.readDetailCache, "function")
@@ -2457,6 +2464,390 @@ async function main(): Promise<void> {
     }
     await overlapCase("16n-o1 旧分页先回", true)
     await overlapCase("16n-o2 旧分页晚回", false)
+    requestModule.invalidateDetailCache()
+
+    // 16p. Revert / Delete / cleared 事件与在途请求竞态（TASK-16.3）。
+    // 三条生产路径接在同一个 harness 上：真实 consumeDetailEvents（组件 onMount
+    // 调用它）+ 真实 createDetailLoader（组件按钮/强刷/删除动作调用它）+ 真实
+    // DETAIL_CACHE / 脏标记（页面级决策 handlePageEvent 与组件共用）。
+    // 未挂载 SolidJS 组件，覆盖层级为生产事件处理、请求协调与缓存写入，不是 E2E。
+    type Event16p = { type: string; data?: { sessionID?: string; id?: string } }
+    type Request16p = { input: FetchInput; d: Deferred<SessionDetail> }
+    const eventHarness = (id: string) => {
+      const state = {
+        detail: undefined as SessionDetail | undefined,
+        committed: [] as SessionDetail[],
+        refreshing: false,
+        loadingMore: false,
+        error: "",
+        gone: false,
+        cacheInvalidations: 0,
+        goneMarks: 0,
+        reloads: 0,
+      }
+      const requests: Request16p[] = []
+      const outcomes: Promise<LoadOutcome>[] = []
+      const loader = requestModule.createDetailLoader({
+        // 每次请求记录真实入参，并返回一个新的 Deferred：测试可任意决定返回顺序。
+        fetch: (input) => {
+          const d = deferred<SessionDetail>()
+          requests.push({ input: { ...input }, d })
+          return d.promise
+        },
+        currentSessionID: () => id,
+        isGone: () => state.gone,
+        getDetail: () => state.detail,
+        setDetail: (next) => {
+          state.detail = next
+          state.committed.push(next)
+        },
+        setRefreshing: (value) => {
+          state.refreshing = value
+        },
+        isRefreshing: () => state.refreshing,
+        setLoadingMore: (value) => {
+          state.loadingMore = value
+        },
+        isLoadingMore: () => state.loadingMore,
+        setError: (message) => {
+          state.error = message
+        },
+        describeError: (cause) => String(cause),
+        remember: requestModule.rememberDetail,
+      })
+      const load = (force = false) => {
+        const pending = loader.load(force)
+        outcomes.push(pending)
+        return pending
+      }
+      const more = () => {
+        const pending = loader.loadMore()
+        outcomes.push(pending)
+        return pending
+      }
+      // 与组件 onMount 的动作接线同构：失效真实缓存 / 置删除态并作废在途 /
+      // 强制刷新走同一个协调器。
+      const actions = {
+        invalidate: () => {
+          state.cacheInvalidations += 1
+          requestModule.invalidateDetailCache(id)
+        },
+        markGone: () => {
+          state.goneMarks += 1
+          state.gone = true
+          loader.cancelForGone()
+        },
+        forceReload: () => {
+          state.reloads += 1
+          void load(true)
+        },
+      }
+      /** 有限事件流；await 消费结束是「事件处理完成」的确定同步点（强刷仍在途）。 */
+      const feed = async (events: Event16p[], signal: AbortSignal = new AbortController().signal) => {
+        const source = async function* () {
+          for (const event of events) yield event
+        }
+        await detailModule.consumeDetailEvents(source(), signal, id, actions)
+      }
+      return { id, state, loader, requests, outcomes, actions, load, more, feed }
+    }
+    type Env16p = ReturnType<typeof eventHarness>
+    const indexes16p = (env: Env16p) => env.state.detail?.turns.map((t) => t.index).join(",") ?? ""
+    const open16p = async (env: Env16p, indexes: number[]) => {
+      const loading = env.load()
+      env.requests[0]?.d.resolve(detailOf(env.id, indexes.map(turnOf)))
+      expect(`16p 首屏 ${env.id} 提交`, (await loading).reason, "ok")
+    }
+    const committedEvent = (id: string): Event16p => ({ type: "session.revert.committed", data: { sessionID: id } })
+    const deletedEvent = (id: string): Event16p => ({ type: "session.deleted", data: { sessionID: id } })
+
+    // 16p-a1. 首屏挂起 → committed 处理完成 → 旧首屏晚返回 → 强刷返回。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const first = h.load()
+      expect("16p-a1 首屏置 refreshing", h.state.refreshing, true)
+      await h.feed([committedEvent("sess-A")])
+      expect("16p-a1 Revert 触发强刷", h.requests.length, 2)
+      expect("16p-a1 强刷带 force", h.requests[1]?.input.force ?? false, true)
+      expect("16p-a1 事件已清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      h.requests[0]!.d.resolve(detailOf("sess-A", [1, 2, 3].map(turnOf))) // Revert 前
+      expect("16p-a1 旧首屏判 stale", (await first).reason, "stale")
+      expect("16p-a1 旧首屏不提交", h.state.committed.length, 0)
+      expect("16p-a1 旧首屏不写过期缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16p-a1 旧请求不清强刷的 refreshing", h.state.refreshing, true)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf))) // Revert 后
+      expect("16p-a1 强刷提交", (await h.outcomes[1]!).reason, "ok")
+      expect("16p-a1 已截断回合未复活", indexes16p(h), "1,2")
+      expect("16p-a1 缓存为 Revert 后", cacheTurns("sess-A"), 2)
+      expect("16p-a1 只提交一次", h.state.committed.length, 1)
+      expect("16p-a1 加载态恢复", `${h.state.refreshing}/${h.state.loadingMore}`, "false/false")
+    }
+
+    // 16p-a2. 首屏先返回并提交（Revert 前数据）→ committed → 强刷。
+    // 同时验证 D6：commit 保留「更早分页」不会把被截断的末尾回合拼回来。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2, 3])
+      expect("16p-a2 Revert 前缓存 3 回合", cacheTurns("sess-A"), 3)
+      await h.feed([committedEvent("sess-A")])
+      expect("16p-a2 Revert 立即清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      h.requests[1]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      expect("16p-a2 强刷提交", (await h.outcomes[1]!).reason, "ok")
+      expect("16p-a2 已截断回合未复活", indexes16p(h), "1,2")
+      expect("16p-a2 缓存同步", cacheTurns("sess-A"), 2)
+      expect("16p-a2 提交 2 次（首屏+强刷）", h.state.committed.length, 2)
+    }
+
+    // 16p-b. loadMore 挂起 → committed → 旧分页返回 → 强刷 → 继续 loadMore。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162]) // hasMore=true / nextBefore=161
+      const oldMore = h.more()
+      expect("16p-b 旧分页请求游标", h.requests[1]?.input.beforeTurn ?? -1, 161)
+      await h.feed([committedEvent("sess-A")])
+      expect("16p-b Revert 触发强刷", h.requests.length, 3)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16p-b 旧分页判 stale", (await oldMore).reason, "stale")
+      expect("16p-b 旧分页未追加", indexes16p(h), "161,162")
+      expect("16p-b 旧游标未被改动", h.state.detail?.nextBefore ?? -1, 161)
+      expect("16p-b hasMore 未被旧页改动", h.state.detail?.hasMore ?? false, true)
+      expect("16p-b 旧分页不写缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      h.requests[2]!.d.resolve(detailOf("sess-A", [101, 102].map(turnOf))) // Revert 后首屏
+      expect("16p-b 强刷提交", (await h.outcomes[2]!).reason, "ok")
+      expect("16p-b 新状态回合", indexes16p(h), "101,102")
+      const newCursor = h.state.detail?.nextBefore ?? -1
+      expect("16p-b 新游标重置", newCursor, 101)
+      const nextMore = h.more()
+      expect("16p-b 继续 loadMore 用新游标", h.requests[3]?.input.beforeTurn ?? -1, newCursor)
+      h.requests[3]!.d.resolve(detailOf("sess-A", [99, 100].map(turnOf)))
+      expect("16p-b 新分页提交", (await nextMore).reason, "ok")
+      expect("16p-b 无重复追加", indexes16p(h), "99,100,101,102")
+      expect("16p-b 缓存与视图一致", cacheTurns("sess-A"), 4)
+      expect("16p-b 加载态恢复", `${h.state.refreshing}/${h.state.loadingMore}`, "false/false")
+    }
+
+    // 16p-c1. refresh 挂起 → committed → 旧 refresh 与强刷按两种顺序返回。
+    const revertRefreshCase = async (label: string, oldFirst: boolean) => {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2, 3])
+      const oldRefresh = h.load(true)
+      await h.feed([committedEvent("sess-A")])
+      const old = () => detailOf("sess-A", [1, 2, 3].map(turnOf))
+      const fresh = () => detailOf("sess-A", [1, 2].map(turnOf))
+      if (oldFirst) {
+        h.requests[1]!.d.resolve(old())
+        expect(`${label} 旧刷新判 stale`, (await oldRefresh).reason, "stale")
+        expect(`${label} 旧刷新不清强刷 refreshing`, h.state.refreshing, true)
+        h.requests[2]!.d.resolve(fresh())
+        expect(`${label} 强刷提交`, (await h.outcomes[2]!).reason, "ok")
+      } else {
+        h.requests[2]!.d.resolve(fresh())
+        expect(`${label} 强刷提交`, (await h.outcomes[2]!).reason, "ok")
+        h.requests[1]!.d.resolve(old())
+        expect(`${label} 旧刷新晚返回判 stale`, (await oldRefresh).reason, "stale")
+      }
+      expect(`${label} 视图为 Revert 后`, indexes16p(h), "1,2")
+      expect(`${label} 缓存为 Revert 后`, cacheTurns("sess-A"), 2)
+      expect(`${label} 提交 2 次`, h.state.committed.length, 2)
+      expect(`${label} 加载态恢复`, h.state.refreshing, false)
+      expect(`${label} 错误态为空`, h.state.error, "")
+    }
+    await revertRefreshCase("16p-c1 旧刷新先回", true)
+    await revertRefreshCase("16p-c1 旧刷新晚回", false)
+
+    // 16p-c2. loadMore 挂起 → committed → 随后又触发 refresh → 三个旧请求先后返回。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [161, 162])
+      const oldMore = h.more()
+      await h.feed([committedEvent("sess-A")])
+      const manual = h.load(true)
+      expect("16p-c2 共 4 个请求", h.requests.length, 4)
+      h.requests[1]!.d.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16p-c2 旧分页判 stale", (await oldMore).reason, "stale")
+      h.requests[2]!.d.resolve(detailOf("sess-A", [1, 2, 3].map(turnOf)))
+      expect("16p-c2 旧强刷判 stale", (await h.outcomes[2]!).reason, "stale")
+      h.requests[3]!.d.resolve(detailOf("sess-A", [1, 2].map(turnOf)))
+      expect("16p-c2 最后刷新提交", (await manual).reason, "ok")
+      expect("16p-c2 视图只有最后结果", indexes16p(h), "1,2")
+      expect("16p-c2 缓存只有最后结果", cacheTurns("sess-A"), 2)
+      expect("16p-c2 提交 2 次（首屏+最后刷新）", h.state.committed.length, 2)
+      expect("16p-c2 加载态恢复", `${h.state.refreshing}/${h.state.loadingMore}`, "false/false")
+      expect("16p-c2 错误态为空", h.state.error, "")
+    }
+
+    // 16p-d1/d2/d3. 首屏 / refresh / loadMore 挂起时删除，事件处理完后旧请求返回。
+    const deleteCase = async (label: string, pending: "load" | "refresh" | "more") => {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      let oldRequest: Promise<LoadOutcome>
+      if (pending === "refresh") await open16p(h, [1, 2])
+      if (pending === "more") await open16p(h, [161, 162])
+      if (pending === "load") oldRequest = h.load()
+      else if (pending === "refresh") oldRequest = h.load(true)
+      else oldRequest = h.more()
+      const beforeRequests = h.requests.length
+      const beforeCommitted = h.state.committed.length
+      const beforeDetail = indexes16p(h)
+      await h.feed([deletedEvent("sess-A")])
+      expect(`${label} 删除状态置位`, h.state.gone, true)
+      expect(`${label} 删除清缓存`, String(requestModule.readDetailCache("sess-A")), "undefined")
+      // 删除事件一处理完，加载态就必须收尾（不必等迟到响应）——D2 回归点。
+      expect(`${label} 删除即恢复 refreshing`, h.state.refreshing, false)
+      expect(`${label} 删除即恢复 loadingMore`, h.state.loadingMore, false)
+      // 删除后主动触发必须短路，不再发请求。兜底 resolve 新出现的请求：
+      // 若短路被削弱，测试会跑完并报失败，而不是挂在 Deferred 上静默假绿退出。
+      const afterLoad = h.load(true)
+      const afterMore = h.more()
+      for (let i = beforeRequests; i < h.requests.length; i++) {
+        h.requests[i]!.d.resolve(detailOf("sess-A", [1].map(turnOf)))
+      }
+      expect(`${label} 删除后不再发请求`, h.requests.length, beforeRequests)
+      expect(`${label} 删除后 load 短路`, (await afterLoad).reason, "gone")
+      expect(`${label} 删除后 loadMore 短路`, (await afterMore).reason, "gone")
+      const late = h.requests[beforeRequests - 1]!
+      late.d.resolve(detailOf("sess-A", pending === "more" ? [159, 160].map(turnOf) : [1, 2, 3].map(turnOf)))
+      const outcome = await oldRequest
+      expect(`${label} 迟到响应不提交`, outcome.committed, false)
+      // D4：删除靠 generation 失效，旧响应判 stale；功能上不提交、不写缓存。
+      expect(`${label} 迟到响应判过期`, outcome.reason, "stale")
+      expect(`${label} 迟到响应不调用 setDetail`, h.state.committed.length, beforeCommitted)
+      expect(`${label} 迟到响应不写缓存`, String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect(`${label} 已有详情不被覆盖`, indexes16p(h), beforeDetail)
+      expect(`${label} 删除状态不被覆盖`, h.state.gone, true)
+      expect(`${label} 迟到响应后加载态仍恢复`, `${h.state.refreshing}/${h.state.loadingMore}`, "false/false")
+    }
+    await deleteCase("16p-d1 首屏挂起删除", "load")
+    await deleteCase("16p-d2 刷新挂起删除", "refresh")
+    await deleteCase("16p-d3 分页挂起删除", "more")
+
+    // 16p-e1. deleted 后停止消费：重复 delete 与后续 committed 都不再产生副作用。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      await h.feed([deletedEvent("sess-A"), deletedEvent("sess-A"), committedEvent("sess-A")])
+      expect("16p-e1 markGone 恰好 1 次", h.state.goneMarks, 1)
+      expect("16p-e1 缓存失效恰好 1 次", h.state.cacheInvalidations, 1)
+      expect("16p-e1 删除后不触发强刷", h.state.reloads, 0)
+      expect("16p-e1 删除后不再发请求", h.requests.length, 1)
+      expect("16p-e1 删除状态保持", h.state.gone, true)
+    }
+
+    // 16p-e2. Abort 后停止消费循环（真实 consumeDetailEvents + 真实动作）。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      const controller = new AbortController()
+      const source = async function* () {
+        yield committedEvent("sess-A")
+        controller.abort()
+        yield committedEvent("sess-A")
+        yield deletedEvent("sess-A")
+      }
+      await detailModule.consumeDetailEvents(source(), controller.signal, "sess-A", h.actions)
+      expect("16p-e2 abort 后强刷恰好 1 次", h.state.reloads, 1)
+      expect("16p-e2 abort 后缓存失效恰好 1 次", h.state.cacheInvalidations, 1)
+      expect("16p-e2 abort 后不标记删除", h.state.gone, false)
+      expect("16p-e2 abort 生效", controller.signal.aborted, true)
+    }
+
+    // 16p-f1. cleared 经详情页消费循环：不失效、不刷新、不标记删除、不动缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      expect("16p-f1 事件前缓存 2 回合", cacheTurns("sess-A"), 2)
+      await h.feed([{ type: "session.revert.cleared", data: { sessionID: "sess-A" } }])
+      expect("16p-f1 cleared 缓存仍在", String(requestModule.readDetailCache("sess-A")) !== "undefined", true)
+      expect("16p-f1 cleared 缓存仍是 2 回合", cacheTurns("sess-A"), 2)
+      expect("16p-f1 cleared 不失效缓存", h.state.cacheInvalidations, 0)
+      expect("16p-f1 cleared 不刷新", h.state.reloads, 0)
+      expect("16p-f1 cleared 不标记删除", h.state.gone, false)
+      expect("16p-f1 cleared 不发请求", h.requests.length, 1)
+    }
+
+    // 16p-f2. 页面级 handlePageEvent 决策 + 真实缓存（D1 回归点）。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      // 与 page.tsx 订阅循环同一份决策与动作接线。
+      const applyPageEvent = (kind: string, data?: { sessionID?: string; id?: string }) => {
+        const action = requestModule.handlePageEvent(kind, data)
+        if (action.invalidate) requestModule.invalidateDetailCache(action.invalidate.sessionID)
+        if (action.reverted) requestModule.markSessionReverted(action.reverted)
+        return action
+      }
+      const cleared = applyPageEvent("session.revert.cleared", { sessionID: "sess-A" })
+      expect("16p-f2 cleared 决策为空", Object.keys(cleared).length, 0)
+      expect("16p-f2 cleared 不失效缓存", cacheTurns("sess-A"), 2)
+      expect("16p-f2 cleared 不标脏", requestModule.consumeRevertedMarker("sess-A"), false)
+      const committed = applyPageEvent("session.revert.committed", { sessionID: "sess-A" })
+      expect("16p-f2 committed 失效指定会话", committed.invalidate?.sessionID ?? "", "sess-A")
+      expect("16p-f2 committed 清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16p-f2 committed 标脏", requestModule.consumeRevertedMarker("sess-A"), true)
+      expect("16p-f2 脏标记消费一次后清除", requestModule.consumeRevertedMarker("sess-A"), false)
+      requestModule.rememberDetail(detailOf("sess-A", [1, 2].map(turnOf)))
+      const deleted = applyPageEvent("session.deleted", { id: "sess-A" })
+      expect("16p-f2 deleted 失效指定会话", deleted.invalidate?.sessionID ?? "", "sess-A")
+      expect("16p-f2 deleted 清缓存", String(requestModule.readDetailCache("sess-A")), "undefined")
+      expect("16p-f2 deleted 不标脏", requestModule.consumeRevertedMarker("sess-A"), false)
+      expect(
+        "16p-f2 其它事件决策为空",
+        Object.keys(applyPageEvent("session.usage.updated", { sessionID: "sess-A" })).length,
+        0,
+      )
+    }
+
+    // 16p-f3. cleared 不导致下次打开详情被强制刷新（组件同一份脏标记消费）。
+    {
+      requestModule.invalidateDetailCache()
+      const apply = (kind: string, id: string) => {
+        const action = requestModule.handlePageEvent(kind, { sessionID: id })
+        if (action.invalidate) requestModule.invalidateDetailCache(action.invalidate.sessionID)
+        if (action.reverted) requestModule.markSessionReverted(action.reverted)
+      }
+      apply("session.revert.cleared", "sess-C")
+      expect("16p-f3 cleared 后下次打开不强制刷新", requestModule.consumeRevertedMarker("sess-C"), false)
+      apply("session.revert.committed", "sess-C")
+      expect("16p-f3 committed 后下次打开强制刷新", requestModule.consumeRevertedMarker("sess-C"), true)
+      expect("16p-f3 强制刷新标记只消费一次", requestModule.consumeRevertedMarker("sess-C"), false)
+    }
+
+    // 16p-e3/f4. 其他会话的 Revert/Delete/cleared 不误伤当前会话。
+    {
+      requestModule.invalidateDetailCache()
+      const h = eventHarness("sess-A")
+      await open16p(h, [1, 2])
+      requestModule.rememberDetail(detailOf("sess-B", [1].map(turnOf)))
+      const beforeA = cacheTurns("sess-A")
+      const beforeB = cacheTurns("sess-B")
+      await h.feed([
+        committedEvent("sess-B"),
+        { type: "session.revert.cleared", data: { sessionID: "sess-B" } },
+        deletedEvent("sess-B"),
+      ])
+      expect("16p-e3 他会话事件不刷新", h.state.reloads, 0)
+      expect("16p-e3 他会话事件不标记删除", h.state.gone, false)
+      expect("16p-e3 他会话事件不失效缓存", h.state.cacheInvalidations, 0)
+      expect("16p-e3 他会话事件不发请求", h.requests.length, 1)
+      expect("16p-e3 A 缓存不变", cacheTurns("sess-A"), beforeA)
+      expect("16p-e3 B 缓存不变（详情页只管自己）", cacheTurns("sess-B"), beforeB)
+      // 页面级：他会话事件按自身 ID 处理，仍不得误伤 A。
+      const actionB = requestModule.handlePageEvent("session.revert.committed", { sessionID: "sess-B" })
+      if (actionB.invalidate) requestModule.invalidateDetailCache(actionB.invalidate.sessionID)
+      if (actionB.reverted) requestModule.markSessionReverted(actionB.reverted)
+      expect("16p-f4 页面级他会话失效只清 B", String(requestModule.readDetailCache("sess-B")), "undefined")
+      expect("16p-f4 页面级他会话不误伤 A 缓存", cacheTurns("sess-A"), beforeA)
+      expect("16p-f4 页面级他会话不标脏 A", requestModule.consumeRevertedMarker("sess-A"), false)
+      expect("16p-f4 页面级他会话标脏 B", requestModule.consumeRevertedMarker("sess-B"), true)
+    }
     requestModule.invalidateDetailCache()
   }
 
