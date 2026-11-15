@@ -219,11 +219,12 @@ function main(): void {
   expect("same-count content change invalidates cache", p1?.cost ?? -1, 12.98, 1e-6)
   mutated.close()
 
-  // 11c. 同路径重建 + 相同文件大小 + 相同内容指纹的数据库（评审 P1）。
-  // 构造技巧：重建库用同一 seedMain 造（相同的 600 条消息、相同的 ID 长度、
-  // 相同的时间戳），只把 cost 从 0.01 换成 0.09——等长字符串使文件大小一致，
-  // 相同的 count 与 Σtime_updated 使内容指纹一致。此时旧缓存能否被误读
-  // 完全取决于数据库身份键里的 dev/inode。
+  // 11c. 同路径重建 + 相同文件大小 + 相同内容指纹的数据库（评审二轮 P1、
+  // 三轮 P1-3）。构造技巧：重建库用同一 seedMain 造（相同的 600 条消息、
+  // 相同的 ID 长度、相同的时间戳），只把 cost 从 0.01 换成 0.09——等长
+  // 字符串使文件大小一致，相同的 count 与 Σtime_updated 使内容指纹一致。
+  // 身份键（path:dev:ino）里只有 inode 不同：重建库绝不能读到旧库缓存。
+  // 这同时覆盖三轮移除 size 后的语义——size/指纹撞车时 inode 是唯一防线。
   {
     // 先用旧库把磁盘缓存填上（走一遍冷启动）
     const warmup = new UsageStore(file, () => {})

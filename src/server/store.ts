@@ -844,17 +844,22 @@ export class UsageStore {
   ) {}
 
   /**
-   * 磁盘缓存目录。scope 之外再叠加数据库身份（路径 + dev + inode + 大小）：
+   * 磁盘缓存目录。scope 之外再叠加数据库身份（路径 + dev + inode）：
    * 不同数据库（换机器、重建 DB、测试里同一目录下的多个临时库）的逐日
    * 聚合不同但文件名相同，不加隔离会互相污染——聚合数据错乱且指纹可能
-   * 恰好一致而无法察觉。dev/inode 参与散列是因为重建后的同一路径是新文件
-   * （新 inode）；只有大小参与时，同路径重建出恰好同大小的库仍会碰撞。
+   * 恰好一致而无法察觉。inode 参与散列是因为重建后的同一路径是新文件
+   * （新 inode），身份随之改变。
+   *
+   * 不用 size：数据库每次写入都会增长，size 参与身份会让 key 随正常使用
+   * 不断漂移，历史逐日缓存整目录作废（评审三轮 P1-3 在真实库上复现：
+   * 一天内出现孤儿目录、30 个文件重算）。重建识别交给 inode；内容修改
+   * 由逐日指纹（count|Σtime_updated）负责检测。
    */
   private dbCacheKey(): string {
     try {
       const st = statSync(this.path)
       return createHash("sha1")
-        .update(`${this.path}:${st.dev}:${st.ino}:${st.size}`)
+        .update(`${this.path}:${st.dev}:${st.ino}`)
         .digest("hex")
         .slice(0, 12)
     } catch {

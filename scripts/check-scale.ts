@@ -144,11 +144,19 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
   }
 
   for (let s = 0; s < scale.sessions; s++) {
-    // 会话起点从现在往回铺满 months 个月；部分会话无项目（NULL，约 6%）
+    // 会话起点从现在往回铺满 months 个月；部分会话无项目（NULL，约 6%）。
+    // 时间安全边界（评审三轮 P1-2）：消息在起点上正向偏移，最大到起点 +
+    // 6×(60s+1h) ≈ 6.1 小时；起点若贴近当前时刻，消息会落在未来。store 对
+    // 「今天」聚合整个本地日桶，同日的未来消息侥幸仍被计入，但跨过本地
+    // 午夜的消息会落在查询窗口之外，与全量累计的 expected 失配。起点整体
+    // 回退安全边界（最大偏移 + 36 小时天界余量），保证所有消息 ≤ 昨天，
+    // 任何运行时刻都与统计范围对齐；边界不含随机量，三档数据仍可复现。
+    const MAX_MSG_OFFSET = 6 * (60_000 + 3_600_000)
+    const SAFE_MARGIN = MAX_MSG_OFFSET + 36 * 3_600_000
     const projectless = s % 17 === 0
     const projectID = projectless ? null : projects[s % projects.length]
     const span = scale.months * 30 * DAY
-    const start = Date.now() - rand() * span
+    const start = Date.now() - SAFE_MARGIN - rand() * (span - SAFE_MARGIN)
     const msgCount = 2 + Math.floor(rand() * 6) // 2-7 条消息
     let last = start
     let sessionCost = 0
@@ -178,6 +186,9 @@ function buildDb(scale: ScaleCase, dir: string): { file: string; messages: numbe
           })
       batch.push([`m${s}-${m}`, `s${s}`, at, at, payload])
       messages += 1
+      // 生成期自检（评审 P1-2）：任何未来消息都会破坏 expected 与统计范围
+      // 的一致性，直接失败而不是让 worker 对账时才暴露。
+      if (at > Date.now()) throw new Error(`生成消息落在未来：${new Date(at).toISOString()}（会话 s${s} 消息 ${m}）`)
       // 独立预期值：与聚合的 num() 语义一致——缺失字段按 0
       const eCost = missing ? 0 : cost
       const eInput = missing ? 0 : input

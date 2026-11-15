@@ -40,7 +40,9 @@ const toBytes = (maxRss: number): number => (process.platform === "darwin" ? max
 // 用「统计前 maxRSS − 统计后 maxRSS」的高水位差，而不是与当前 RSS 相减——
 // 若运行时启动阶段曾冲高，后者会把启动峰值误算成本次统计的增量。
 const maxRssNow = () => toBytes(process.resourceUsage().maxRSS)
-const rssNow = () => toBytes(process.memoryUsage.rss())
+// 注意：memoryUsage.rss() 本身已返回 bytes，绝不能再过 toBytes()——
+// 那会在 Linux 下重复乘 1024（评审三轮 P1-1，CI 曾出现 48284MB 的假基线）。
+const rssNow = () => process.memoryUsage.rss()
 const baselineRss = rssNow()
 const baselineHigh = maxRssNow()
 
@@ -137,6 +139,14 @@ const seriesWithData = cold.series.filter((p) => p.requests > 0).length
 expect("activeDays matches series", cold.totals.activeDays, seriesWithData)
 // 未知归属桶保留（无项目会话约 6% 必然产生空桶）
 expect("projectless bucket kept", cold.projectUsage.some((p) => p.projectID === ""), true)
+
+// 内存单位断言（评审三轮 P1-1）：rss()/maxRSS 两个口径混用曾是回归源。
+// maxRSS 是生命周期峰值，必然 ≥ 任意时刻的当前 RSS；两者都已是 bytes，
+// 若有人再把 rss 过一遍 toBytes（Linux ×1024），这些不变式会立即破裂。
+expect("memory: baselineRss in bytes range", baselineRss > 0 && baselineRss < 16 * 1024 ** 3, true)
+expect("memory: baselineHigh >= baselineRss", baselineHigh >= baselineRss, true)
+expect("memory: peakHigh >= baselineHigh", peakHigh >= baselineHigh, true)
+expect("memory: stageDelta sane", stageDelta >= 0 && stageDelta < 16 * 1024 ** 3, true)
 
 const result = {
   failures,

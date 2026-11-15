@@ -214,3 +214,26 @@ Sessions 时，用户点的是「prov-x / deepseek-v4.1-flash」这一行，但�
 - **规模测试命令**（二轮 P1）：`npm run test:scale -- medium` 实际会把 medium
   追加在 base 后面（argv[2] 仍是 base）。新增独立脚本 `test:scale:medium` /
   `test:scale:large` / `test:scale:all`，CI 注释同步更正。
+
+## 12. 评审三轮收尾记录（509c6ba 复审意见）
+
+- **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，
+  一轮实现误让它再过一遍 `toBytes`，Linux 下重复 ×1024（CI 日志出现 48284MB
+  的假基线）。修复：`rssNow()` 直接返回 rss()，仅 `maxRSS` 走平台换算。
+  新增 4 条内存单位断言（bytes 量级上界、高水位单调不减、增量非负）；
+  敏感度验证：模拟 Linux 重复换算形态时断言立即失败（baselineRss 越界 +
+  stageDelta 异常），exit 1。
+- **生成数据时间边界**（三轮 P1-2）：会话起点分布 `[now-span, now]`、消息
+  正向偏移最多 ≈6.1 小时，起点贴近当前时刻的消息会落在未来。真实种子下
+  实测：Medium 1 条、Large 7 条未来消息（Base 0）——当前未失配是因为
+  store 对「今天」聚合整个本地日桶，未来但同日的消息侥幸仍被计入；跨过
+  本地午夜就会与全量累计的 expected 失配。修复：起点整体回退安全边界
+  （最大偏移 + 36 小时天界余量），保证所有消息 ≤ 昨天；生成期加自检，
+  任何未来消息直接抛错。三档数据仍可复现（边界不含随机量）。
+- **缓存身份键移除 size**（三轮 P1-3，评估后实施）：size 参与身份让 DB 随
+  正常写入增长时 key 不断漂移——真实库已复现（一天内出现孤儿目录
+  `fca152fd6d7e-all`、30 个逐日缓存文件作废重算）。身份键改为
+  `path:dev:ino`：重建识别交给 inode，内容修改交给逐日指纹，size 不再
+  提供增量信息。11c 回归的构造（同大小 + 同指纹 + 不同 inode）恰好成为
+  新键的最强验证；敏感度验证：退化为 path-only（无 inode）时 11c 失败
+  （读到 $15.98 脏混合值）。mtime 继续排除（每次写库都变，会打穿缓存）。
