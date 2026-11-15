@@ -1492,6 +1492,13 @@ export class UsageStore {
         output: num(r.outTok),
       })
     }
+    // 请求数按 assistant 消息条数（含坏 JSON 行）：旧实现里 parseJSON 失败的
+    // 消息仍会构造一个全 0 的请求并计入 requestCount。费用/Token/时延等聚合
+    // 已由 json_valid 过滤后的 aggRows 承担（坏 JSON 行贡献 0，语义一致），
+    // 但请求数不能因此少算。
+    const requestCountRow = db
+      .query<Row>("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'assistant'")
+      .get(sessionID)
 
     // 回合边界统计：回合 = 一条 user 消息开启的群组；头部 assistant 群组
     //（无前置 user）合成「会话开始」回合，同样占一个回合序号。
@@ -1560,7 +1567,7 @@ export class UsageStore {
       tokens: { input, output, reasoning, cacheRead, cacheWrite },
       totalTurns,
       promptCount: userCount,
-      requestCount: aggRows.length,
+      requestCount: num(requestCountRow?.n),
       toolCount,
       errorCount,
       ttftP50: latency.ttftP50,
@@ -1651,7 +1658,7 @@ export class UsageStore {
     }
     const boundaryRows = db
       .query<Row>(
-        `SELECT seq, time_created FROM session_message
+        `SELECT seq FROM session_message
          WHERE session_id = ? AND type = 'user' AND seq < ?
          ORDER BY seq DESC LIMIT ?`,
       )
@@ -1659,16 +1666,22 @@ export class UsageStore {
     // 页起点：本页最多 limit 个回合。boundaryRows 倒序取 limit+1 个：前 limit 个
     // 属于本页；第 limit+1 个说明更早还有回合（供 hasMore 判断），它及其之前的
     // 消息不属于本页。pageStartSeq = 第 limit 个边界（倒序）的 seq —— 若不足
-    // limit 个边界，则本页一直覆盖到会话头（含头部合成回合）。
-    const pageStartSeq = boundaryRows.length > limit ? num(boundaryRows[limit - 1]?.seq) : 0
-    // 本页回合数：页内 user 边界数 +（pageStartSeq 覆盖头部群组时的 1）。
-    // 旧实现的终止语义：beforeTurn=1 时 index<1 无回合 → 空页。cursor 是
-    // 头部合成回合时（cursorSeq = headSeq+1 且无 user 边界 < cursorSeq）同样
-    // 只含合成回合本身——与旧实现的 [合成] 终止页一致。
+    // limit 个边界，则本页一直覆盖到会话头（可能含头部合成回合）。
     const headRow = db
       .query<Row>("SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
       .get(sessionID)
     const headIsAssistant = text(headRow?.type) === "assistant"
+    // 页起点：覆盖到头（pageStartSeq = 0）时页含「边界数 + 头部合成回合」；
+    // 超过 limit 时把头部让位给下一页——pageStartSeq 抬到第 limit 个边界
+    //（区间含端点，本页恰好 limit 个回合），头部回合由下一页（更小的游标）
+    // 覆盖。这与旧实现的尾部切片行为一致：61 回合的会话首页装 index 2..61，
+    // 翻页终止页只剩 index 1。
+    const pageStartSeq =
+      boundaryRows.length > limit
+        ? num(boundaryRows[limit - 1]?.seq)
+        : headIsAssistant && boundaryRows.length === limit
+          ? num(boundaryRows[limit - 1]?.seq)
+          : 0
     const pageCount = Math.min(boundaryRows.length, limit) + (pageStartSeq === 0 && headIsAssistant ? 1 : 0)
 
     // 2) 只读本页消息（含 data 正文）并重放现有切分逻辑。

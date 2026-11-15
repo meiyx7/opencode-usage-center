@@ -816,7 +816,8 @@ function main(): void {
     expect("big totalTurns (218 user + 合成头 + 尾部无回复)", first.totalTurns, 220)
     expect("big promptCount", first.promptCount, 219)
     expect("big cost = 独立预期", first.cost, wantBigCost, 1e-9)
-    expect("big requestCount (218+1 头部+1 双assistant-1 坏JSON)", first.requestCount, 219)
+    // 坏 JSON 行仍计入请求数（复审 P1）：218 正常 + 头部 1 + 双发 1 = 220
+    expect("big requestCount 含坏 JSON 行", first.requestCount, 220)
     expect("big toolCount", first.toolCount, 3)
     // 工具错误 2（头 t-head + i=20 的 t2）；i=20 的 data.error 字段不存在
     expect("big errorCount = tool errors", first.errorCount, 2)
@@ -876,6 +877,132 @@ function main(): void {
     expect("cache: forced data identical", forced.cost, first.cost, 1e-9)
     bigStore.close()
     require("node:fs").rmSync(bigPageFile)
+
+    // 15f. 页大小边界（复审 P1）：59/60/61 个 user 回合 × 有无头部合成回合，
+    // 首屏与连续翻页的回合数、序号、hasMore、nextBefore 全断言。
+    const edgeFiles: string[] = []
+    const edgeCase = (label: string, userTurns: number, headSynthetic: boolean) => {
+      const file = `${process.env.TMPDIR ?? "/tmp"}/uc-edge-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+      edgeFiles.push(file)
+      const db = new Database(file)
+      db.exec(`
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+        CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+        CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+        CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+      `)
+      db.exec(`INSERT INTO project VALUES ('pe', NULL, '/tmp/edge', 1)`)
+      db.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('ed1', 'pe', ?, 1, 1)").run(label)
+      const msg = db.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'ed1', ?, ?, ?, ?, ?)")
+      let seq = 0
+      const assistantPayload = JSON.stringify({ cost: 0.01, model: { providerID: "p", id: "m" }, agent: "b", tokens: {}, time: { created: 1, completed: 10 } })
+      if (headSynthetic) {
+        msg.run(`e${seq}`, "assistant", ++seq, 1, 1, assistantPayload)
+      }
+      for (let i = 0; i < userTurns; i++) {
+        msg.run(`e${seq}`, "user", ++seq, i, i, JSON.stringify({ text: `q${i}` }))
+        msg.run(`e${seq}`, "assistant", ++seq, i, i, assistantPayload)
+      }
+      db.close()
+      const store = new UsageStore(file, () => {})
+      const total = userTurns + (headSynthetic ? 1 : 0)
+      const head = store.sessionDetail({ sessionID: "ed1", force: true })
+      expect(`${label}: totalTurns`, head.totalTurns, total)
+      expect(`${label}: 首页回合数 ≤ 60`, head.turns.length <= 60, true)
+      expect(`${label}: 首页回合数`, head.turns.length, Math.min(total, 60))
+      // 连续翻页：回合数守上限、序号连续、无重复
+      let cursor: number | undefined
+      const seen: number[] = []
+      let pageCount = 0
+      for (;;) {
+        const page = store.sessionDetail({ sessionID: "ed1", beforeTurn: cursor, limit: 60, force: true })
+        pageCount += 1
+        expect(`${label}: 每页回合数 ≤ 60`, page.turns.length <= 60, true)
+        for (const turn of page.turns) seen.push(turn.index)
+        if (!page.hasMore) break
+        cursor = page.nextBefore
+        expect(`${label}: nextBefore 合法`, cursor! >= 2 && cursor! <= total, true)
+      }
+      const sorted = [...seen].sort((a, b) => a - b)
+      expect(`${label}: 翻页序号连续 1..${total} 无重复`, sorted.join(",") === sorted.map((_, i) => i + 1).join(","), true)
+      expect(`${label}: 翻页总数`, seen.length, total)
+      store.close()
+      require("node:fs").rmSync(file)
+    }
+    edgeCase("边界 59 user 无头", 59, false)
+    edgeCase("边界 60 user 无头", 60, false)
+    edgeCase("边界 61 user 无头", 61, false)
+    edgeCase("边界 59 user 有头", 59, true)
+    edgeCase("边界 60 user 有头", 60, true)
+    edgeCase("边界 61 user 有头", 61, true)
+
+    // 15g. 10,000 回合长会话（复审 P2 → 阶段 A 补充）：首屏只解析当前页，
+    // 全链翻页完整，汇总与独立预期对账，记录各阶段耗时。
+    const hugeFile = `${process.env.TMPDIR ?? "/tmp"}/uc-huge-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbHuge = new Database(hugeFile)
+    dbHuge.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    dbHuge.exec(`INSERT INTO project VALUES ('ph', NULL, '/tmp/huge', 1)`)
+    dbHuge.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('hg1', 'ph', '万回合', 1, 1)").run()
+    const hugeMsg = dbHuge.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'hg1', ?, ?, ?, ?, ?)")
+    const hugeTurns = 10_000
+    const hugePayload = JSON.stringify({ cost: 0.001, model: { providerID: "prov-x", id: "model-a" }, agent: "build", tokens: { input: 30, output: 15, cache: { read: 10, write: 2 } }, time: { created: 1, streamed: 100, completed: 900 } })
+    dbHuge.transaction(() => {
+      for (let i = 0; i < hugeTurns; i++) {
+        hugeMsg.run(`h${i}u`, "user", i * 2 + 1, i, i, JSON.stringify({ text: `回合 ${i}` }))
+        hugeMsg.run(`h${i}a`, "assistant", i * 2 + 2, i, i, hugePayload)
+      }
+    })()
+    dbHuge.close()
+    const hugeStore = new UsageStore(hugeFile, () => {})
+    const tBuild = performance.now()
+    const hugeFirst = hugeStore.sessionDetail({ sessionID: "hg1", force: true })
+    const tFirst = performance.now()
+    expect("huge totalTurns", hugeFirst.totalTurns, hugeTurns)
+    expect("huge 首屏回合数 = 60", hugeFirst.turns.length, 60)
+    const hugeReads = { messages: 0, assistant: 0 }
+    ;(globalThis as { __ucPageReads?: typeof hugeReads }).__ucPageReads = hugeReads
+    const beforeFirst = hugeReads.messages
+    hugeStore.sessionDetail({ sessionID: "hg1", force: true })
+    const firstReads = hugeReads.messages - beforeFirst
+    expect("huge 首屏读取消息数 ≤ ~125（非 20000）", firstReads <= 130, true)
+    let hugeCursor: number | undefined
+    let hugeLoaded = 0
+    let hugeCost = 0
+    let hugePages = 0
+    const readPerFirst = firstReads
+    let maxPageReads = readPerFirst
+    for (;;) {
+      const before = hugeReads.messages
+      const page = hugeStore.sessionDetail({ sessionID: "hg1", beforeTurn: hugeCursor, limit: 60, force: true })
+      const pageReads = hugeReads.messages - before
+      maxPageReads = Math.max(maxPageReads, pageReads)
+      hugeLoaded += page.turns.length
+      for (const turn of page.turns) hugeCost += turn.cost
+      hugePages += 1
+      if (!page.hasMore) break
+      hugeCursor = page.nextBefore
+    }
+    ;(globalThis as { __ucPageReads?: typeof hugeReads }).__ucPageReads = undefined
+    const tAll = performance.now()
+    expect("huge 翻页总回合", hugeLoaded, hugeTurns)
+    expect("huge Σ页cost = 汇总", hugeCost, hugeFirst.cost, 1e-9)
+    expect("huge 汇总 = 独立预期", hugeFirst.cost, hugeTurns * 0.001, 1e-9)
+    expect("huge 每页读取 ≤ 130 行（真分页，全会话 20000 行）", maxPageReads <= 130, true)
+    console.log(
+      `[长会话] ${hugeTurns} 回合: 首屏 ${(tFirst - tBuild).toFixed(0)}ms（读取 ${readPerFirst} 行）、全链 ${hugePages} 页 ${(tAll - tFirst).toFixed(0)}ms、单页最大读取 ${maxPageReads} 行`,
+    )
+    hugeStore.close()
+    require("node:fs").rmSync(hugeFile)
   }
 
   if (failures.length > 0) {
