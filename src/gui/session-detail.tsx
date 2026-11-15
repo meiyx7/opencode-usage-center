@@ -52,16 +52,16 @@ export function markSessionReverted(sessionID: string) {
   revertDirtySessions.add(sessionID)
 }
 
-/** Merge two turn pages; later arguments win when a turn index overlaps. */
-function mergeTurns(first: readonly SessionTurn[], second: readonly SessionTurn[]): SessionTurn[] {
+/** Merge two turn pages; later arguments win when a turn index overlaps. 导出供 15k 数据流回归。 */
+export function mergeTurns(first: readonly SessionTurn[], second: readonly SessionTurn[]): SessionTurn[] {
   const map = new Map<number, SessionTurn>()
   for (const turn of first) map.set(turn.index, turn)
   for (const turn of second) map.set(turn.index, turn)
   return [...map.values()].sort((a, b) => a.index - b.index)
 }
 
-/** Keep loaded older pages when a refresh only returns the latest page. */
-function withTurns(detail: SessionDetail, turns: SessionTurn[]): SessionDetail {
+/** Keep loaded older pages when a refresh only returns the latest page. 导出供 15k 数据流回归。 */
+export function withTurns(detail: SessionDetail, turns: SessionTurn[]): SessionDetail {
   const hasMore = turns.length > 0 && turns[0]!.index > 1
   return { ...detail, turns, hasMore, nextBefore: hasMore ? turns[0]!.index : 0 }
 }
@@ -768,6 +768,15 @@ export function SessionDetailView(props: {
         const empty = { ...current, hasMore: false, nextBefore: 0 }
         setDetail(empty)
         remember(empty)
+        return
+      }
+      // 游标无进展防护（TASK-14）：服务端返回的第一回合 index 与本页游标相同，
+      // 意味着没有取到更早的回合——再合并会原样返回，用户再点仍请求同一页
+      //（无限加载）。判定无进展时直接终止分页。
+      if (next.turns[0]!.index >= current.nextBefore) {
+        const stalled = { ...withTurns(next, mergeTurns(next.turns, current.turns)), hasMore: false, nextBefore: 0 }
+        setDetail(stalled)
+        remember(stalled)
         return
       }
       const merged = withTurns(next, mergeTurns(next.turns, current.turns))

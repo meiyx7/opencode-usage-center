@@ -325,6 +325,23 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
   invalidate=2 / forceReload=1 / markGone=1；无限事件源 + 卸载 abort 验证
   消费终止。敏感度：移除 markGone-break → 计数断言立即失败。
 
+## 17. 阶段 B 第一轮（TASK-14：前端分页数据流核查与适配）
+
+- **核查结论**：首屏/加载更多均只处理服务端返回页（无全量解析路径）；
+  `mergeTurns` 以 index 为键合并（后者胜出）+ 升序输出——重复回合天然去重、
+  顺序不反转；`openTurns` 展开状态以全局稳定 index 为键，加载更多后保留；
+  搜索（`visibleTurns`）与导出（CSV/JSON）同源已加载回合；文案已标明
+  「匹配 X / 已加载 Y」。
+- **游标无进展防护**（本轮唯一代码修正）：loadMore 响应的首回合 index
+  ≥ 本页游标（nextBefore）时，说明没有取到更早回合——再合并会原样返回，
+  用户重试仍请求同一页（无限加载）。判定无进展直接终止分页
+  （hasMore=false, nextBefore=0）。
+- **15k 数据流回归**：`mergeTurns`/`withTurns` 导出为可测纯函数，测试覆盖
+  合并去重（重叠 index 后者胜出）、升序输出、hasMore/nextBefore 语义；
+  并以生产合并函数模拟前端 loadMore 连续三页（220 回合 fixture）——
+  每页无重复 index、序号连续无乱序（41..220）、游标单调递减、
+  Σ回合 cost 与独立预期一致（180 × 0.001）。
+
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 
 - **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，

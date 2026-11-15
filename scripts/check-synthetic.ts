@@ -1226,6 +1226,125 @@ async function main(): Promise<void> {
     expect("15j 卸载后消费循环终止（动作不再执行）", countsAbort.invalidate > countsAbort.forceReload, false)
     expect("15j 卸载后 forceReload 恰好 1 次", countsAbort.forceReload, 1)
 
+    // 15k. 前端分页数据流回归（TASK-14）：mergeTurns / withTurns 纯函数 +
+    // 服务端 10k 会话三页连续加载（引用生产合并函数模拟前端 loadMore 流程）。
+    const front = require("../src/gui/session-detail") as {
+      mergeTurns: (a: readonly SessionTurn[], b: readonly SessionTurn[]) => SessionTurn[]
+      withTurns: (d: SessionDetail, t: SessionTurn[]) => SessionDetail
+    }
+    // withTurns 只读 id/title 等展示字段之外的汇总字段——最小占位即可
+    const emptyDetailLike = {
+      found: true,
+      id: "fk1",
+      title: "t",
+      projectID: "",
+      projectName: "",
+      directory: "",
+      providerID: "unknown",
+      modelID: "unknown",
+      agent: "",
+      timeCreated: 0,
+      timeUpdated: 0,
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+      totalTurns: 220,
+      hasMore: false,
+      nextBefore: 0,
+      promptCount: 0,
+      requestCount: 0,
+      toolCount: 0,
+      errorCount: 0,
+      ttftP50: 0,
+      ttftP95: 0,
+      totalP50: 0,
+      totalP95: 0,
+      slowRate: 0,
+      cacheHit: 0,
+      generatedAt: 0,
+    } as unknown as SessionDetail
+    const mkTurn = (index: number, cost: number): SessionTurn =>
+      ({
+        index,
+        seq: index,
+        time: 0,
+        prompt: `回合 ${index}`,
+        promptTruncated: false,
+        files: [],
+        agents: [],
+        requests: [],
+        cost,
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        toolCount: 0,
+        errorCount: 0,
+        duration: 0,
+        ttft: 0,
+        cacheHit: 0,
+      }) as SessionTurn
+    // 合并去重：重叠 index 后者胜出，结果按 index 升序
+    const mergedA = front.mergeTurns([mkTurn(3, 0.1), mkTurn(4, 0.1)], [mkTurn(1, 0.1), mkTurn(2, 0.1), mkTurn(3, 0.2)])
+    expect("15k 合并后无重复 index", new Set(mergedA.map((t) => t.index)).size, mergedA.length)
+    expect("15k 合并后升序", mergedA.map((t) => t.index).join(","), "1,2,3,4")
+    expect("15k 重叠 index 后者胜出", mergedA.find((t) => t.index === 3)?.cost, 0.2, 1e-9)
+    // withTurns 的 hasMore/nextBefore 语义：首回合 index>1 表示还有更早
+    const wtA = front.withTurns({ ...emptyDetailLike, turns: [] }, [mkTurn(1, 0)])
+    expect("15k 首回合 index=1 → hasMore=false", wtA.hasMore, false)
+    const wtB = front.withTurns({ ...emptyDetailLike, turns: [] }, [mkTurn(3, 0)])
+    expect("15k 首回合 index=3 → hasMore=true", wtB.hasMore, true)
+    expect("15k nextBefore=首回合 index", wtB.nextBefore, 3)
+    // 连续三页模拟（服务端 10k 会话）：每页 60 回合，合并后无重复、无乱序、
+    // 游标单调递减、第三页后继续有 hasMore（前端可继续加载）。
+    // 自建轻量分页库：220 回合（首页 60 + 二页 60 + 三页 60 + 剩余 40）
+    const file15k = `${process.env.TMPDIR ?? "/tmp"}/uc-f15k-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const db15k = new Database(file15k)
+    db15k.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    db15k.exec(`INSERT INTO project VALUES ('pf', NULL, '/tmp/f15k', 1)`)
+    db15k.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('fk1', 'pf', '前端分页', 1, 1)").run()
+    const msg15k = db15k.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'fk1', ?, ?, ?, ?, ?)")
+    const pay15k = JSON.stringify({ cost: 0.001, model: { providerID: "prov-x", id: "model-a" }, agent: "build", tokens: {}, time: { created: 1, completed: 10 } })
+    db15k.transaction(() => {
+      for (let i = 0; i < 220; i++) {
+        msg15k.run(`k${i}u`, "user", i * 2 + 1, i, i, JSON.stringify({ text: `回合 ${i + 1}` }))
+        msg15k.run(`k${i}a`, "assistant", i * 2 + 2, i, i, pay15k)
+      }
+    })()
+    db15k.close()
+    const store15k = new UsageStore(file15k, () => {})
+    let frontTurns: SessionTurn[] = []
+    let cursor15k: number | undefined
+    const seenIndexes = new Set<number>()
+    let lastCostSum = 0
+    for (let page = 0; page < 3; page++) {
+      const pageDetail = store15k.sessionDetail({ sessionID: "fk1", beforeTurn: cursor15k, limit: 60, force: true })
+      const before = frontTurns.length
+      frontTurns = front.mergeTurns(frontTurns, pageDetail.turns)
+      expect(`15k 第 ${page + 1} 页合并后无重复`, frontTurns.length, before + pageDetail.turns.length)
+      for (const turn of pageDetail.turns) {
+        expect(`15k 第 ${page + 1} 页无重复 index`, seenIndexes.has(turn.index), false)
+        seenIndexes.add(turn.index)
+        lastCostSum += turn.cost
+      }
+      const withTurnsResult = front.withTurns(
+        { ...emptyDetailLike, turns: frontTurns, cost: lastCostSum },
+        frontTurns,
+      )
+      if (page < 2) {
+        expect(`15k 第 ${page + 1} 页后 hasMore`, withTurnsResult.hasMore, true)
+        expect(`15k 游标单调递减`, withTurnsResult.nextBefore < (cursor15k ?? Number.POSITIVE_INFINITY), true)
+        cursor15k = pageDetail.nextBefore
+      }
+    }
+    expect("15k 三页合计 180 回合", frontTurns.length, 180)
+    expect("15k 序号连续无乱序（41..220）", frontTurns.map((t) => t.index).join(","), Array.from({ length: 180 }, (_, i) => i + 41).join(","))
+    expect("15k Σ回合cost 与页数据一致", frontTurns.reduce((sum, t) => sum + t.cost, 0), 180 * 0.001, 1e-9)
+    store15k.close()
+    require("node:fs").rmSync(file15k)
 
     // 15h. 查询计划自动化回归（TASK-09，复审修正后）：直接引用 store.ts 导出的
     // SESSION_PAGE_SQLS——生产查询与测试共用同一份 SQL 文本，改生产不改测试
