@@ -29,7 +29,7 @@
 
 ```json
 {
-  "plugins": ["opencode-usage-center@0.1.0"]
+  "plugins": ["opencode-usage-center@1.0.0"]
 }
 ```
 

@@ -5,7 +5,7 @@ import { count } from "./format"
 
 /**
  * 模型浏览页。两个视角：
- * 1. 常用：最近 30 天真实请求过的模型（数据来自 usage 快照的 ModelRow），带请求次数，可折叠
+ * 1. 常用：当前全局时间范围内真实请求过的模型（数据来自 usage 快照的 ModelRow，与全局筛选同源），带请求次数，可折叠
  * 2. 全部：provider 分组，点击展开该 provider 的模型列表（上下文 / 价格 / 用量 / 隐藏标记）
  * 内部通道（subagent / advisor / auto 路由等非对话模型）单独一组默认折叠。
  * 隐藏标记是本地偏好，不改变 OpenCode 行为。
@@ -53,8 +53,10 @@ export function ModelsExplorer(props: {
   ctx: Context
   models: readonly ModelInfo[]
   providerNames: Map<string, string>
-  /** 最近 30 天真实用过的模型（providerID:modelID → 请求次数），来自 usage 快照 */
+  /** 当前全局时间范围内真实用过的模型（providerID:modelID → 请求次数），来自 usage 快照，与页面数据同源同范围 */
   usage?: ReadonlyMap<string, { requests: number; cost: number }>
+  /** 全局时间范围标签（今日 / 7 天 / 30 天 / 全部），文案必须跟随，不能硬编码 */
+  rangeLabel: string
 }) {
   const ui = props.ctx.ui
   const [query, setQuery] = createSignal("")
@@ -165,7 +167,7 @@ export function ModelsExplorer(props: {
                 <path d="M4.5 2.5 8 6l-3.5 3.5" />
               </svg>
             </span>
-            <span class="uc-int-section-title">最近 30 天常用</span>
+            <span class="uc-int-section-title">{props.rangeLabel}常用</span>
             <span class="uc-recent-note">来自本机真实用量，按请求次数排序</span>
             <span class="uc-mp-count">{recent().length} 个</span>
           </button>
@@ -227,7 +229,7 @@ export function ModelsExplorer(props: {
                       <span>模型</span>
                       <span>上下文</span>
                       <span>价格</span>
-                      <span>30 天用量</span>
+                      <span>{props.rangeLabel}用量</span>
                       <span></span>
                     </div>
                     <For each={list}>

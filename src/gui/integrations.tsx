@@ -154,7 +154,7 @@ export function IntegrationsPage(props: {
   const ui = props.ctx.ui
   const [integrations, setIntegrations] = createSignal<IntegrationInfo[]>([])
   const [credentials, setCredentials] = createSignal<CredentialEntry[]>([])
-  const [models] = createSignal<ModelInfo[]>([])
+  const [models, setModels] = createSignal<ModelInfo[]>([])
   const [providers, setProviders] = createSignal<ProviderInfo[]>([])
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal("")
@@ -191,6 +191,7 @@ export function IntegrationsPage(props: {
       ])
       setIntegrations(integrationList.data)
       setCredentials(credentialList)
+      setModels(modelList.data)
       setProviders(providerList.data)
       return modelList.data
     } catch (cause) {

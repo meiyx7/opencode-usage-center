@@ -626,10 +626,7 @@ function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly Late
             </div>
           </div>
           <div class="uc-lat-health">
-            <div class="uc-lat-stat"><b>{percent(props.latency.slowRate * 100, 1)}</b><span>慢请求比例</span></div>
-            <div class="uc-lat-stat"><b>{props.latency.tokensPerSecond.toFixed(1)}</b><span>输出 tok/s</span></div>
             <div class="uc-lat-stat"><b>{compact(props.latency.samples)}</b><span>有效样本</span></div>
-            <div class="uc-lat-stat"><b>{duration(props.latency.totalP95)}</b><span>总时延 P95</span></div>
           </div>
           <Show when={slowest()}>
             {(model) => (
@@ -639,7 +636,7 @@ function LatencyTab(props: { latency: Snapshot["latency"]; models: readonly Late
             )}
           </Show>
           <div class="uc-detail-note">
-            首字时延取 <code>time.streamed - time.created</code>，总时延取 <code>time.completed - time.created</code>。样本来自本机数据库，不包含进行中的请求。
+            首字时延取 <code>time.streamed - time.created</code>，总时延取 <code>time.completed - time.created</code>。样本来自本机数据库，不包含进行中的请求。慢请求比例、输出速度与总时延 P95 见顶部概览。
           </div>
         </section>
       </div>
@@ -713,7 +710,9 @@ function ModelEfficiency(props: { latencyModels: readonly LatencyModelRow[]; usa
   type ScatterRow = ReturnType<typeof rows>[number]
   const position = (row: ScatterRow) => ({
     x: hasCost() ? 8 + (row.costPerRequest / maxCost()) * 84 : 8 + (row.tokens / maxTokens()) * 84,
-    y: 8 + (row.ttftP95 / maxTtft()) * 84,
+    // 纵轴慢在上：P95 越大 y 越小（越靠顶），与竖轴标签「↑ 慢 / 快 ↓」和
+    // 「左下角理想」的说明一致。曾误写成 8 + 归一化 * 84，慢模型沉底，图文相反。
+    y: 92 - (row.ttftP95 / maxTtft()) * 84,
     r: 3 + Math.sqrt(row.tokens / maxTokens()) * 9,
   })
   return (
@@ -738,9 +737,10 @@ function ModelEfficiency(props: { latencyModels: readonly LatencyModelRow[]; usa
           <For each={rows()}>
             {(row) => {
               const pos = position(row)
+              // 非交互展示元素：气泡没有点击动作，不用 button 语义（不进键盘
+              // 焦点序）；数据说明保留在 title 悬停提示里。
               return (
-                <button
-                  type="button"
+                <span
                   class="uc-scatter-dot"
                   style={{
                     left: `${pos.x}%`,
@@ -1755,6 +1755,7 @@ const CSS = `
 }
 .uc-scatter > svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .uc-scatter-dot {
+  display: block;
   position: absolute;
   transform: translate(-50%, -50%);
   border-radius: 50%;
@@ -2561,7 +2562,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
   /** 目录拉取状态：只有成功才算完成，失败保留错误并允许就地重试。 */
   const [hostDataError, setHostDataError] = createSignal("")
   const [hostDataLoading, setHostDataLoading] = createSignal(false)
-  /** providerID:modelID → 最近 30 天真实请求，供模型页的「常用」区。声明顺序必须在 modelUsage 之前：esbuild 压缩后 const 无提升。 */
+  /** providerID:modelID → 当前全局范围内真实请求，供模型页的「常用」区。声明顺序必须在 modelUsage 之前：esbuild 压缩后 const 无提升。 */
   const usageModels = () => snapshot()?.models ?? []
   const modelUsage = createMemo(() => {
     const map = new Map<string, { requests: number; cost: number }>()
@@ -3178,6 +3179,7 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
                         models={remoteModels()}
                         providerNames={providerNames()}
                         usage={modelUsage()}
+                        rangeLabel={rangeLabel()}
                       />
                     </Show>
                   </Match>
