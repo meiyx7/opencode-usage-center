@@ -30,6 +30,16 @@ function remember(detail: SessionDetail) {
   }
 }
 
+/** 写会话详情缓存（TASK-16.1：请求协调器与 16m 测试共用）。 */
+export function rememberDetail(detail: SessionDetail) {
+  remember(detail)
+}
+
+/** 读会话详情缓存（只读探针，供测试断言会话隔离与旧响应未写入）。 */
+export function readDetailCache(sessionID: string): CachedDetail | undefined {
+  return DETAIL_CACHE.get(sessionID)
+}
+
 /**
  * 会话级缓存失效（TASK-08）：Revert / 删除会话后，已加载回合可能包含被
  * 删除的消息。由页面层在收到对应事件时调用——指定 ID 只清该会话（普通
@@ -109,6 +119,110 @@ export function mergeTurns(first: readonly SessionTurn[], second: readonly Sessi
 export function withTurns(detail: SessionDetail, turns: SessionTurn[]): SessionDetail {
   const hasMore = turns.length > 0 && turns[0]!.index > 1
   return { ...detail, turns, hasMore, nextBefore: hasMore ? turns[0]!.index : 0 }
+}
+
+/** 会话详情请求入参（与 wire 契约同形，测试注入同一形状）。 */
+export type DetailRequestInput = { sessionID: string; force?: boolean; beforeTurn?: number }
+
+/**
+ * 响应提交判定结果（TASK-16.1）。测试与文档共用同一份词汇：
+ * `ok` 属于最新一代且仍是当前会话；`stale` 更新一代请求已发出；
+ * `gone` 会话已删除；`switched` 请求发起后当前会话已切换；
+ * `mismatch` 响应 id 与请求会话不一致（防串写缓存）；`error` 请求失败。
+ */
+export type DetailRejectReason = "ok" | "stale" | "gone" | "switched" | "mismatch" | "error"
+
+export type DetailLoadOutcome = { committed: boolean; reason: DetailRejectReason }
+
+/**
+ * 会话详情请求协调器（TASK-16.1）：首次加载、刷新、Revert 强刷都经由这里。
+ *
+ * 为什么要有它：实例级的 `request` 计数只能区分「本实例的第几代请求」，分不清
+ * 会话。一旦详情页在同一个实例里切换 `props.session`（Solid 的 Show 在 when
+ * 仍为真时不重建 children），旧会话的响应就可能落到新会话的视图或缓存上。
+ * 这里用「会话 id + 响应 id」双重校验把「旧响应不得覆盖新会话、不得串写缓存」
+ * 变成显式判定，提交与缓存写入共用同一个结果。
+ *
+ * 测试用 Deferred 直接驱动本函数（与组件同一实现），精确控制返回顺序。
+ */
+export function createDetailLoader(options: {
+  /** 真实 RPC；测试注入可控 Promise。 */
+  fetch: (input: DetailRequestInput) => Promise<SessionDetail>
+  /** 当前会话 id（组件传 `props.session.id` 访问器，不是固定值）。 */
+  currentSessionID: () => string
+  /** 会话已删除：置位后既不发请求，也不接收响应。 */
+  isGone: () => boolean
+  /** 当前详情，用于保留已加载的更早分页。 */
+  getDetail: () => SessionDetail | undefined
+  /** 提交详情（组件传 `setDetail`）。 */
+  setDetail: (detail: SessionDetail) => void
+  setRefreshing: (value: boolean) => void
+  setError: (message: string) => void
+  describeError: (cause: unknown) => string
+  /** 写前端缓存（组件传 `rememberDetail`）。 */
+  remember: (detail: SessionDetail) => void
+}) {
+  let generation = 0
+  let inFlight = 0
+
+  /** 响应能否落到当前视图（不看载荷内容）。 */
+  function checkpoint(ticket: { generation: number; sessionID: string }): DetailRejectReason {
+    if (ticket.generation !== generation) return "stale"
+    if (options.isGone()) return "gone"
+    if (ticket.sessionID !== options.currentSessionID()) return "switched"
+    return "ok"
+  }
+
+  /** 提交响应：判定通过才写入视图与缓存。 */
+  function commit(ticket: { generation: number; sessionID: string }, next: SessionDetail): DetailRejectReason {
+    const reason = checkpoint(ticket)
+    if (reason !== "ok") return reason
+    // 响应必须属于发起请求的会话，否则 remember 会按载荷 id 写进别的缓存槽。
+    if (next.id !== ticket.sessionID) return "mismatch"
+    const previous = options.getDetail()
+    const previousTurns = previous?.id === next.id ? previous.turns : []
+    // 保留已加载的更早分页，替换最新一页覆盖的范围（Revert 后消失的回合会被丢弃）。
+    const firstIncoming = next.turns[0]?.index ?? Number.POSITIVE_INFINITY
+    const olderTurns = previousTurns.filter((turn) => turn.index < firstIncoming)
+    const merged = next.turns.length === 0 ? next : withTurns(next, mergeTurns(olderTurns, next.turns))
+    options.setDetail(merged)
+    options.remember(merged)
+    return "ok"
+  }
+
+  return {
+    /** 最新一代请求编号（loadMore 用它判断响应是否过期）。 */
+    get generation() {
+      return generation
+    },
+    get inFlight() {
+      return inFlight
+    },
+    /** 会话切换 / 删除：所有在途响应作废，且不再写入缓存。 */
+    invalidate() {
+      generation += 1
+    },
+    async load(force = false, quiet = false): Promise<DetailLoadOutcome> {
+      if (options.isGone()) return { committed: false, reason: "gone" }
+      const ticket = { generation: ++generation, sessionID: options.currentSessionID() }
+      inFlight += 1
+      if (!quiet) options.setRefreshing(true)
+      options.setError("")
+      try {
+        const next = await options.fetch({ sessionID: ticket.sessionID, force })
+        const reason = commit(ticket, next)
+        return { committed: reason === "ok", reason }
+      } catch (cause) {
+        const reason = checkpoint(ticket)
+        if (reason === "ok") options.setError(options.describeError(cause))
+        return { committed: false, reason: reason === "ok" ? "error" : reason }
+      } finally {
+        inFlight = Math.max(0, inFlight - 1)
+        // 只有最新一代能结束加载态：旧请求晚返回不得清掉新请求的 refreshing。
+        if (ticket.generation === generation) options.setRefreshing(false)
+      }
+    },
+  }
 }
 
 import { cacheHitRate, effectiveTokens } from "./metrics"
@@ -701,8 +815,19 @@ export function SessionDetailView(props: {
   /** JSON 导出的脱敏开关：开启时剥掉提示词、回复、思考与工具内容，只留结构化数字。 */
   const [sanitizeExport, setSanitizeExport] = createSignal(true)
   const [openTurns, setOpenTurns] = createSignal<Set<number>>(new Set())
-  let request = 0
-  let loadInFlight = 0
+  // 请求协调（TASK-16.1）：首次加载 / 刷新 / Revert 强刷共用；会话切换或删除时
+  // invalidate 让在途响应作废，响应 id 与会话不一致时拒绝提交（不写缓存）。
+  const loader = createDetailLoader({
+    fetch: (input) => api.sessionDetail(input),
+    currentSessionID: () => props.session.id,
+    isGone: () => sessionGone(),
+    getDetail: () => detail(),
+    setDetail: (next) => setDetail(next),
+    setRefreshing,
+    setError,
+    describeError: readableError,
+    remember: rememberDetail,
+  })
 
   const title = () => detail()?.title || props.session.title
   const projectLabel = () => detail()?.projectName || props.projectName || props.session.projectID || "项目"
@@ -795,37 +920,6 @@ export function SessionDetailView(props: {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  async function load(force = false, quiet = false) {
-    if (sessionGone()) return // 会话已删除（TASK-10）：不再请求
-    const id = ++request
-    loadInFlight += 1
-    if (!quiet) setRefreshing(true)
-    setError("")
-    try {
-      const next = await api.sessionDetail({ sessionID: props.session.id, force })
-      if (id !== request) return
-      if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废，不得写入缓存
-      const previous = detail()
-      const previousTurns = previous?.id === next.id ? previous.turns : []
-      // Keep older loaded pages, but replace the whole range covered by the
-      // fresh latest page. This drops turns that disappeared after a revert.
-      const firstIncoming = next.turns[0]?.index ?? Number.POSITIVE_INFINITY
-      const olderTurns = previousTurns.filter((turn) => turn.index < firstIncoming)
-      const merged =
-        next.turns.length === 0 ? next : withTurns(next, mergeTurns(olderTurns, next.turns))
-      setDetail(merged)
-      remember(merged)
-    } catch (cause) {
-      if (id !== request) return
-      setError(readableError(cause))
-    } finally {
-      loadInFlight = Math.max(0, loadInFlight - 1)
-      if (id === request) {
-        setRefreshing(false)
-      }
-    }
-  }
-
   async function loadMore() {
     const current = detail()
     if (!current) return
@@ -837,11 +931,11 @@ export function SessionDetailView(props: {
         hasMore: current.hasMore,
         loadingMore: loadingMore(),
         refreshing: refreshing(),
-        inFlight: loadInFlight,
+        inFlight: loader.inFlight,
       })
     )
       return
-    const id = request
+    const id = loader.generation
     setLoadingMore(true)
     setError("")
     try {
@@ -849,13 +943,13 @@ export function SessionDetailView(props: {
         sessionID: props.session.id,
         beforeTurn: current.nextBefore,
       })
-      if (id !== request) return
+      if (id !== loader.generation) return
       if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废
       // 归并/终止判定统一走 applyLoadMoreResult（TASK-14 收尾）：与 15k 测试
       // 同一实现——无进展保留 current 回合，有进展合并新页。
       const merged = applyLoadMoreResult(current, next)
       setDetail(merged)
-      remember(merged)
+      rememberDetail(merged)
     } catch (cause) {
       setError(readableError(cause))
     } finally {
@@ -879,12 +973,12 @@ export function SessionDetailView(props: {
         invalidate: () => invalidateDetailCache(props.session.id),
         markGone: () => {
           setSessionGone(true)
-          // 递增 request 使已发出的 in-flight 请求结果失效（TASK-13）：
+          // 递增 generation 使已发出的 in-flight 请求结果失效（TASK-13）：
           // 否则删除事件到达后，先前的 load/loadMore 响应仍会 setDetail
           // + remember，把已删除会话的数据重新写进前端缓存。
-          request += 1
+          loader.invalidate()
         },
-        forceReload: () => void load(true),
+        forceReload: () => void loader.load(true),
       },
     )
     onCleanup(() => eventsController.abort())
@@ -895,7 +989,7 @@ export function SessionDetailView(props: {
     // Stale cache still paints instantly, then revalidates in the background.
     // Revert 过的会话强制走网络（force 跳过服务端汇总 TTL）。
     if (cachedFresh) return
-    void load(wasReverted, Boolean(cached))
+    void loader.load(wasReverted, Boolean(cached))
   })
 
   return (
@@ -946,7 +1040,7 @@ export function SessionDetailView(props: {
             <button type="button" class="uc-sd-mini" onClick={() => toggleAll(true)}>全部展开</button>
             <button type="button" class="uc-sd-mini" onClick={() => toggleAll(false)}>全部收起</button>
           </Show>
-          <button type="button" class="uc-export" onClick={() => void load(true)} disabled={refreshing()}>
+          <button type="button" class="uc-export" onClick={() => void loader.load(true)} disabled={refreshing()}>
             {refreshing() ? "刷新中…" : "刷新"}
           </button>
         </div>
@@ -962,7 +1056,7 @@ export function SessionDetailView(props: {
         <div class="uc-sd-error">
           <b>会话数据加载失败</b>
           <span>{error()}</span>
-          <button type="button" class="uc-sd-mini" onClick={() => void load(true)}>重试</button>
+          <button type="button" class="uc-sd-mini" onClick={() => void loader.load(true)}>重试</button>
         </div>
       </Show>
 

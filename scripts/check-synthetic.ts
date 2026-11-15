@@ -1923,6 +1923,199 @@ async function main(): Promise<void> {
     }
     dbPlan.close()
     require("node:fs").rmSync(planFile)
+
+    // 16m. 首次加载与会话切换（TASK-16.1）：手写 Deferred 精确控制响应顺序，
+    // 驱动组件实际使用的 createDetailLoader（首次加载 / 刷新 / Revert 强刷同一
+    // 入口）与真实 DETAIL_CACHE 写入。覆盖层级：未挂载 Solid 组件，测试覆盖的
+    // 是生产请求协调、提交判定与缓存写入路径，不是组件 E2E。
+    interface Deferred<T> {
+      promise: Promise<T>
+      resolve: (value: T) => void
+    }
+    function deferred<T>(): Deferred<T> {
+      let resolve!: (value: T) => void
+      const promise = new Promise<T>((res) => {
+        resolve = res
+      })
+      return { promise, resolve }
+    }
+    const requestModule = require("../src/gui/session-detail") as {
+      createDetailLoader: (options: {
+        fetch: (input: { sessionID: string; force?: boolean; beforeTurn?: number }) => Promise<SessionDetail>
+        currentSessionID: () => string
+        isGone: () => boolean
+        getDetail: () => SessionDetail | undefined
+        setDetail: (detail: SessionDetail) => void
+        setRefreshing: (value: boolean) => void
+        setError: (message: string) => void
+        describeError: (cause: unknown) => string
+        remember: (detail: SessionDetail) => void
+      }) => {
+        generation: number
+        inFlight: number
+        invalidate: () => void
+        load: (force?: boolean, quiet?: boolean) => Promise<{
+          committed: boolean
+          reason: "ok" | "stale" | "gone" | "switched" | "mismatch" | "error"
+        }>
+      }
+      rememberDetail: (detail: SessionDetail) => void
+      readDetailCache: (sessionID: string) => { value: SessionDetail } | undefined
+      invalidateDetailCache: (sessionID?: string) => void
+    }
+    expect("16m 请求协调器可导入", typeof requestModule.createDetailLoader, "function")
+    expect("16m 缓存探针可导入", typeof requestModule.readDetailCache, "function")
+    requestModule.invalidateDetailCache()
+    const turnOf = (index: number): SessionTurn => mkTurn(index, 0)
+    const detailOf = (id: string, turns: SessionTurn[], hasMore = false): SessionDetail =>
+      ({
+        ...(emptyDetailLike as unknown as Record<string, unknown>),
+        id,
+        title: `会话 ${id}`,
+        turns,
+        hasMore,
+        nextBefore: hasMore && turns.length > 0 ? turns[0]!.index : 0,
+      }) as unknown as SessionDetail
+    // 每个会话一个协调器状态：记录 detail 提交、refreshing/error 变化。
+    const harness = (setup: {
+      fetch: (input: { sessionID: string; force?: boolean; beforeTurn?: number }) => Promise<SessionDetail>
+      sessionID: () => string
+      gone?: () => boolean
+    }) => {
+      const state: {
+        detail?: SessionDetail
+        committed: SessionDetail[]
+        refreshing: boolean
+        error: string
+      } = { committed: [], refreshing: false, error: "" }
+      const loader = requestModule.createDetailLoader({
+        fetch: setup.fetch,
+        currentSessionID: setup.sessionID,
+        isGone: setup.gone ?? (() => false),
+        getDetail: () => state.detail,
+        setDetail: (next) => {
+          state.detail = next
+          state.committed.push(next)
+        },
+        setRefreshing: (value) => {
+          state.refreshing = value
+        },
+        setError: (message) => {
+          state.error = message
+        },
+        describeError: (cause) => String(cause),
+        remember: requestModule.rememberDetail,
+      })
+      return { loader, state }
+    }
+
+    // 16m-a. A 首次加载挂起 → 切到 B（重建路径：两个独立实例），B 先回、A 后回。
+    {
+      const pendingA = deferred<SessionDetail>()
+      const pendingB = deferred<SessionDetail>()
+      const a = harness({ fetch: () => pendingA.promise, sessionID: () => "sess-A" })
+      const b = harness({ fetch: () => pendingB.promise, sessionID: () => "sess-B" })
+      const loadA = a.loader.load()
+      const loadB = b.loader.load()
+      expect("16m-a 首次加载置 refreshing", a.state.refreshing, true)
+      expect("16m-a 两会话各自在途", `${a.loader.inFlight}/${b.loader.inFlight}`, "1/1")
+      pendingB.resolve(detailOf("sess-B", [turnOf(2)]))
+      expect("16m-a B 先返回提交", (await loadB).reason, "ok")
+      expect("16m-a B 视图为 B", b.state.detail?.id, "sess-B")
+      pendingA.resolve(detailOf("sess-A", [turnOf(1)]))
+      expect("16m-a A 晚返回写入自身实例", (await loadA).reason, "ok")
+      expect("16m-a B 视图未被 A 覆盖", b.state.detail?.id, "sess-B")
+      expect("16m-a B 只提交一次", b.state.committed.length, 1)
+      expect("16m-a A 缓存为 A", requestModule.readDetailCache("sess-A")?.value.id, "sess-A")
+      expect("16m-a B 缓存为 B", requestModule.readDetailCache("sess-B")?.value.id, "sess-B")
+      expect("16m-a 无第三会话缓存", requestModule.readDetailCache("sess-C"), undefined)
+      expect("16m-a 加载态均已恢复", `${a.state.refreshing}/${b.state.refreshing}`, "false/false")
+      expect("16m-a 预热缓存不影响已提交详情", b.state.detail?.turns.length, 1)
+    }
+
+    // 16m-b. 同一实例 props 从 A 切到 B，B 尚未发请求，A 就返回：
+    // 不得提交、不得写任何缓存（Show 在 when 仍为真时不重建 children 的防御）。
+    {
+      requestModule.invalidateDetailCache()
+      let active = "sess-A"
+      const pending = deferred<SessionDetail>()
+      const shared = harness({ fetch: () => pending.promise, sessionID: () => active })
+      const loading = shared.loader.load()
+      active = "sess-B" // 模拟 props.session 变化
+      pending.resolve(detailOf("sess-A", [turnOf(1)]))
+      const outcome = await loading
+      expect("16m-b 切换后旧响应判 switched", outcome.reason, "switched")
+      expect("16m-b 切换后不提交", shared.state.committed.length, 0)
+      expect("16m-b 切换后视图保持为空", shared.state.detail, undefined)
+      expect("16m-b 不写 A 缓存", requestModule.readDetailCache("sess-A"), undefined)
+      expect("16m-b 不写 B 缓存", requestModule.readDetailCache("sess-B"), undefined)
+    }
+
+    // 16m-c. 同一实例切换后 B 请求先返回，A 再返回：B 保持，A 判过期。
+    {
+      requestModule.invalidateDetailCache()
+      let active = "sess-A"
+      const pendingA = deferred<SessionDetail>()
+      const pendingB = deferred<SessionDetail>()
+      let nth = 0
+      const shared = harness({
+        fetch: () => (nth++ === 0 ? pendingA.promise : pendingB.promise),
+        sessionID: () => active,
+      })
+      const loadA = shared.loader.load()
+      active = "sess-B"
+      const loadB = shared.loader.load()
+      pendingB.resolve(detailOf("sess-B", [turnOf(5)]))
+      expect("16m-c 切换后 B 提交", (await loadB).reason, "ok")
+      expect("16m-c 切换后视图为 B", shared.state.detail?.id, "sess-B")
+      pendingA.resolve(detailOf("sess-A", [turnOf(1)]))
+      expect("16m-c A 晚返回判 stale", (await loadA).reason, "stale")
+      expect("16m-c A 晚返回不覆盖 B", shared.state.detail?.id, "sess-B")
+      expect("16m-c A 晚返回不写缓存", requestModule.readDetailCache("sess-A"), undefined)
+      expect("16m-c 只写入 B 缓存", requestModule.readDetailCache("sess-B")?.value.id, "sess-B")
+    }
+
+    // 16m-d. 响应 id 与请求会话不一致（服务端串包）：不提交，也不写该 id 的缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const pending = deferred<SessionDetail>()
+      const one = harness({ fetch: () => pending.promise, sessionID: () => "sess-A" })
+      const loading = one.loader.load()
+      pending.resolve(detailOf("sess-B", [turnOf(9)]))
+      const outcome = await loading
+      expect("16m-d 响应 id 不一致判 mismatch", outcome.reason, "mismatch")
+      expect("16m-d 响应 id 不一致不提交", one.state.committed.length, 0)
+      expect(
+        "16m-d 响应 id 不一致不写任何缓存",
+        `${String(requestModule.readDetailCache("sess-A"))}/${String(requestModule.readDetailCache("sess-B"))}`,
+        "undefined/undefined",
+      )
+    }
+
+    // 16m-f. A 在途时切到 B 并发出 B 请求，A 先返回：不得清掉 B 的 refreshing。
+    {
+      let active = "sess-A"
+      const pendingA = deferred<SessionDetail>()
+      const pendingB = deferred<SessionDetail>()
+      let nth = 0
+      const shared = harness({
+        fetch: () => (nth++ === 0 ? pendingA.promise : pendingB.promise),
+        sessionID: () => active,
+      })
+      const loadA = shared.loader.load()
+      active = "sess-B"
+      const loadB = shared.loader.load()
+      pendingA.resolve(detailOf("sess-A", [turnOf(1)]))
+      await loadA
+      expect("16m-f 旧请求不提交", shared.state.detail, undefined)
+      expect("16m-f B 在途时 refreshing 保持", shared.state.refreshing, true)
+      expect("16m-f 旧请求不产生错误", shared.state.error, "")
+      pendingB.resolve(detailOf("sess-B", [turnOf(2)]))
+      await loadB
+      expect("16m-f B 完成后 refreshing 恢复", shared.state.refreshing, false)
+      expect("16m-f B 完成后视图为 B", shared.state.detail?.id, "sess-B")
+    }
+    requestModule.invalidateDetailCache()
   }
 
   if (failures.length > 0) {
