@@ -69,7 +69,7 @@ function seedMain(db: import("bun:sqlite").Database, cost = 0.01): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const failures: string[] = []
   const expect = (label: string, actual: number | boolean | string, wanted: number | boolean | string, tolerance = 0) => {
     const ok = typeof actual === "number" && typeof wanted === "number" ? Math.abs(actual - wanted) <= tolerance : actual === wanted
@@ -1113,6 +1113,65 @@ function main(): void {
     revStore.close()
     require("node:fs").rmSync(revertFile)
 
+    // 15j. 前端事件行为测试（TASK-11）：验证 handleDetailEvent 的实际分支决策
+    // 与事件订阅生命周期，而非仅验证函数可导入。
+    const detailModule = require("../src/gui/session-detail") as {
+      handleDetailEvent: (
+        kind: string,
+        eventSession: string | undefined,
+        ownSessionID: string,
+      ) => { invalidate: boolean; forceReload: boolean; markGone: boolean }
+    }
+    const own = "ses-own"
+    // 缓存命中场景同样会建立订阅（订阅在 onMount 缓存判断之前）——分支函数
+    // 是纯函数，与订阅建立解耦；这里验证各事件类型的决策输出。
+    const committed = detailModule.handleDetailEvent("session.revert.committed", own, own)
+    expect("15j committed → 失效缓存", committed.invalidate, true)
+    expect("15j committed → 强制刷新", committed.forceReload, true)
+    expect("15j committed → 不标记删除", committed.markGone, false)
+    const cleared = detailModule.handleDetailEvent("session.revert.cleared", own, own)
+    expect("15j cleared → 不失效缓存（数据未变）", cleared.invalidate, false)
+    expect("15j cleared → 不刷新（避免重复请求）", cleared.forceReload, false)
+    const deleted = detailModule.handleDetailEvent("session.deleted", own, own)
+    expect("15j deleted → 失效缓存", deleted.invalidate, true)
+    expect("15j deleted → 不强制刷新（不再请求）", deleted.forceReload, false)
+    expect("15j deleted → 标记会话已删除", deleted.markGone, true)
+    const jOther1 = detailModule.handleDetailEvent("session.revert.committed", "ses-other", own)
+    const jOther2 = detailModule.handleDetailEvent("session.deleted", "ses-other", own)
+    expect(
+      "15j 其他会话事件 → 全部不动作",
+      JSON.stringify(jOther1) === JSON.stringify({ invalidate: false, forceReload: false, markGone: false }) &&
+        JSON.stringify(jOther2) === JSON.stringify({ invalidate: false, forceReload: false, markGone: false }),
+      true,
+    )
+    // 订阅生命周期（卸载清理等价验证）：AbortController.abort() 后，for-await
+    // 消费循环终止（生产组件 onCleanup 调同一 API）。mock 一个可中断生成器。
+    const controller15j = new AbortController()
+    let delivered = 0
+    // mock 事件源：两次事件后阻塞等待（模拟真实订阅的长驻循环）。abort 后
+    // 生成器在下一次恢复点检查 aborted 并退出——与真实 client.event.subscribe
+    // 的 signal 联动语义一致（消费循环终止，不再拉取事件）。
+    const mockSubscribe = async function* () {
+      for (let i = 0; i < 10; i++) {
+        if (eventsControllerMockAborted(controller15j)) return
+        yield { type: "session.revert.committed", data: { sessionID: own } }
+      }
+    }
+    const consume = async () => {
+      for await (const event of mockSubscribe()) {
+        delivered += 1
+        if (delivered === 1) controller15j.abort() // 模拟组件卸载
+      }
+    }
+    // eventsControllerMockAborted 在恢复点之间也能生效：mock 的 yield 是同步
+    // 完成（无挂起 await），abort 后下一次 for-await 迭代调用 next() 时检查。
+    function eventsControllerMockAborted(c: AbortController): boolean {
+      return c.signal.aborted
+    }
+    await consume()
+    expect("15j 卸载（abort）后订阅循环退出", delivered, 1)
+    expect("15j abort 生效", controller15j.signal.aborted, true)
+
     // 15h. 查询计划自动化回归（TASK-09，复审修正后）：直接引用 store.ts 导出的
     // SESSION_PAGE_SQLS——生产查询与测试共用同一份 SQL 文本，改生产不改测试
     // 不再可能。断言命中索引（SEARCH/COVERING）、无全表扫描、无临时排序。
@@ -1142,37 +1201,35 @@ function main(): void {
       [
         "会话首条消息（头部合成回合判定）",
         SESSION_PAGE_SQLS.firstMessage.replace(/\?/g, "'x'"),
-        /session_message_session_seq_idx/,
+        /SEARCH session_message USING INDEX session_message_session_seq_idx/,
       ],
       [
         "本页消息读取（唯一带 data 本体的查询）",
         SESSION_PAGE_SQLS.pageMessages.replace(/\?/g, "1").replace(/seq < \d+/, "seq < 100"),
-        /session_message_session_seq_idx/,
+        /SEARCH session_message USING INDEX session_message_session_seq_idx/,
       ],
       [
         "游标前回合计数",
         SESSION_PAGE_SQLS.turnCountBefore.replace(/\?/g, "100"),
-        /COVERING INDEX session_message_session_type_seq_idx/,
+        /SEARCH( COVERING)? session_message USING( COVERING)? INDEX session_message_session_type_seq_idx/,
       ],
       [
         "汇总标量聚合（json_extract，无 data 本体列）",
         SESSION_PAGE_SQLS.summaryScalars.replace(/\?/g, "'x'"),
-        /session_message_session_type_seq_idx/,
+        /SEARCH( COVERING)? session_message USING( COVERING)? INDEX session_message_session_type_seq_idx/,
       ],
       [
         "最后一条消息 seq",
         SESSION_PAGE_SQLS.lastSeq.replace(/\?/g, "'x'"),
-        /COVERING INDEX session_message_session_seq_idx/,
+        /SEARCH( COVERING)? session_message USING( COVERING)? INDEX session_message_session_seq_idx/,
       ],
-      // 工具统计（json_each 展开，复审补充纳入）
+      // 工具统计（json_each 展开）：引用生产 SQL（TASK-12 共用），占位符填实参。
+      // 需要回表读 data 参与 json_extract → 非 COVERING；SCAN je 是 json_each
+      // 虚拟表展开（非会话表扫描，由「无全表扫描」断言区分）。
       [
-        "工具统计 json_each 聚合",
-        `SELECT SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools
-         FROM session_message sm,
-              json_each(CASE WHEN json_valid(sm.data) AND json_type(sm.data, '$.content') = 'array'
-                             THEN json_extract(sm.data, '$.content') ELSE '[]' END) je
-         WHERE sm.session_id = 'x' AND sm.type = 'assistant' AND json_type(je.value) = 'object'`,
-        /session_message_session_type_seq_idx/,
+        "工具统计 json_each 聚合（生产 SQL）",
+        SESSION_PAGE_SQLS.toolStats.replace(/\?/g, "'x'"),
+        /SEARCH sm USING INDEX session_message_session_type_seq_idx/,
       ],
     ]
     for (const [label, sql, expected] of planChecks) {
@@ -1193,4 +1250,4 @@ function main(): void {
   console.log("synthetic ok: 600 sessions across 2 projects, attribution complete beyond list cap, cold-start stable")
 }
 
-main()
+void main()

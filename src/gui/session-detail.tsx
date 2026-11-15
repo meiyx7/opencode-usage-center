@@ -394,6 +394,27 @@ function DetailSkeleton() {  return (
   )
 }
 
+/**
+ * 详情页 Revert / 删除事件的处理分支（TASK-11）：纯函数，供组件订阅循环与
+ * 行为测试共用。返回应执行的动作——调用方负责实际执行（失效缓存/强制刷新/
+ * 置删除状态）。其他 sessionID 的事件返回空动作，不得刷新当前详情。
+ */
+export function handleDetailEvent(
+  kind: string,
+  eventSession: string | undefined,
+  ownSessionID: string,
+): { invalidate: boolean; forceReload: boolean; markGone: boolean } {
+  if (eventSession !== ownSessionID) return { invalidate: false, forceReload: false, markGone: false }
+  if (kind === "session.deleted") {
+    // 会话已删除：清缓存 + 标记状态，不再请求（组件保持打开，显示「会话已删除」）。
+    return { invalidate: true, forceReload: false, markGone: true }
+  }
+  // committed：回合被截断，已加载内容与汇总都可能过期 → 清缓存 + 强制刷新。
+  // cleared：清除 Revert 标记（未截断回合），数据未变 → 不刷新，避免重复请求。
+  if (kind === "session.revert.committed") return { invalidate: true, forceReload: true, markGone: false }
+  return { invalidate: false, forceReload: false, markGone: false }
+}
+
 export function SessionDetailView(props: {
   ctx: Context
   session: SessionRow
@@ -412,6 +433,8 @@ export function SessionDetailView(props: {
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [error, setError] = createSignal("")
   const [query, setQuery] = createSignal("")
+  /** 所属会话被删除（TASK-10）：置位后 UI 显示明确状态，不再请求。 */
+  const [sessionGone, setSessionGone] = createSignal(false)
   /** JSON 导出的脱敏开关：开启时剥掉提示词、回复、思考与工具内容，只留结构化数字。 */
   const [sanitizeExport, setSanitizeExport] = createSignal(true)
   const [openTurns, setOpenTurns] = createSignal<Set<number>>(new Set())
@@ -661,6 +684,7 @@ export function SessionDetailView(props: {
   }
 
   async function load(force = false, quiet = false) {
+    if (sessionGone()) return // 会话已删除（TASK-10）：不再请求
     const id = ++request
     loadInFlight += 1
     if (!quiet) setRefreshing(true)
@@ -717,30 +741,41 @@ export function SessionDetailView(props: {
     }
   }
 
+  // Revert / 删除事件订阅（TASK-10）：必须在缓存判断之前建立——cachedFresh
+  // 命中时跳过初始请求是缓存优化，但事件订阅不能跟着跳过，否则缓存展示期间
+  // 发生的 Revert 无人感知，旧回合会一直停留到手动刷新。
+  const eventsController = new AbortController()
+  onMount(() => {
+    void (async () => {
+      try {
+        for await (const event of props.ctx.client.event.subscribe({
+          types: ["session.revert.committed", "session.revert.cleared", "session.deleted"],
+          signal: eventsController.signal,
+        })) {
+          if (eventsController.signal.aborted) break
+          const data = event.data as { sessionID?: string; id?: string } | undefined
+          const action = handleDetailEvent(
+            event.type as string,
+            data?.sessionID ?? data?.id,
+            props.session.id,
+          )
+          if (action.invalidate) invalidateDetailCache(props.session.id)
+          if (action.markGone) setSessionGone(true)
+          if (action.forceReload) void load(true)
+        }
+      } catch {
+        // 事件订阅失败时靠手动刷新兜底
+      }
+    })()
+    onCleanup(() => eventsController.abort())
+  })
+
   onMount(() => {
     // Fresh cache paints instantly and avoids resetting expanded requests.
     // Stale cache still paints instantly, then revalidates in the background.
     // Revert 过的会话强制走网络（force 跳过服务端汇总 TTL）。
     if (cachedFresh) return
     void load(wasReverted, Boolean(cached))
-    // Revert 发生在本会话详情打开期间（TASK-08）：事件驱动强制刷新，
-    // load 的合并逻辑会丢弃刷新页覆盖范围外已消失的旧回合。
-    const controller = new AbortController()
-    void (async () => {
-      try {
-        for await (const event of props.ctx.client.event.subscribe({
-          types: ["session.revert.committed", "session.revert.cleared"],
-          signal: controller.signal,
-        })) {
-          if (controller.signal.aborted) break
-          if ((event.data as { sessionID?: string } | undefined)?.sessionID !== props.session.id) continue
-          void load(true)
-        }
-      } catch {
-        // 事件订阅失败时靠手动刷新兜底
-      }
-    })()
-    onCleanup(() => controller.abort())
   })
 
   return (
@@ -797,6 +832,12 @@ export function SessionDetailView(props: {
         </div>
       </div>
 
+      <Show when={sessionGone()}>
+        <div class="uc-sd-error" data-gone="true">
+          <b>会话已删除</b>
+          <span>该会话已被删除，展示的内容不再更新。返回会话列表查看其他会话。</span>
+        </div>
+      </Show>
       <Show when={error()}>
         <div class="uc-sd-error">
           <b>会话数据加载失败</b>

@@ -108,6 +108,30 @@ export const SESSION_PAGE_SQLS = {
          ORDER BY seq`,
   /** 最后一条消息 seq（游标上界）。 */
   lastSeq: `SELECT MAX(seq) AS s FROM session_message WHERE session_id = ?`,
+  /**
+   * 工具统计（json_each 展开 content）。错误谓词与旧 JS 真值语义一致：
+   * state.error 为 null/缺失、空串、false/0 时不计错，其余计错。
+   * json_extract 已解包值，用 typeof 检查 SQLite 值类型（JSON false 解包为 0）。
+   */
+  toolStats: `SELECT
+           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools,
+           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool'
+                     AND (json_extract(je.value, '$.state.status') = 'error'
+                          OR CASE
+                               WHEN json_extract(je.value, '$.state.error') IS NULL THEN 0
+                               WHEN typeof(json_extract(je.value, '$.state.error')) = 'text'
+                                    AND json_extract(je.value, '$.state.error') = '' THEN 0
+                               WHEN typeof(json_extract(je.value, '$.state.error')) IN ('integer','real')
+                                    AND json_extract(je.value, '$.state.error') = 0 THEN 0
+                               ELSE 1
+                             END = 1) THEN 1 ELSE 0 END) AS toolErrors,
+           COUNT(*) AS expandedParts
+         FROM session_message sm,
+              json_each(CASE WHEN json_valid(sm.data)
+                              AND json_type(sm.data, '$.content') = 'array'
+                             THEN json_extract(sm.data, '$.content') ELSE '[]' END) je
+         WHERE sm.session_id = ? AND sm.type = 'assistant'
+           AND json_type(je.value) = 'object'`,
 } as const
 
 const PROVIDERS: Record<string, string> = {
@@ -1563,27 +1587,7 @@ export class UsageStore {
     // 输入输出不再传入 JS。口径与旧 JS 实现一致：tool part 计数；status==='error'
     // 或 state.error 非空计错误；坏 JSON / content 缺失 / 非数组 / 空数组 → 0。
     const toolAgg = db
-      .query<Row>(
-        `SELECT
-           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools,
-           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool'
-                     AND (json_extract(je.value, '$.state.status') = 'error'
-                          OR CASE
-                               WHEN json_extract(je.value, '$.state.error') IS NULL THEN 0
-                               WHEN typeof(json_extract(je.value, '$.state.error')) = 'text'
-                                    AND json_extract(je.value, '$.state.error') = '' THEN 0
-                               WHEN typeof(json_extract(je.value, '$.state.error')) IN ('integer','real')
-                                    AND json_extract(je.value, '$.state.error') = 0 THEN 0
-                               ELSE 1
-                             END = 1) THEN 1 ELSE 0 END) AS toolErrors,
-           COUNT(*) AS expandedParts
-         FROM session_message sm,
-              json_each(CASE WHEN json_valid(sm.data)
-                              AND json_type(sm.data, '$.content') = 'array'
-                             THEN json_extract(sm.data, '$.content') ELSE '[]' END) je
-         WHERE sm.session_id = ? AND sm.type = 'assistant'
-           AND json_type(je.value) = 'object'`,
-      )
+      .query<Row>(SESSION_PAGE_SQLS.toolStats)
       .get(sessionID)
     const toolCount = num(toolAgg?.tools)
     const toolErrorCount = num(toolAgg?.toolErrors)

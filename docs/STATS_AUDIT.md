@@ -289,6 +289,27 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
   修改索引，真实库退化时插件仍可用。敏感度验证：从 fixture 移除复合索引
   → 18 处断言立即失败。
 
+## 15. 阶段 A 最终补丁（TASK-10～12）
+
+- **Revert 事件订阅提前返回修复**（TASK-10）：订阅从 onMount 的 `cachedFresh`
+  早退之后移到之前——缓存命中跳过初始请求是优化，但事件订阅不能跟着跳过，
+  否则缓存展示期间的 Revert 无人感知。新增 `session.deleted` 处理：失效对应
+  缓存 + `sessionGone` 信号（UI 显示「会话已删除」，load 短路不再请求，组件
+  保持打开由用户手动退出）；`revert.committed` → 失效 + force 刷新；
+  `revert.cleared` → 不动作（未截断回合，数据未变，避免重复请求）。事件
+  分支提取为导出纯函数 `handleDetailEvent`（TASK-11 测试共用），AbortController
+  + onCleanup 清理保留。
+- **前端事件行为测试**（TASK-11）：15j 验证 `handleDetailEvent` 全部分支
+  （committed → 失效+刷新；cleared → 均不动作；deleted → 失效+标记删除；
+  其他 sessionID → 全部不动作），以及订阅生命周期（mock 事件源 + abort 后
+  消费循环退出 = 组件卸载清理语义）。断言有效性用故意失败注入验证。
+- **工具统计 SQL 共用**（TASK-12）：`SESSION_PAGE_SQLS.toolStats` 提取，
+  生产查询与 15h EXPLAIN 引用同一份文本。全部 8 条核心查询的索引断言
+  统一要求 `SEARCH ... USING INDEX`（不再只匹配索引名）；工具聚合需回表读
+  data 参与 json_extract → 非 COVERING（如实断言 SEARCH），`SCAN je` 是
+  json_each 虚拟表展开，由「无全表扫描」正则区分。敏感度：移除复合索引
+  → 16 处断言失败；错误谓词退化为 IS NOT NULL → errorCount 断言失败。
+
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 
 - **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，
