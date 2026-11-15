@@ -257,6 +257,38 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
   用户手动刷新立即生效。与旧实现（缓存完整详情同样 60s TTL）行为一致，
   且新实现的缓存不含回合正文，旧回合不可能从缓存复读。
 
+## 14. 阶段 A 收尾（复审第二批意见，TASK-06～09）
+
+- **工具统计 SQL 化**（TASK-06）：`buildSessionSummary` 的工具数/工具错误数
+  从「JS 读全部 assistant data 逐条解析」改为单条 SQL——`json_each` 展开
+  content 数组，`json_type` 守门（坏 JSON / content 缺失 / 非数组 / 空数组
+  一律按 0），`state.status='error' OR state.error IS NOT NULL` 与旧 JS 口径
+  一致。SQLite 内部仍解析 JSON（全会话统计扫描必要的结构化数据，可接受），
+  但正文/思考/工具输入输出不再传入 JS。同一 DB 快照（`.backup` 含 WAL）下
+  新旧实现 1759 请求逐字段一致（真实活跃会话——此前 444 会话对比出现
+  差异是因为两次导出之间库被写入，非口径漂移）。
+- **分阶段读取量探针**（TASK-07）：`parseJSON` 增加 `__ucReadProbe`（JSON.parse
+  次数 + 字节数）、分页计数器扩展 bodyBytes（本页传给 JS 的 data 总字节）、
+  `__ucSummaryProbe` 记录汇总结构化扫描行数。15g 升级：每条 assistant 带
+  ~6KB 正文/思考/工具内容，10,000 回合断言——汇总阶段正文传入 JS 恒 0 字节、
+  首屏 JSON 解析 120 次 0.4MB（全会话 ~7.4MB 的 5%）、汇总结构化扫描 40,000 行
+  （aggRows 10,000 + json_each 展开 30,000，如实记录——SQLite 需要扫描才能
+  聚合，但正文不进 JS）。
+- **Revert 缓存失效**（TASK-08）：SDK 事件核查确认存在
+  `session.revert.committed` / `session.revert.cleared` / `session.deleted`
+  （payload 带 sessionID），无 message 级删除事件——能力边界：消息级 Revert
+  通过 revert.committed 覆盖。实现最小方案：session-detail.tsx 导出
+  `invalidateDetailCache(id?)`（清前端 DETAIL_CACHE 对应会话，普通打开/翻页/
+  刷新不动其他会话）与 `markSessionReverted(id)`（脏标记单例）；page.tsx
+  事件订阅新增三个类型，命中即失效+标记；详情页打开时消费脏标记——视为
+  未缓存 + 首次 load force=true 跳过服务端汇总 TTL。TTL 保留为兜底。
+- **查询计划自动化回归**（TASK-09）：15h 在含真实 schema 复合索引的 fixture
+  上对 7 条核心 SQL 断言 EXPLAIN QUERY PLAN——命中预期索引（SEARCH/COVERING）、
+  无 `SCAN session_message`、无 `USE TEMP B-TREE`，共 21 条断言进 CI。索引
+  缺失的兼容性：断言针对 fixture（与真实库结构一致），插件运行时不创建/
+  修改索引，真实库退化时插件仍可用。敏感度验证：从 fixture 移除复合索引
+  → 18 处断言立即失败。
+
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 
 - **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，

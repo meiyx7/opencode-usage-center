@@ -30,6 +30,28 @@ function remember(detail: SessionDetail) {
   }
 }
 
+/**
+ * 会话级缓存失效（TASK-08）：Revert / 删除会话后，已加载回合可能包含被
+ * 删除的消息。由页面层在收到对应事件时调用——指定 ID 只清该会话（普通
+ * 打开、翻页、刷新不动其他会话缓存），省略 ID 清空全部（保守兜底）。
+ * 清掉后重新打开会走网络请求，服务端汇总缓存可用 force 跳过 60s TTL。
+ */
+export function invalidateDetailCache(sessionID?: string) {
+  if (sessionID === undefined) {
+    DETAIL_CACHE.clear()
+    return
+  }
+  DETAIL_CACHE.delete(sessionID)
+}
+
+/** Revert 过的脏会话（模块级单例，与 DETAIL_CACHE 同生命周期）。详情页打开时消费并移除。 */
+const revertDirtySessions = new Set<string>()
+
+/** 页面层收到 Revert 事件时标记：下次打开该会话强制走网络刷新两级缓存。 */
+export function markSessionReverted(sessionID: string) {
+  revertDirtySessions.add(sessionID)
+}
+
 /** Merge two turn pages; later arguments win when a turn index overlaps. */
 function mergeTurns(first: readonly SessionTurn[], second: readonly SessionTurn[]): SessionTurn[] {
   const map = new Map<number, SessionTurn>()
@@ -379,7 +401,10 @@ export function SessionDetailView(props: {
   onBack: () => void
 }) {
   const api = props.ctx.client.rpc(Usage)
-  const cachedEntry = DETAIL_CACHE.get(props.session.id)
+  // Revert 过的会话：缓存里的回合可能包含已删除消息，视为未缓存，
+  // 首次加载用 force 跳过服务端汇总 TTL。
+  const wasReverted = revertDirtySessions.delete(props.session.id)
+  const cachedEntry = wasReverted ? undefined : DETAIL_CACHE.get(props.session.id)
   const cached = cachedEntry?.value
   const cachedFresh = Boolean(cachedEntry && Date.now() - cachedEntry.at < DETAIL_FRESH_MS)
   const [detail, setDetail] = createSignal<SessionDetail | undefined>(cached)
@@ -695,8 +720,9 @@ export function SessionDetailView(props: {
   onMount(() => {
     // Fresh cache paints instantly and avoids resetting expanded requests.
     // Stale cache still paints instantly, then revalidates in the background.
+    // Revert 过的会话强制走网络（force 跳过服务端汇总 TTL）。
     if (cachedFresh) return
-    void load(false, Boolean(cached))
+    void load(wasReverted, Boolean(cached))
   })
 
   return (

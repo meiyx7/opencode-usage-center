@@ -209,6 +209,13 @@ function fillSeries(points: SeriesPoint[], from: number, to: number): SeriesPoin
 }
 
 function parseJSON(value: string): Record<string, unknown> | undefined {
+  // 测试探针（TASK-07）：统计 JSON.parse 次数与字节数，证明「只有当前页消息
+  // 被完整解析」。生产环境无消费者，读取一次 undefined 属性零开销。
+  const probe = (globalThis as { __ucReadProbe?: { parses: number; parseBytes: number } }).__ucReadProbe
+  if (probe) {
+    probe.parses += 1
+    probe.parseBytes += value.length
+  }
   try {
     const parsed: unknown = JSON.parse(value)
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined
@@ -1427,6 +1434,13 @@ export class UsageStore {
    * 与 loadMore 都只触碰本页数据，汇总始终覆盖全会话。
    */
   private buildSessionSummary(db: Database, sessionID: string): SessionSummary {
+    // 汇总阶段探针（TASK-07）：记录结构化扫描行数。全部汇总查询只提取顶层
+    // 标量 / json_each 展开状态字段，不把 data 本体传入 JS——bodyBytes 恒 0
+    // 由测试断言（区别于 SQLite 内部的 JSON 解析成本，后者可接受）。
+    const probe = (globalThis as {
+      __ucSummaryProbe?: { scannedRows: number; bodyBytes: number }
+    }).__ucSummaryProbe
+    if (probe) probe.scannedRows = 0
     const row = db
       .query<Row>(
         `SELECT s.id, s.project_id, s.title, s.directory, s.model, s.agent, s.time_created, s.time_updated,
@@ -1466,6 +1480,7 @@ export class UsageStore {
          ORDER BY seq`,
       )
       .all(sessionID)
+    if (probe) probe.scannedRows += aggRows.length
 
     const requests: LatencySample[] = []
     let cost = 0
@@ -1511,25 +1526,32 @@ export class UsageStore {
     const syntheticHead = text(firstRow?.type) === "assistant" ? 1 : 0
     const userCount = num(userCountRow?.n)
     const totalTurns = userCount + syntheticHead
-    // 工具调用数与工具错误数：content 数组里的 tool part。SQLite 无法可靠
-    // 数嵌套数组元素，退化为对 assistant data 的 JS 侧轻量计数——只读状态
-    // 字段，不构建 SessionRequest / SessionToolCall 对象。
-    let toolCount = 0
-    let toolErrorCount = 0
-    for (const m of db
-      .query<Row>("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' AND json_valid(data)")
-      .all(sessionID)) {
-      const data = parseJSON(String(m.data))
-      const content = Array.isArray(data?.content) ? data.content : []
-      for (const part of content) {
-        const record = asRecord(part)
-        if (record?.type !== "tool") continue
-        toolCount += 1
-        const state = asRecord(record.state)
-        if (text(state?.status) === "error" || state?.error) toolErrorCount += 1
-      }
-    }
-    // 请求级错误数（data.error 字段）由上面的 SQL 聚合给出（errorCount 起始值）。
+    // 工具调用数与工具错误数（复审 TASK-06）：不再把全部 assistant data 读进
+    // JS 逐条解析——单条 SQL 用 json_each 展开 content 数组完成聚合。SQLite
+    // 内部仍要解析 JSON（全会话统计扫描必要的结构化数据），但正文/思考/工具
+    // 输入输出不再传入 JS。口径与旧 JS 实现一致：tool part 计数；status==='error'
+    // 或 state.error 非空计错误；坏 JSON / content 缺失 / 非数组 / 空数组 → 0。
+    const toolAgg = db
+      .query<Row>(
+        `SELECT
+           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools,
+           SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool'
+                     AND (json_extract(je.value, '$.state.status') = 'error'
+                          OR json_extract(je.value, '$.state.error') IS NOT NULL) THEN 1 ELSE 0 END) AS toolErrors,
+           COUNT(*) AS expandedParts
+         FROM session_message sm,
+              json_each(CASE WHEN json_valid(sm.data)
+                              AND json_type(sm.data, '$.content') = 'array'
+                             THEN json_extract(sm.data, '$.content') ELSE '[]' END) je
+         WHERE sm.session_id = ? AND sm.type = 'assistant'
+           AND json_type(je.value) = 'object'`,
+      )
+      .get(sessionID)
+    const toolCount = num(toolAgg?.tools)
+    const toolErrorCount = num(toolAgg?.toolErrors)
+    // json_each 展开的 content 元素行数（结构化扫描，非正文传入）
+    if (probe) probe.scannedRows += num(toolAgg?.expandedParts)
+    // 请求级错误数（data.error 字段）已由上面的 SQL 聚合给出（errorCount 起始值）。
     errorCount += toolErrorCount
 
     const latency = latencyStats(requests)
@@ -1697,10 +1719,13 @@ export class UsageStore {
             )
             .all(sessionID, pageStartSeq, cursorSeq)
         : []
-    const counters = (globalThis as { __ucPageReads?: { messages: number; assistant: number } }).__ucPageReads
+    const counters = (globalThis as { __ucPageReads?: { messages: number; assistant: number; bodyBytes: number } })
+      .__ucPageReads
     if (counters) {
       counters.messages += messageRows.length
       counters.assistant += messageRows.filter((m) => text(m.type) === "assistant").length
+      // data 列总字节数：本页传给 JS 的正文体积（summary 阶段 0 传入）
+      for (const m of messageRows) counters.bodyBytes += String(m.data ?? "").length
     }
 
     const turns: MutableTurn[] = []

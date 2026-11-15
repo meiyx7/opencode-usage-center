@@ -938,8 +938,9 @@ function main(): void {
     edgeCase("边界 60 user 有头", 60, true)
     edgeCase("边界 61 user 有头", 61, true)
 
-    // 15g. 10,000 回合长会话（复审 P2 → 阶段 A 补充）：首屏只解析当前页，
-    // 全链翻页完整，汇总与独立预期对账，记录各阶段耗时。
+    // 15g. 10,000 回合长会话（复审 P2 → 阶段 A 补充；TASK-07 扩展）：大体积
+    // 正文/思考/工具内容 + 分阶段读取量探针。首屏只解析当前页，全链翻页完整，
+    // 汇总与独立预期对账，记录各阶段耗时与字节数。
     const hugeFile = `${process.env.TMPDIR ?? "/tmp"}/uc-huge-${process.pid}-${Math.random().toString(36).slice(2)}.db`
     const dbHuge = new Database(hugeFile)
     dbHuge.exec(`
@@ -955,7 +956,21 @@ function main(): void {
     dbHuge.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('hg1', 'ph', '万回合', 1, 1)").run()
     const hugeMsg = dbHuge.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'hg1', ?, ?, ?, ?, ?)")
     const hugeTurns = 10_000
-    const hugePayload = JSON.stringify({ cost: 0.001, model: { providerID: "prov-x", id: "model-a" }, agent: "build", tokens: { input: 30, output: 15, cache: { read: 10, write: 2 } }, time: { created: 1, streamed: 100, completed: 900 } })
+    // 大体积正文（TASK-07）：每条 assistant 带数 KB 的文本/思考/工具输出，
+    // 让「全量正文传入 JS」与「只传当前页」的差距在字节数上可见。
+    const bigText = "长".repeat(3_000)
+    const hugePayload = JSON.stringify({
+      cost: 0.001,
+      model: { providerID: "prov-x", id: "model-a" },
+      agent: "build",
+      tokens: { input: 30, output: 15, cache: { read: 10, write: 2 } },
+      time: { created: 1, streamed: 100, completed: 900 },
+      content: [
+        { type: "text", text: bigText },
+        { type: "reasoning", text: bigText },
+        { type: "tool", id: "t", name: "bash", state: { status: "completed", input: { command: `echo ${bigText.slice(0, 500)}` }, metadata: { output: bigText.slice(0, 800) } } },
+      ],
+    })
     dbHuge.transaction(() => {
       for (let i = 0; i < hugeTurns; i++) {
         hugeMsg.run(`h${i}u`, "user", i * 2 + 1, i, i, JSON.stringify({ text: `回合 ${i}` }))
@@ -969,12 +984,34 @@ function main(): void {
     const tFirst = performance.now()
     expect("huge totalTurns", hugeFirst.totalTurns, hugeTurns)
     expect("huge 首屏回合数 = 60", hugeFirst.turns.length, 60)
-    const hugeReads = { messages: 0, assistant: 0 }
+    expect("huge 大体积正文下 toolCount 正常", hugeFirst.toolCount, hugeTurns)
+    // 分阶段探针（TASK-07）：pageReads = 分页阶段传入 JS 的正文行/字节；
+    // summaryProbe = 汇总阶段结构化扫描行数与正文字节（必须为 0）。
+    // parseProbe = JSON.parse 次数与字节数（只应覆盖当前页 + user 行）。
+    const hugeReads = { messages: 0, assistant: 0, bodyBytes: 0 }
+    const hugeSummary = { scannedRows: 0, bodyBytes: 0 }
+    const hugeParse = { parses: 0, parseBytes: 0 }
     ;(globalThis as { __ucPageReads?: typeof hugeReads }).__ucPageReads = hugeReads
-    const beforeFirst = hugeReads.messages
+    ;(globalThis as { __ucSummaryProbe?: typeof hugeSummary }).__ucSummaryProbe = hugeSummary
+    ;(globalThis as { __ucReadProbe?: typeof hugeParse }).__ucReadProbe = hugeParse
+    hugeSummary.scannedRows = 0
+    hugeSummary.bodyBytes = 0
+    hugeParse.parses = 0
+    hugeParse.parseBytes = 0
+    const pageBefore = { ...hugeReads }
+    const parseBefore = { ...hugeParse }
     hugeStore.sessionDetail({ sessionID: "hg1", force: true })
-    const firstReads = hugeReads.messages - beforeFirst
+    const firstReads = hugeReads.messages - pageBefore.messages
+    const firstBytes = hugeReads.bodyBytes - pageBefore.bodyBytes
+    const firstParses = hugeParse.parses - parseBefore.parses
+    const firstParseBytes = hugeParse.parseBytes - parseBefore.parseBytes
+    const firstScanned = hugeSummary.scannedRows
+    const summaryBodyBytes = hugeSummary.bodyBytes
     expect("huge 首屏读取消息数 ≤ ~125（非 20000）", firstReads <= 130, true)
+    expect("huge 汇总阶段正文传入 JS 字节 = 0", summaryBodyBytes, 0)
+    expect("huge 首屏 JSON 解析次数 ≤ 页内消息数（非 20000）", firstParses <= firstReads, true)
+    const singleRowBytes = hugePayload.length + JSON.stringify({ text: `回合 0` }).length
+    expect("huge 首屏解析字节 ≈ 当前页（< 5% 全会话）", firstParseBytes < hugeTurns * singleRowBytes * 0.05, true)
     let hugeCursor: number | undefined
     let hugeLoaded = 0
     let hugeCost = 0
@@ -993,16 +1030,83 @@ function main(): void {
       hugeCursor = page.nextBefore
     }
     ;(globalThis as { __ucPageReads?: typeof hugeReads }).__ucPageReads = undefined
+    ;(globalThis as { __ucSummaryProbe?: typeof hugeSummary }).__ucSummaryProbe = undefined
+    ;(globalThis as { __ucReadProbe?: typeof hugeParse }).__ucReadProbe = undefined
     const tAll = performance.now()
     expect("huge 翻页总回合", hugeLoaded, hugeTurns)
     expect("huge Σ页cost = 汇总", hugeCost, hugeFirst.cost, 1e-9)
     expect("huge 汇总 = 独立预期", hugeFirst.cost, hugeTurns * 0.001, 1e-9)
     expect("huge 每页读取 ≤ 130 行（真分页，全会话 20000 行）", maxPageReads <= 130, true)
     console.log(
-      `[长会话] ${hugeTurns} 回合: 首屏 ${(tFirst - tBuild).toFixed(0)}ms（读取 ${readPerFirst} 行）、全链 ${hugePages} 页 ${(tAll - tFirst).toFixed(0)}ms、单页最大读取 ${maxPageReads} 行`,
+      `[长会话] ${hugeTurns} 回合: 首屏 ${(tFirst - tBuild).toFixed(0)}ms / 正文 ${firstReads} 行 ${(firstBytes / 1048576).toFixed(1)}MB / JSON 解析 ${firstParses} 次 ${(firstParseBytes / 1048576).toFixed(1)}MB / 汇总结构化扫描 ${firstScanned} 行（正文传入 0 字节）/ 全链 ${hugePages} 页 ${(tAll - tFirst).toFixed(0)}ms / 单页最大读取 ${maxPageReads} 行`,
     )
     hugeStore.close()
     require("node:fs").rmSync(hugeFile)
+
+    // 15h. 查询计划自动化回归（TASK-09）：fixture 含与 OpenCode 真实 schema
+    // 一致的复合索引，断言核心分页 SQL 全部命中索引（SEARCH/COVERING），
+    // 不出现 SCAN（全表扫描）或临时排序（USE TEMP B-TREE）。只读约束下
+    // 不断言索引名称存在性（真实库缺索引时插件仍可用，仅性能退化）。
+    const planFile = `${process.env.TMPDIR ?? "/tmp"}/uc-plan-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbPlan = new Database(planFile)
+    dbPlan.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    const planQuery = (sql: string): string => {
+      const rows = dbPlan.query(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]
+      return rows.map((r) => r.detail).join(" | ")
+    }
+    const planChecks: [string, string, RegExp][] = [
+      [
+        "user 边界探测（页起点）",
+        `SELECT seq FROM session_message WHERE session_id = 'x' AND type = 'user' AND seq < 100 ORDER BY seq DESC LIMIT 61`,
+        /COVERING INDEX session_message_session_type_seq_idx/,
+      ],
+      [
+        "游标翻译（seqOfTurnStart）",
+        `SELECT seq FROM session_message WHERE session_id = 'x' AND type = 'user' ORDER BY seq LIMIT 1 OFFSET 5`,
+        /COVERING INDEX session_message_session_type_seq_idx/,
+      ],
+      [
+        "会话首条消息（头部合成回合判定）",
+        `SELECT type, seq FROM session_message WHERE session_id = 'x' ORDER BY seq LIMIT 1`,
+        /session_message_session_seq_idx/,
+      ],
+      [
+        "本页消息读取",
+        `SELECT id, type, seq, time_created, data FROM session_message WHERE session_id = 'x' AND seq >= 1 AND seq < 100 ORDER BY seq`,
+        /session_message_session_seq_idx/,
+      ],
+      [
+        "游标前回合计数",
+        `SELECT COUNT(*) AS n FROM session_message WHERE session_id = 'x' AND type = 'user' AND seq < 100`,
+        /COVERING INDEX session_message_session_type_seq_idx/,
+      ],
+      [
+        "汇总标量聚合",
+        `SELECT json_extract(data, '$.cost') FROM session_message WHERE session_id = 'x' AND type = 'assistant' AND json_valid(data) ORDER BY seq`,
+        /session_message_session_type_seq_idx/,
+      ],
+      [
+        "最后一条消息时间",
+        `SELECT MAX(seq) AS s FROM session_message WHERE session_id = 'x'`,
+        /COVERING INDEX session_message_session_seq_idx/,
+      ],
+    ]
+    for (const [label, sql, expected] of planChecks) {
+      const detail = planQuery(sql)
+      expect(`${label} 命中索引`, expected.test(detail), true)
+      expect(`${label} 无全表扫描`, /SCAN session_message(?!_)/.test(detail), false)
+      expect(`${label} 无临时排序`, /TEMP B-TREE/.test(detail), false)
+    }
+    dbPlan.close()
+    require("node:fs").rmSync(planFile)
   }
 
   if (failures.length > 0) {

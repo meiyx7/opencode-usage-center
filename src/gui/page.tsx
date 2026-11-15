@@ -21,7 +21,7 @@ import {
   shortModel,
   type RangeKind,
 } from "./format"
-import { SessionDetailView } from "./session-detail"
+import { SessionDetailView, invalidateDetailCache, markSessionReverted } from "./session-detail"
 import { IntegrationsPage } from "./integrations"
 import { ModelsExplorer } from "./models-explorer"
 import { agentTokens, cacheHitRate, effectiveTokens, modelTokens, pointCacheHit, pointTokens, projectUsageTokens, sessionTokens } from "./metrics"
@@ -2696,16 +2696,32 @@ export function UsagePage(props: { ctx: Context; embedded?: boolean }) {
     const controller = new AbortController()
     void (async () => {
       try {
-        for await (const _event of props.ctx.client.event.subscribe({
+        for await (const event of props.ctx.client.event.subscribe({
           types: [
             "session.usage.updated",
             "session.execution.succeeded",
             "session.execution.failed",
             "session.execution.interrupted",
+            // Revert / 删除（TASK-08）：已加载回合与汇总可能引用被删除的消息，
+            // 立即失效对应会话的前端缓存；重新打开时 force 跳过服务端汇总 TTL。
+            "session.revert.committed",
+            "session.revert.cleared",
+            "session.deleted",
           ],
           signal: controller.signal,
         })) {
           if (controller.signal.aborted) break
+          const kind = event.type as string
+          if (kind === "session.revert.committed" || kind === "session.revert.cleared") {
+            const sessionID = (event.data as { sessionID?: string } | undefined)?.sessionID
+            if (sessionID) {
+              invalidateDetailCache(sessionID)
+              markSessionReverted(sessionID)
+            }
+          } else if (kind === "session.deleted") {
+            const payload = event.data as { id?: string; sessionID?: string } | undefined
+            invalidateDetailCache(payload?.id ?? payload?.sessionID)
+          }
           schedule()
         }
       } catch {
