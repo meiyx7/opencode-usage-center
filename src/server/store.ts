@@ -71,6 +71,45 @@ const PREVIEW = {
   summary: 120,
 } as const
 
+/**
+ * 会话分页核心 SQL（TASK-09）：生产查询与 15h 查询计划回归共用同一份文本——
+ * 改生产 SQL 而忘了改测试是不可能的（同一常量）。占位符 ? 与运行时一致。
+ * 真实 OpenCode 数据库带 (session_id, seq) 与 (session_id, type, seq) 复合
+ * 索引，这些查询全部命中索引（SEARCH/COVERING），不得退化全表扫描。
+ */
+export const SESSION_PAGE_SQLS = {
+  /** 本页 user 边界探测（页起点）：倒序取 limit+1 个。 */
+  userBoundaries: `SELECT seq FROM session_message
+     WHERE session_id = ? AND type = 'user' AND seq < ?
+     ORDER BY seq DESC LIMIT ?`,
+  /** 会话首条消息（头部合成回合判定）。 */
+  firstMessage: `SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1`,
+  /** 本页消息读取（唯一允许携带 data 本体的查询）。 */
+  pageMessages: `SELECT id, type, seq, time_created, data FROM session_message
+     WHERE session_id = ? AND seq >= ? AND seq < ?
+     ORDER BY seq`,
+  /** 游标前回合计数。 */
+  turnCountBefore: `SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'user' AND seq < ?`,
+  /** 汇总：assistant 行标量提取（不含 data 本体——正文不传入 JS）。 */
+  summaryScalars: `SELECT
+           CAST(COALESCE(json_extract(data, '$.cost'), 0) AS REAL) AS cost,
+           CAST(COALESCE(json_extract(data, '$.tokens.input'), 0) AS REAL) AS input,
+           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS output,
+           CAST(COALESCE(json_extract(data, '$.tokens.reasoning'), 0) AS REAL) AS reasoning,
+           CAST(COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS REAL) AS cacheRead,
+           CAST(COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS REAL) AS cacheWrite,
+           CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS REAL) AS created,
+           CAST(COALESCE(json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS streamed,
+           CAST(COALESCE(json_extract(data, '$.time.completed'), json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS completed,
+           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS outTok,
+           CASE WHEN json_extract(data, '$.error') IS NOT NULL THEN 1 ELSE 0 END AS hasError
+         FROM session_message
+         WHERE session_id = ? AND type = 'assistant' AND json_valid(data)
+         ORDER BY seq`,
+  /** 最后一条消息 seq（游标上界）。 */
+  lastSeq: `SELECT MAX(seq) AS s FROM session_message WHERE session_id = ?`,
+} as const
+
 const PROVIDERS: Record<string, string> = {
   opencode: "OpenCode",
   "opencode-go": "OpenCode Go",
@@ -1462,25 +1501,17 @@ export class UsageStore {
     // 不允许一条异常消息让整个会话详情失败。COALESCE 保持 num() 的缺失即 0。
     // 时延样本必须保留原值（分位数口径不变），从提取行在 JS 里算 P50/P95。
     const aggRows = db
-      .query<Row>(
-        `SELECT
-           CAST(COALESCE(json_extract(data, '$.cost'), 0) AS REAL) AS cost,
-           CAST(COALESCE(json_extract(data, '$.tokens.input'), 0) AS REAL) AS input,
-           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS output,
-           CAST(COALESCE(json_extract(data, '$.tokens.reasoning'), 0) AS REAL) AS reasoning,
-           CAST(COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS REAL) AS cacheRead,
-           CAST(COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS REAL) AS cacheWrite,
-           CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS REAL) AS created,
-           CAST(COALESCE(json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS streamed,
-           CAST(COALESCE(json_extract(data, '$.time.completed'), json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS completed,
-           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS outTok,
-           CASE WHEN json_extract(data, '$.error') IS NOT NULL THEN 1 ELSE 0 END AS hasError
-         FROM session_message
-         WHERE session_id = ? AND type = 'assistant' AND json_valid(data)
-         ORDER BY seq`,
-      )
+      .query<Row>(SESSION_PAGE_SQLS.summaryScalars)
       .all(sessionID)
-    if (probe) probe.scannedRows += aggRows.length
+    // 探针（TASK-07 修正）：检查汇总查询返回行的实际列——未来若有人把
+    // data 本体加进 SELECT 列表，bodyBytes 会立刻变成非 0 并触发断言，
+    // 而不是像以前那样恒为 0 的空断言。
+    if (probe) {
+      probe.scannedRows += aggRows.length
+      for (const r of aggRows) {
+        if ("data" in r) probe.bodyBytes += String(r.data ?? "").length
+      }
+    }
 
     const requests: LatencySample[] = []
     let cost = 0
@@ -1521,7 +1552,7 @@ export class UsageStore {
       .query<Row>("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'user'")
       .get(sessionID)
     const firstRow = db
-      .query<Row>("SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .query<Row>(SESSION_PAGE_SQLS.firstMessage)
       .get(sessionID)
     const syntheticHead = text(firstRow?.type) === "assistant" ? 1 : 0
     const userCount = num(userCountRow?.n)
@@ -1537,7 +1568,14 @@ export class UsageStore {
            SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools,
            SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool'
                      AND (json_extract(je.value, '$.state.status') = 'error'
-                          OR json_extract(je.value, '$.state.error') IS NOT NULL) THEN 1 ELSE 0 END) AS toolErrors,
+                          OR CASE
+                               WHEN json_extract(je.value, '$.state.error') IS NULL THEN 0
+                               WHEN typeof(json_extract(je.value, '$.state.error')) = 'text'
+                                    AND json_extract(je.value, '$.state.error') = '' THEN 0
+                               WHEN typeof(json_extract(je.value, '$.state.error')) IN ('integer','real')
+                                    AND json_extract(je.value, '$.state.error') = 0 THEN 0
+                               ELSE 1
+                             END = 1) THEN 1 ELSE 0 END) AS toolErrors,
            COUNT(*) AS expandedParts
          FROM session_message sm,
               json_each(CASE WHEN json_valid(sm.data)
@@ -1679,18 +1717,14 @@ export class UsageStore {
       return { ...summary, turns: [], hasMore: false, nextBefore: 0 }
     }
     const boundaryRows = db
-      .query<Row>(
-        `SELECT seq FROM session_message
-         WHERE session_id = ? AND type = 'user' AND seq < ?
-         ORDER BY seq DESC LIMIT ?`,
-      )
+      .query<Row>(SESSION_PAGE_SQLS.userBoundaries)
       .all(sessionID, cursorSeq, limit + 1)
     // 页起点：本页最多 limit 个回合。boundaryRows 倒序取 limit+1 个：前 limit 个
     // 属于本页；第 limit+1 个说明更早还有回合（供 hasMore 判断），它及其之前的
     // 消息不属于本页。pageStartSeq = 第 limit 个边界（倒序）的 seq —— 若不足
     // limit 个边界，则本页一直覆盖到会话头（可能含头部合成回合）。
     const headRow = db
-      .query<Row>("SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .query<Row>(SESSION_PAGE_SQLS.firstMessage)
       .get(sessionID)
     const headIsAssistant = text(headRow?.type) === "assistant"
     // 页起点：覆盖到头（pageStartSeq = 0）时页含「边界数 + 头部合成回合」；
@@ -1712,11 +1746,7 @@ export class UsageStore {
     const messageRows =
       pageCount > 0
         ? db
-            .query<Row>(
-              `SELECT id, type, seq, time_created, data FROM session_message
-               WHERE session_id = ? AND seq >= ? AND seq < ?
-               ORDER BY seq`,
-            )
+            .query<Row>(SESSION_PAGE_SQLS.pageMessages)
             .all(sessionID, pageStartSeq, cursorSeq)
         : []
     const counters = (globalThis as { __ucPageReads?: { messages: number; assistant: number; bodyBytes: number } })
@@ -1733,7 +1763,7 @@ export class UsageStore {
     // 回合全局序号：游标前的回合总数 = user 边界数 + 头部合成回合。
     // 本页第一回合的全局 index = 游标前回合总数 − 本页回合数 + 1。
     const turnsBeforeCursor = num(
-      db.query<Row>("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'user' AND seq < ?").get(sessionID, cursorSeq)?.n,
+      db.query<Row>(SESSION_PAGE_SQLS.turnCountBefore).get(sessionID, cursorSeq)?.n,
     ) + (headIsAssistant ? 1 : 0)
     let turnIndex = turnsBeforeCursor - pageCount + 1
 
@@ -1820,7 +1850,7 @@ export class UsageStore {
   /** 会话最后一条消息 seq + 1（开区间上界）；无消息返回 undefined。 */
   private seqAfterLastMessage(db: Database, sessionID: string): number | undefined {
     const r = db
-      .query<Row>("SELECT MAX(seq) AS s FROM session_message WHERE session_id = ?")
+      .query<Row>(SESSION_PAGE_SQLS.lastSeq)
       .get(sessionID)
     return r && r.s !== null ? num(r.s) + 1 : undefined
   }

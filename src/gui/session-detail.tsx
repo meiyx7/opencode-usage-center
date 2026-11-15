@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import type { Context } from "@opencode/plugin/gui"
 import { Usage } from "../contract"
 import type { SessionDetail, SessionRequest, SessionRow, SessionToolCall, SessionTurn } from "../contract"
@@ -723,6 +723,24 @@ export function SessionDetailView(props: {
     // Revert 过的会话强制走网络（force 跳过服务端汇总 TTL）。
     if (cachedFresh) return
     void load(wasReverted, Boolean(cached))
+    // Revert 发生在本会话详情打开期间（TASK-08）：事件驱动强制刷新，
+    // load 的合并逻辑会丢弃刷新页覆盖范围外已消失的旧回合。
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of props.ctx.client.event.subscribe({
+          types: ["session.revert.committed", "session.revert.cleared"],
+          signal: controller.signal,
+        })) {
+          if (controller.signal.aborted) break
+          if ((event.data as { sessionID?: string } | undefined)?.sessionID !== props.session.id) continue
+          void load(true)
+        }
+      } catch {
+        // 事件订阅失败时靠手动刷新兜底
+      }
+    })()
+    onCleanup(() => controller.abort())
   })
 
   return (

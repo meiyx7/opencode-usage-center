@@ -8,7 +8,7 @@
  * - 时间范围边界（从/到之外的消息不计入）
  * - cost 缺失按 0 处理
  */
-import { UsageStore } from "../src/server/store"
+import { UsageStore, SESSION_PAGE_SQLS } from "../src/server/store"
 
 const DAY = 86_400_000
 const now = Date.now()
@@ -786,10 +786,14 @@ function main(): void {
         bigSeq++
         bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 300, bigTime + 300, JSON.stringify({ ...payload, cost: 0.02 }))
       } else if (i === 20) {
-        // 工具 + 工具错误
+        // 工具 + 工具错误 + state.error 真值边界（复审收尾项）：""/false/0
+        // 是 JS falsy——旧口径不计错；SQL 必须用真值判断而非 IS NOT NULL。
         payload.content = [
           { type: "tool", id: "t1", name: "read", state: { status: "completed" } },
           { type: "tool", id: "t2", name: "bash", state: { status: "error", error: "exit 1" } },
+          { type: "tool", id: "t3", name: "grep", state: { status: "completed", error: "" } },
+          { type: "tool", id: "t4", name: "edit", state: { status: "completed", error: false } },
+          { type: "tool", id: "t5", name: "glob", state: { status: "completed", error: 0 } },
         ]
         bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 100, bigTime + 100, JSON.stringify(payload))
       } else if (i === 30) {
@@ -818,7 +822,7 @@ function main(): void {
     expect("big cost = 独立预期", first.cost, wantBigCost, 1e-9)
     // 坏 JSON 行仍计入请求数（复审 P1）：218 正常 + 头部 1 + 双发 1 = 220
     expect("big requestCount 含坏 JSON 行", first.requestCount, 220)
-    expect("big toolCount", first.toolCount, 3)
+    expect("big toolCount（含 falsy error 工具）", first.toolCount, 6)
     // 工具错误 2（头 t-head + i=20 的 t2）；i=20 的 data.error 字段不存在
     expect("big errorCount = tool errors", first.errorCount, 2)
     // 首页只含最后 60 回合；合成回合在全局 index 1，翻到第一页验证。
@@ -1043,10 +1047,76 @@ function main(): void {
     hugeStore.close()
     require("node:fs").rmSync(hugeFile)
 
-    // 15h. 查询计划自动化回归（TASK-09）：fixture 含与 OpenCode 真实 schema
-    // 一致的复合索引，断言核心分页 SQL 全部命中索引（SEARCH/COVERING），
-    // 不出现 SCAN（全表扫描）或临时排序（USE TEMP B-TREE）。只读约束下
-    // 不断言索引名称存在性（真实库缺索引时插件仍可用，仅性能退化）。
+    // 15i. Revert 缓存失效行为测试（TASK-08 行为验证，复审补充）：服务端侧
+    // 模拟 Revert——删除消息后 force 读取，已删回合不得出现，其他会话缓存
+    // 不受影响；invalidateDetailCache / markSessionReverted 模块单元验证。
+    const revertFile = `${process.env.TMPDIR ?? "/tmp"}/uc-revert-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbRev = new Database(revertFile)
+    dbRev.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    dbRev.exec(`INSERT INTO project VALUES ('pr', NULL, '/tmp/revert', 1)`)
+    const revSess = dbRev.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES (?, 'pr', ?, 1, 1)")
+    revSess.run("rv1", "Revert 会话")
+    revSess.run("rv2", "无关会话")
+    const revMsg = dbRev.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    const revPayload = JSON.stringify({ cost: 0.01, model: { providerID: "p", id: "m" }, agent: "b", tokens: {}, time: { created: 1, completed: 10 } })
+    // rv1: 5 回合；rv2: 2 回合
+    for (let i = 0; i < 5; i++) {
+      revMsg.run(`r1u${i}`, "rv1", "user", i * 2 + 1, i, i, JSON.stringify({ text: `rv1 回合 ${i + 1}` }))
+      revMsg.run(`r1a${i}`, "rv1", "assistant", i * 2 + 2, i, i, revPayload)
+    }
+    for (let i = 0; i < 2; i++) {
+      revMsg.run(`r2u${i}`, "rv2", "user", i * 2 + 1, i, i, JSON.stringify({ text: `rv2 回合 ${i + 1}` }))
+      revMsg.run(`r2a${i}`, "rv2", "assistant", i * 2 + 2, i, i, revPayload)
+    }
+    dbRev.close()
+    const revStore = new UsageStore(revertFile, () => {})
+    const beforeRevert = revStore.sessionDetail({ sessionID: "rv1", force: true })
+    expect("revert: 初次 5 回合", beforeRevert.totalTurns, 5)
+    // 缓存命中（无 force）：读的是缓存的汇总
+    const cachedRead = revStore.sessionDetail({ sessionID: "rv1" })
+    expect("revert: TTL 内缓存命中", cachedRead.generatedAt, beforeRevert.generatedAt)
+    // 模拟 Revert：删除最后 2 回合的消息（rv1 只剩 3 回合）。直接读写打开
+    //（仅测试环境修改自己的 fixture；插件运行时永远只读打开真实库）。
+    const rawRev = new Database(revertFile, { readwrite: true, create: false })
+    rawRev.exec(`DELETE FROM session_message WHERE session_id = 'rv1' AND seq >= 7`)
+    rawRev.close()
+    // 无 force：TTL 内仍读旧汇总（60s 兜底窗口）——如实断言现有行为
+    const staleRead = revStore.sessionDetail({ sessionID: "rv1" })
+    expect("revert: TTL 内汇总仍为旧值（兜底窗口行为）", staleRead.totalTurns, 5)
+    // force 读取：汇总立即反映删除后状态
+    const forcedAfterRevert = revStore.sessionDetail({ sessionID: "rv1", force: true })
+    expect("revert: force 后汇总 = 3 回合", forcedAfterRevert.totalTurns, 3)
+    expect("revert: force 后成本同步", forcedAfterRevert.cost, 3 * 0.01, 1e-9)
+    expect("revert: 页内无已删回合", forcedAfterRevert.turns.length, 3)
+    // 无关会话缓存不受影响（rv2 从未读过 → 读到的是新数据；再读一次命中缓存验证 LRU 不串）
+    const other1 = revStore.sessionDetail({ sessionID: "rv2", force: true })
+    const other2 = revStore.sessionDetail({ sessionID: "rv2" })
+    expect("revert: 无关会话数据正常", other1.totalTurns, 2)
+    expect("revert: 无关会话缓存命中", other2.generatedAt, other1.generatedAt)
+    // 前端缓存失效模块单元验证（Bun 可直接 import TS 模块）
+    const frontCache = require("../src/gui/session-detail") as {
+      invalidateDetailCache: (sessionID?: string) => void
+      markSessionReverted: (sessionID: string) => void
+    }
+    expect("revert: 前端失效函数可导入", typeof frontCache.invalidateDetailCache, "function")
+    expect("revert: 脏标记函数可导入", typeof frontCache.markSessionReverted, "function")
+    frontCache.invalidateDetailCache("rv1") // 指定 ID 清理不抛错
+    frontCache.invalidateDetailCache() // 全清不抛错
+    frontCache.markSessionReverted("rv1") // 标记不抛错
+    revStore.close()
+    require("node:fs").rmSync(revertFile)
+
+    // 15h. 查询计划自动化回归（TASK-09，复审修正后）：直接引用 store.ts 导出的
+    // SESSION_PAGE_SQLS——生产查询与测试共用同一份 SQL 文本，改生产不改测试
+    // 不再可能。断言命中索引（SEARCH/COVERING）、无全表扫描、无临时排序。
+    // 只读约束下不断言索引名称存在性（真实库缺索引时插件仍可用，仅性能退化）。
     const planFile = `${process.env.TMPDIR ?? "/tmp"}/uc-plan-${process.pid}-${Math.random().toString(36).slice(2)}.db`
     const dbPlan = new Database(planFile)
     dbPlan.exec(`
@@ -1062,46 +1132,52 @@ function main(): void {
       const rows = dbPlan.query(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]
       return rows.map((r) => r.detail).join(" | ")
     }
+    // 占位符填具体值（EXPLAIN 不执行，参数只影响计划文本展示）
     const planChecks: [string, string, RegExp][] = [
       [
         "user 边界探测（页起点）",
-        `SELECT seq FROM session_message WHERE session_id = 'x' AND type = 'user' AND seq < 100 ORDER BY seq DESC LIMIT 61`,
-        /COVERING INDEX session_message_session_type_seq_idx/,
-      ],
-      [
-        "游标翻译（seqOfTurnStart）",
-        `SELECT seq FROM session_message WHERE session_id = 'x' AND type = 'user' ORDER BY seq LIMIT 1 OFFSET 5`,
-        /COVERING INDEX session_message_session_type_seq_idx/,
+        SESSION_PAGE_SQLS.userBoundaries.replace(/\?/g, "100").replace(/LIMIT \d+/, "LIMIT 61"),
+        /SEARCH( COVERING)? session_message USING( COVERING)? INDEX session_message_session_type_seq_idx/,
       ],
       [
         "会话首条消息（头部合成回合判定）",
-        `SELECT type, seq FROM session_message WHERE session_id = 'x' ORDER BY seq LIMIT 1`,
+        SESSION_PAGE_SQLS.firstMessage.replace(/\?/g, "'x'"),
         /session_message_session_seq_idx/,
       ],
       [
-        "本页消息读取",
-        `SELECT id, type, seq, time_created, data FROM session_message WHERE session_id = 'x' AND seq >= 1 AND seq < 100 ORDER BY seq`,
+        "本页消息读取（唯一带 data 本体的查询）",
+        SESSION_PAGE_SQLS.pageMessages.replace(/\?/g, "1").replace(/seq < \d+/, "seq < 100"),
         /session_message_session_seq_idx/,
       ],
       [
         "游标前回合计数",
-        `SELECT COUNT(*) AS n FROM session_message WHERE session_id = 'x' AND type = 'user' AND seq < 100`,
+        SESSION_PAGE_SQLS.turnCountBefore.replace(/\?/g, "100"),
         /COVERING INDEX session_message_session_type_seq_idx/,
       ],
       [
-        "汇总标量聚合",
-        `SELECT json_extract(data, '$.cost') FROM session_message WHERE session_id = 'x' AND type = 'assistant' AND json_valid(data) ORDER BY seq`,
+        "汇总标量聚合（json_extract，无 data 本体列）",
+        SESSION_PAGE_SQLS.summaryScalars.replace(/\?/g, "'x'"),
         /session_message_session_type_seq_idx/,
       ],
       [
-        "最后一条消息时间",
-        `SELECT MAX(seq) AS s FROM session_message WHERE session_id = 'x'`,
+        "最后一条消息 seq",
+        SESSION_PAGE_SQLS.lastSeq.replace(/\?/g, "'x'"),
         /COVERING INDEX session_message_session_seq_idx/,
+      ],
+      // 工具统计（json_each 展开，复审补充纳入）
+      [
+        "工具统计 json_each 聚合",
+        `SELECT SUM(CASE WHEN json_extract(je.value, '$.type') = 'tool' THEN 1 ELSE 0 END) AS tools
+         FROM session_message sm,
+              json_each(CASE WHEN json_valid(sm.data) AND json_type(sm.data, '$.content') = 'array'
+                             THEN json_extract(sm.data, '$.content') ELSE '[]' END) je
+         WHERE sm.session_id = 'x' AND sm.type = 'assistant' AND json_type(je.value) = 'object'`,
+        /session_message_session_type_seq_idx/,
       ],
     ]
     for (const [label, sql, expected] of planChecks) {
       const detail = planQuery(sql)
-      expect(`${label} 命中索引`, expected.test(detail), true)
+      expect(`${label} 命中索引（SEARCH）`, expected.test(detail), true)
       expect(`${label} 无全表扫描`, /SCAN session_message(?!_)/.test(detail), false)
       expect(`${label} 无临时排序`, /TEMP B-TREE/.test(detail), false)
     }
