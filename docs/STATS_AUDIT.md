@@ -335,12 +335,22 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
 - **游标无进展防护**（本轮唯一代码修正）：loadMore 响应的首回合 index
   ≥ 本页游标（nextBefore）时，说明没有取到更早回合——再合并会原样返回，
   用户重试仍请求同一页（无限加载）。判定无进展直接终止分页
-  （hasMore=false, nextBefore=0）。
-- **15k 数据流回归**：`mergeTurns`/`withTurns` 导出为可测纯函数，测试覆盖
-  合并去重（重叠 index 后者胜出）、升序输出、hasMore/nextBefore 语义；
-  并以生产合并函数模拟前端 loadMore 连续三页（220 回合 fixture）——
-  每页无重复 index、序号连续无乱序（41..220）、游标单调递减、
-  Σ回合 cost 与独立预期一致（180 × 0.001）。
+  （hasMore=false, nextBefore=0），并**保留 current 回合数据不动**：
+  无进展意味着新页没有可信的更早数据，不执行 merge，避免异常响应污染
+  已加载集合（回合对象保持原引用）。
+- **loadMore 调用链提取**（复审收尾）：`canLoadMore`（入口守卫）、
+  `loadMoreProgress`（游标判定）、`applyLoadMoreResult`（响应归并）三个
+  导出函数被组件 loadMore 与 15k 测试共用——测试驱动的是生产代码路径，
+  不是复刻逻辑。
+- **15k 数据流回归**：`mergeTurns`/`withTurns` 纯函数覆盖合并去重
+  （重叠 index 后者胜出）、升序输出、hasMore/nextBefore 语义；
+  `loadMoreProgress` 四场景直测（正常下一页 / 空页 / 游标持平 /
+  游标倒退）；最小合成回合页覆盖无进展保留引用与有进展合并；
+  220 回合 fixture 走完整调用链——首屏 60 回合后连续三次 loadMore
+  （canLoadMore 守卫 → beforeTurn 请求 → 归并），断言请求次数、每页
+  仅追加、游标前移、四页合计 220、序号连续 1..220、cost 全量对账；
+  到达终点后守卫拒绝再次请求，重复页响应终止分页且不额外请求。
+  10k 长会话规模验证明确留在 TASK-17 性能验收（原注释误写 10k，已更正）。
 
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 

@@ -1226,11 +1226,25 @@ async function main(): Promise<void> {
     expect("15j 卸载后消费循环终止（动作不再执行）", countsAbort.invalidate > countsAbort.forceReload, false)
     expect("15j 卸载后 forceReload 恰好 1 次", countsAbort.forceReload, 1)
 
-    // 15k. 前端分页数据流回归（TASK-14）：mergeTurns / withTurns 纯函数 +
-    // 服务端 10k 会话三页连续加载（引用生产合并函数模拟前端 loadMore 流程）。
+    // 15k. 前端分页数据流回归（TASK-14）：与组件 loadMore 共用同一实现——
+    // canLoadMore（入口守卫）+ loadMoreProgress（游标判定）+
+    // applyLoadMoreResult（响应归并）。220 回合 fixture 驱动连续请求；
+    // 10k 长会话规模验证留在 TASK-17 性能验收。
     const front = require("../src/gui/session-detail") as {
       mergeTurns: (a: readonly SessionTurn[], b: readonly SessionTurn[]) => SessionTurn[]
       withTurns: (d: SessionDetail, t: SessionTurn[]) => SessionDetail
+      canLoadMore: (state: {
+        sessionGone: boolean
+        hasMore: boolean
+        loadingMore: boolean
+        refreshing: boolean
+        inFlight: number
+      }) => boolean
+      loadMoreProgress: (
+        response: { turns: readonly SessionTurn[] },
+        nextBefore: number,
+      ) => { progress: boolean; reason: "ok" | "empty" | "stalled" }
+      applyLoadMoreResult: (current: SessionDetail, next: SessionDetail) => SessionDetail
     }
     // withTurns 只读 id/title 等展示字段之外的汇总字段——最小占位即可
     const emptyDetailLike = {
@@ -1291,6 +1305,46 @@ async function main(): Promise<void> {
     const wtB = front.withTurns({ ...emptyDetailLike, turns: [] }, [mkTurn(3, 0)])
     expect("15k 首回合 index=3 → hasMore=true", wtB.hasMore, true)
     expect("15k nextBefore=首回合 index", wtB.nextBefore, 3)
+    // loadMoreProgress 四场景直测（复审要求：游标保护必须有防回归断言）
+    expect("15k 游标判定 ok", front.loadMoreProgress({ turns: [mkTurn(101, 0)] }, 161).reason, "ok")
+    expect("15k 游标判定空页", front.loadMoreProgress({ turns: [] }, 161).reason, "empty")
+    expect("15k 游标判定持平", front.loadMoreProgress({ turns: [mkTurn(161, 0)] }, 161).reason, "stalled")
+    expect("15k 游标判定倒退", front.loadMoreProgress({ turns: [mkTurn(200, 0)] }, 161).reason, "stalled")
+    // 无进展/空页保留 current 回合不动（复审要求）：只终止分页，不合并异常页。
+    // 回合对象保持原引用——合并路径未被执行，已有回合未被重建。
+    const current15k = {
+      ...emptyDetailLike,
+      turns: [mkTurn(161, 0), mkTurn(162, 0)],
+      hasMore: true,
+      nextBefore: 161,
+    } as SessionDetail
+    const stalled15k = front.applyLoadMoreResult(current15k, {
+      ...emptyDetailLike,
+      turns: [mkTurn(161, 0), mkTurn(162, 0)],
+      hasMore: true,
+      nextBefore: 161,
+    } as SessionDetail)
+    expect("15k 无进展回合数不变", stalled15k.turns.length, 2)
+    expect("15k 无进展回合对象原样保留", stalled15k.turns[0] === current15k.turns[0], true)
+    expect("15k 无进展终止分页", stalled15k.hasMore, false)
+    expect("15k 无进展游标归零", stalled15k.nextBefore, 0)
+    const empty15k = front.applyLoadMoreResult(current15k, {
+      ...emptyDetailLike,
+      turns: [],
+      hasMore: false,
+      nextBefore: 0,
+    } as SessionDetail)
+    expect("15k 空页保留已加载回合", empty15k.turns.length, 2)
+    expect("15k 空页终止分页", empty15k.hasMore, false)
+    // 有进展：合并新增回合、游标前移
+    const grown15k = front.applyLoadMoreResult(current15k, {
+      ...emptyDetailLike,
+      turns: [mkTurn(159, 0), mkTurn(160, 0)],
+      hasMore: true,
+      nextBefore: 159,
+    } as SessionDetail)
+    expect("15k 有进展回合数增加", grown15k.turns.length, 4)
+    expect("15k 有进展游标前移", grown15k.nextBefore, 159)
     // 连续三页模拟（服务端 10k 会话）：每页 60 回合，合并后无重复、无乱序、
     // 游标单调递减、第三页后继续有 hasMore（前端可继续加载）。
     // 自建轻量分页库：220 回合（首页 60 + 二页 60 + 三页 60 + 剩余 40）
@@ -1316,33 +1370,105 @@ async function main(): Promise<void> {
     })()
     db15k.close()
     const store15k = new UsageStore(file15k, () => {})
-    let frontTurns: SessionTurn[] = []
-    let cursor15k: number | undefined
+    // 首屏由 load() 建立分页状态（withTurns）；之后三次 loadMore 全部走
+    // 生产函数 applyLoadMoreResult——与组件 loadMore 的响应处理完全同源。
+    const firstPage15k = store15k.sessionDetail({ sessionID: "fk1", limit: 60, force: true })
+    let frontDetail = front.withTurns(
+      { ...emptyDetailLike, turns: [], hasMore: false, nextBefore: 0 } as SessionDetail,
+      [...firstPage15k.turns],
+    )
     const seenIndexes = new Set<number>()
     let lastCostSum = 0
-    for (let page = 0; page < 3; page++) {
-      const pageDetail = store15k.sessionDetail({ sessionID: "fk1", beforeTurn: cursor15k, limit: 60, force: true })
-      const before = frontTurns.length
-      frontTurns = front.mergeTurns(frontTurns, pageDetail.turns)
-      expect(`15k 第 ${page + 1} 页合并后无重复`, frontTurns.length, before + pageDetail.turns.length)
+    for (const turn of frontDetail.turns) {
+      expect("15k 首屏无重复 index", seenIndexes.has(turn.index), false)
+      seenIndexes.add(turn.index)
+      lastCostSum += turn.cost
+    }
+    expect("15k 首屏 60 回合且 hasMore", frontDetail.turns.length === 60 && frontDetail.hasMore, true)
+    // 模拟组件 loadMore 完整调用链：入口守卫 → 服务端游标请求 → 归并。
+    // 连续调用直到 hasMore=false，断言请求次数与每页追加/游标推进。
+    const guardState = {
+      sessionGone: false,
+      loadingMore: false,
+      refreshing: false,
+      inFlight: 0,
+    }
+    let loadMoreCalls = 0
+    const runLoadMore = () => {
+      if (!front.canLoadMore({ ...guardState, hasMore: frontDetail.hasMore })) return
+      loadMoreCalls += 1
+      const pageDetail = store15k.sessionDetail({
+        sessionID: "fk1",
+        beforeTurn: frontDetail.nextBefore,
+        limit: 60,
+        force: true,
+      })
+      const beforeCount = frontDetail.turns.length
+      const beforeCursor = frontDetail.nextBefore
+      frontDetail = front.applyLoadMoreResult(frontDetail, pageDetail)
+      expect(`15k 第 ${loadMoreCalls + 1} 页仅追加新增回合`, frontDetail.turns.length, beforeCount + pageDetail.turns.length)
+      expect(`15k 第 ${loadMoreCalls + 1} 页游标前移`, frontDetail.nextBefore < beforeCursor, true)
       for (const turn of pageDetail.turns) {
-        expect(`15k 第 ${page + 1} 页无重复 index`, seenIndexes.has(turn.index), false)
+        expect(`15k 第 ${loadMoreCalls + 1} 页无重复 index`, seenIndexes.has(turn.index), false)
         seenIndexes.add(turn.index)
         lastCostSum += turn.cost
       }
-      const withTurnsResult = front.withTurns(
-        { ...emptyDetailLike, turns: frontTurns, cost: lastCostSum },
-        frontTurns,
-      )
-      if (page < 2) {
-        expect(`15k 第 ${page + 1} 页后 hasMore`, withTurnsResult.hasMore, true)
-        expect(`15k 游标单调递减`, withTurnsResult.nextBefore < (cursor15k ?? Number.POSITIVE_INFINITY), true)
-        cursor15k = pageDetail.nextBefore
-      }
     }
-    expect("15k 三页合计 180 回合", frontTurns.length, 180)
-    expect("15k 序号连续无乱序（41..220）", frontTurns.map((t) => t.index).join(","), Array.from({ length: 180 }, (_, i) => i + 41).join(","))
-    expect("15k Σ回合cost 与页数据一致", frontTurns.reduce((sum, t) => sum + t.cost, 0), 180 * 0.001, 1e-9)
+    runLoadMore()
+    runLoadMore()
+    runLoadMore()
+    expect("15k 三次 loadMore 请求", loadMoreCalls, 3)
+    // 到达终点后守卫拦下后续点击：不再请求
+    runLoadMore()
+    expect("15k 终点后不再请求", loadMoreCalls, 3)
+    expect("15k 四页合计 220 回合", frontDetail.turns.length, 220)
+    expect("15k 序号连续无乱序（1..220）", frontDetail.turns.map((t) => t.index).join(","), Array.from({ length: 220 }, (_, i) => i + 1).join(","))
+    expect("15k Σ回合cost 与页数据一致", frontDetail.turns.reduce((sum, t) => sum + t.cost, 0), 220 * 0.001, 1e-9)
+    expect("15k 覆盖回合 cost 全量对账", lastCostSum, 220 * 0.001, 1e-9)
+    expect("15k 到达终点 hasMore=false", frontDetail.hasMore, false)
+    expect("15k 到达终点 nextBefore=0", frontDetail.nextBefore, 0)
+    // 服务端重复返回当前页（游标不前进）：保留回合不动、终止分页，
+    // 且下一次点击被入口守卫拦下——不会无限请求同一页。
+    const repeatCurrent = {
+      ...emptyDetailLike,
+      turns: [...firstPage15k.turns],
+      hasMore: true,
+      nextBefore: 161,
+    } as SessionDetail
+    const stalledCallCount = loadMoreCalls
+    const stalledResult = front.applyLoadMoreResult(repeatCurrent, {
+      ...repeatCurrent,
+      turns: [...firstPage15k.turns],
+    })
+    expect("15k 重复页保留回合引用", stalledResult.turns[0] === repeatCurrent.turns[0], true)
+    expect("15k 重复页终止分页", stalledResult.hasMore, false)
+    expect(
+      "15k 重复页后守卫拒绝请求",
+      front.canLoadMore({ ...guardState, hasMore: stalledResult.hasMore }),
+      false,
+    )
+    expect("15k 重复页未额外请求", loadMoreCalls, stalledCallCount)
+    // 守卫各维度单独生效：删除 / 加载中 / 刷新中 / 请求在途
+    expect(
+      "15k 删除状态守卫拒绝",
+      front.canLoadMore({ ...guardState, sessionGone: true, hasMore: true }),
+      false,
+    )
+    expect(
+      "15k 加载中守卫拒绝",
+      front.canLoadMore({ ...guardState, loadingMore: true, hasMore: true }),
+      false,
+    )
+    expect(
+      "15k 刷新中守卫拒绝",
+      front.canLoadMore({ ...guardState, refreshing: true, hasMore: true }),
+      false,
+    )
+    expect(
+      "15k 请求在途时守卫拒绝",
+      front.canLoadMore({ ...guardState, hasMore: true, inFlight: 1 }),
+      false,
+    )
     store15k.close()
     require("node:fs").rmSync(file15k)
 

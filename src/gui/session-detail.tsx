@@ -52,6 +52,51 @@ export function markSessionReverted(sessionID: string) {
   revertDirtySessions.add(sessionID)
 }
 
+/**
+ * loadMore 游标进展判定（TASK-14 收尾提取，供测试直连）：服务端响应相对
+ * 当前分页状态是否有进展。空页与「首回合 index ≥ 游标」都判为无进展——
+ * 后者意味着服务端没有取到更早回合，重试只会请求同一页（无限加载）。
+ */
+export function loadMoreProgress(
+  response: { turns: readonly SessionTurn[] },
+  nextBefore: number,
+): { progress: boolean; reason: "ok" | "empty" | "stalled" } {
+  if (!response.turns.length) return { progress: false, reason: "empty" }
+  if (response.turns[0]!.index >= nextBefore) return { progress: false, reason: "stalled" }
+  return { progress: true, reason: "ok" }
+}
+
+/**
+ * loadMore 响应归并（TASK-14 收尾提取，供测试直连）：给定当前详情与服务端
+ * 返回页，计算下一页详情。无进展（空页/游标未前进）保留当前回合不动，
+ * 只终止分页——异常响应不得污染已加载集合。有进展则合并新页并前移游标。
+ */
+export function applyLoadMoreResult(current: SessionDetail, next: SessionDetail): SessionDetail {
+  const progress = loadMoreProgress(next, current.nextBefore)
+  if (!progress.progress) return { ...current, hasMore: false, nextBefore: 0 }
+  return withTurns(next, mergeTurns(next.turns, current.turns))
+}
+
+/**
+ * loadMore 入口守卫（TASK-14 收尾提取，供测试直连）：删除状态、无更早回合、
+ * 加载中、刷新中、其他请求在途——任一成立都不得发请求。
+ */
+export function canLoadMore(state: {
+  sessionGone: boolean
+  hasMore: boolean
+  loadingMore: boolean
+  refreshing: boolean
+  inFlight: number
+}): boolean {
+  return (
+    !state.sessionGone &&
+    state.hasMore &&
+    !state.loadingMore &&
+    !state.refreshing &&
+    state.inFlight === 0
+  )
+}
+
 /** Merge two turn pages; later arguments win when a turn index overlaps. 导出供 15k 数据流回归。 */
 export function mergeTurns(first: readonly SessionTurn[], second: readonly SessionTurn[]): SessionTurn[] {
   const map = new Map<number, SessionTurn>()
@@ -752,8 +797,19 @@ export function SessionDetailView(props: {
 
   async function loadMore() {
     const current = detail()
-    if (sessionGone()) return // 会话已删除（TASK-13）：不加载更多
-    if (!current?.hasMore || loadingMore() || refreshing() || loadInFlight > 0) return
+    if (!current) return
+    // 入口守卫（TASK-14 收尾）：与 15k 测试共用 canLoadMore，删除/加载中/
+    // 刷新中/请求在途/无更早回合时都不发请求。
+    if (
+      !canLoadMore({
+        sessionGone: sessionGone(),
+        hasMore: current.hasMore,
+        loadingMore: loadingMore(),
+        refreshing: refreshing(),
+        inFlight: loadInFlight,
+      })
+    )
+      return
     const id = request
     setLoadingMore(true)
     setError("")
@@ -764,22 +820,9 @@ export function SessionDetailView(props: {
       })
       if (id !== request) return
       if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废
-      if (!next.turns.length) {
-        const empty = { ...current, hasMore: false, nextBefore: 0 }
-        setDetail(empty)
-        remember(empty)
-        return
-      }
-      // 游标无进展防护（TASK-14）：服务端返回的第一回合 index 与本页游标相同，
-      // 意味着没有取到更早的回合——再合并会原样返回，用户再点仍请求同一页
-      //（无限加载）。判定无进展时直接终止分页。
-      if (next.turns[0]!.index >= current.nextBefore) {
-        const stalled = { ...withTurns(next, mergeTurns(next.turns, current.turns)), hasMore: false, nextBefore: 0 }
-        setDetail(stalled)
-        remember(stalled)
-        return
-      }
-      const merged = withTurns(next, mergeTurns(next.turns, current.turns))
+      // 归并/终止判定统一走 applyLoadMoreResult（TASK-14 收尾）：与 15k 测试
+      // 同一实现——无进展保留 current 回合，有进展合并新页。
+      const merged = applyLoadMoreResult(current, next)
       setDetail(merged)
       remember(merged)
     } catch (cause) {
