@@ -125,6 +125,12 @@ function percentile(values: number[], p: number): number {
 
 type LatencySample = { ttft: number; total: number; output: number }
 
+/**
+ * 会话汇总（不含回合正文）。SessionDetail 去掉 turns/hasMore/nextAfter 之外
+ * 的全部字段——缓存只保存这份轻量对象，回合页在每次请求时按游标现读现建。
+ */
+type SessionSummary = Omit<SessionDetail, "turns" | "hasMore" | "nextBefore">
+
 type MutableTokens = {
   input: number
   output: number
@@ -834,7 +840,7 @@ export class UsageStore {
   private dbError = ""
   private cache = new Map<string, { at: number; value: Snapshot }>()
   private quotaCache?: { at: number; value: Quota }
-  private sessionCache = new Map<string, { at: number; value: SessionDetail }>()
+  private sessionCache = new Map<string, { at: number; value: SessionSummary }>()
   /** 逐日聚合的内存缓存：scope → (date → DayAgg)。 */
   private dayMemory = new Map<string, Map<string, DayAgg>>()
 
@@ -1395,37 +1401,32 @@ export class UsageStore {
   }
 
   sessionDetail(input: SessionDetailInput): SessionDetail {
-    const cached = this.sessionCache.get(input.sessionID)
-    if (!input.force && cached && Date.now() - cached.at < DETAIL_CACHE_MS) {
-      return this.sliceSessionDetail(cached.value, input)
-    }
     const db = this.database()
-    const full = db ? this.buildSessionDetail(db, input.sessionID) : this.emptySessionDetail(input.sessionID)
-    if (db) {
+    if (!db) return this.emptySessionDetail(input.sessionID)
+    // 汇总走轻量缓存（不含回合正文）；回合页每次按游标现读现构建。
+    let summary = this.sessionCache.get(input.sessionID)
+    if (input.force || !summary || Date.now() - summary.at >= DETAIL_CACHE_MS) {
+      summary = { at: Date.now(), value: this.buildSessionSummary(db, input.sessionID) }
       // Refresh insertion order so the map behaves as a small LRU.
       this.sessionCache.delete(input.sessionID)
-      this.sessionCache.set(input.sessionID, { at: Date.now(), value: full })
+      this.sessionCache.set(input.sessionID, summary)
       while (this.sessionCache.size > DETAIL_CACHE_LIMIT) {
         const oldest = this.sessionCache.keys().next().value
         if (oldest) this.sessionCache.delete(oldest)
       }
     }
-    return this.sliceSessionDetail(full, input)
+    return this.buildTurnPage(db, input.sessionID, summary.value, input)
   }
 
-  private sliceSessionDetail(full: SessionDetail, input: SessionDetailInput): SessionDetail {
-    const wanted = input.limit
-    const limit = Math.min(200, Math.max(1, Math.round(Number.isFinite(wanted) ? wanted! : DETAIL_PAGE)))
-    const before =
-      Number.isFinite(input.beforeTurn) && input.beforeTurn! > 0 ? input.beforeTurn! : full.turns.length + 1
-    const eligible = full.turns.filter((turn) => turn.index < before)
-    const start = Math.max(0, eligible.length - limit)
-    const turns = eligible.slice(start)
-    const hasMore = turns.length > 0 && turns[0]!.index > 1
-    return { ...full, turns, hasMore, nextBefore: hasMore ? turns[0]!.index : 0 }
-  }
-
-  private buildSessionDetail(db: Database, sessionID: string): SessionDetail {
+  /**
+   * 会话详情的数据路径（第二批真分页）：汇总与回合页分离。
+   * - SessionSummary：全会话 KPI，一条轻量 SQL 聚合（json_extract 提取顶层
+   *   标量字段，不把正文传入 JS），缓存于 sessionCache（LRU，TTL 60s）。
+   * - buildTurnPage：按 seq 游标读取当前页的消息，只解析当前页正文。
+   * 旧实现先解析全会话再切片，分页请求也要付全量解析成本；本路径下首屏
+   * 与 loadMore 都只触碰本页数据，汇总始终覆盖全会话。
+   */
+  private buildSessionSummary(db: Database, sessionID: string): SessionSummary {
     const row = db
       .query<Row>(
         `SELECT s.id, s.project_id, s.title, s.directory, s.model, s.agent, s.time_created, s.time_updated,
@@ -1434,18 +1435,273 @@ export class UsageStore {
          WHERE s.id = ?`,
       )
       .get(sessionID)
-    const messageRows = db
-      .query<Row>("SELECT id, type, seq, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq")
+    if (!row) {
+      // 会话不存在：不读消息，直接按未找到处理（与旧实现 found 语义一致）。
+      const anyMessage = db
+        .query<Row>("SELECT seq FROM session_message WHERE session_id = ? LIMIT 1")
+        .get(sessionID)
+      if (!anyMessage) return this.emptySummary(sessionID)
+    }
+
+    // 全会话聚合：assistant 行的顶层标量字段。json_valid 守门——单条坏 JSON
+    // 按 0/unknown 计入（与旧路径 parseJSON 失败 → 空对象 → num()=0 语义一致），
+    // 不允许一条异常消息让整个会话详情失败。COALESCE 保持 num() 的缺失即 0。
+    // 时延样本必须保留原值（分位数口径不变），从提取行在 JS 里算 P50/P95。
+    const aggRows = db
+      .query<Row>(
+        `SELECT
+           CAST(COALESCE(json_extract(data, '$.cost'), 0) AS REAL) AS cost,
+           CAST(COALESCE(json_extract(data, '$.tokens.input'), 0) AS REAL) AS input,
+           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS output,
+           CAST(COALESCE(json_extract(data, '$.tokens.reasoning'), 0) AS REAL) AS reasoning,
+           CAST(COALESCE(json_extract(data, '$.tokens.cache.read'), 0) AS REAL) AS cacheRead,
+           CAST(COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS REAL) AS cacheWrite,
+           CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS REAL) AS created,
+           CAST(COALESCE(json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS streamed,
+           CAST(COALESCE(json_extract(data, '$.time.completed'), json_extract(data, '$.time.streamed'), json_extract(data, '$.time.created'), time_created) AS REAL) AS completed,
+           CAST(COALESCE(json_extract(data, '$.tokens.output'), 0) AS REAL) AS outTok,
+           CASE WHEN json_extract(data, '$.error') IS NOT NULL THEN 1 ELSE 0 END AS hasError
+         FROM session_message
+         WHERE session_id = ? AND type = 'assistant' AND json_valid(data)
+         ORDER BY seq`,
+      )
       .all(sessionID)
 
+    const requests: LatencySample[] = []
+    let cost = 0
+    let errorCount = 0
+    let input = 0
+    let output = 0
+    let reasoning = 0
+    let cacheRead = 0
+    let cacheWrite = 0
+    for (const r of aggRows) {
+      cost += num(r.cost)
+      input += num(r.input)
+      output += num(r.output)
+      reasoning += num(r.reasoning)
+      cacheRead += num(r.cacheRead)
+      cacheWrite += num(r.cacheWrite)
+      if (num(r.hasError) > 0) errorCount += 1
+      const created = num(r.created)
+      const streamed = num(r.streamed) || created
+      const completed = num(r.completed) || streamed || created
+      requests.push({
+        ttft: Math.max(0, (streamed - created) / 1000),
+        total: Math.max(0, (completed - created) / 1000),
+        output: num(r.outTok),
+      })
+    }
+
+    // 回合边界统计：回合 = 一条 user 消息开启的群组；头部 assistant 群组
+    //（无前置 user）合成「会话开始」回合，同样占一个回合序号。
+    const userCountRow = db
+      .query<Row>("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'user'")
+      .get(sessionID)
+    const firstRow = db
+      .query<Row>("SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .get(sessionID)
+    const syntheticHead = text(firstRow?.type) === "assistant" ? 1 : 0
+    const userCount = num(userCountRow?.n)
+    const totalTurns = userCount + syntheticHead
+    // 工具调用数与工具错误数：content 数组里的 tool part。SQLite 无法可靠
+    // 数嵌套数组元素，退化为对 assistant data 的 JS 侧轻量计数——只读状态
+    // 字段，不构建 SessionRequest / SessionToolCall 对象。
+    let toolCount = 0
+    let toolErrorCount = 0
+    for (const m of db
+      .query<Row>("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' AND json_valid(data)")
+      .all(sessionID)) {
+      const data = parseJSON(String(m.data))
+      const content = Array.isArray(data?.content) ? data.content : []
+      for (const part of content) {
+        const record = asRecord(part)
+        if (record?.type !== "tool") continue
+        toolCount += 1
+        const state = asRecord(record.state)
+        if (text(state?.status) === "error" || state?.error) toolErrorCount += 1
+      }
+    }
+    // 请求级错误数（data.error 字段）由上面的 SQL 聚合给出（errorCount 起始值）。
+    errorCount += toolErrorCount
+
+    const latency = latencyStats(requests)
+    const sessionModel = row?.model ? parseJSON(String(row.model)) : undefined
+    const projectID = text(row?.project_id)
+    const directory = text(row?.directory)
+    const projectWorktree = text(row?.projectWorktree)
+    const projectName =
+      text(row?.projectName) || (projectWorktree ? basename(projectWorktree) : "") || projectID || "未命名项目"
+    // 模型归属：session_v2.model 优先；无 session 级模型时退回首个 assistant 的
+    // model 字段（旧实现取第一条 request 的模型，语义一致——按 seq 排序后的第一条）。
+    const firstModelRow = db
+      .query<Row>(
+        `SELECT json_extract(data, '$.model.providerID') AS providerID, json_extract(data, '$.model.id') AS modelID, json_extract(data, '$.agent') AS agent
+         FROM session_message
+         WHERE session_id = ? AND type = 'assistant' AND json_valid(data)
+         ORDER BY seq LIMIT 1`,
+      )
+      .get(sessionID)
+    const firstModelAgent = text(firstModelRow?.agent)
+
+    return {
+      found: Boolean(row) || totalTurns > 0,
+      id: sessionID,
+      title: text(row?.title) || "未命名会话",
+      projectID,
+      projectName,
+      directory,
+      providerID: text(sessionModel?.providerID) || text(firstModelRow?.providerID) || "unknown",
+      modelID: text(sessionModel?.id) || text(firstModelRow?.modelID) || "unknown",
+      agent: text(row?.agent) || firstModelAgent,
+      timeCreated: num(row?.time_created) || this.firstMessageTime(db, sessionID),
+      timeUpdated: num(row?.time_updated) || this.lastMessageTime(db, sessionID),
+      cost,
+      tokens: { input, output, reasoning, cacheRead, cacheWrite },
+      totalTurns,
+      promptCount: userCount,
+      requestCount: aggRows.length,
+      toolCount,
+      errorCount,
+      ttftP50: latency.ttftP50,
+      ttftP95: latency.ttftP95,
+      totalP50: latency.totalP50,
+      totalP95: latency.totalP95,
+      slowRate: latency.slowRate,
+      cacheHit: cacheHitRate({ input, output, reasoning, cacheRead, cacheWrite }),
+      generatedAt: Date.now(),
+    }
+  }
+
+  private firstMessageTime(db: Database, sessionID: string): number {
+    const r = db
+      .query<Row>("SELECT time_created FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .get(sessionID)
+    return num(r?.time_created)
+  }
+
+  private lastMessageTime(db: Database, sessionID: string): number {
+    const r = db
+      .query<Row>(
+        "SELECT time_created FROM session_message WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+      )
+      .get(sessionID)
+    return num(r?.time_created)
+  }
+
+  private emptySummary(id: string): SessionSummary {
+    return {
+      found: false,
+      id,
+      title: "未找到会话",
+      projectID: "",
+      projectName: "",
+      directory: "",
+      providerID: "unknown",
+      modelID: "unknown",
+      agent: "",
+      timeCreated: 0,
+      timeUpdated: 0,
+      cost: 0,
+      tokens: emptyTokens(),
+      totalTurns: 0,
+      promptCount: 0,
+      requestCount: 0,
+      toolCount: 0,
+      errorCount: 0,
+      ttftP50: 0,
+      ttftP95: 0,
+      totalP50: 0,
+      totalP95: 0,
+      slowRate: 0,
+      cacheHit: 0,
+      generatedAt: Date.now(),
+    }
+  }
+
+  /**
+   * 构建一页回合。游标是 1-based 回合序号（beforeTurn），与旧 RPC 契约一致：
+   * 省略 = 最后一页；传入 = 取该序号之前的回合。页内消息范围由 user 边界
+   * 探测得出（轻量元数据查询，不触碰 data 正文），本页消息才解析正文。
+   */
+  private buildTurnPage(
+    db: Database,
+    sessionID: string,
+    summary: SessionSummary,
+    input: SessionDetailInput,
+  ): SessionDetail {
+    const wanted = input.limit
+    const limit = Math.min(200, Math.max(1, Math.round(Number.isFinite(wanted) ? wanted! : DETAIL_PAGE)))
+    const beforeTurn =
+      Number.isFinite(input.beforeTurn) && input.beforeTurn! > 0 ? Math.floor(input.beforeTurn!) : summary.totalTurns + 1
+
+    // 页边界探测：从 beforeTurn 往前共 limit 个回合的起始 seq。全部基于
+    // (session_id, type, seq) 索引的轻量查询（真实库该索引已存在；EXPLAIN
+    // QUERY PLAN 均为 SEARCH/COVERING，不扫全文）。
+    // 1) 游标之前的 user 边界（倒序取 limit+1 个：第 limit+1 个是上一页的分界）
+    // 游标是开区间上界：beforeTurn ≤ totalTurns 时取下一页首回合的起始 seq；
+    // 超出（省略 beforeTurn = 最后一页）时取最后一条消息之后。
+    const cursorSeq =
+      beforeTurn <= summary.totalTurns
+        ? this.seqOfTurnStart(db, sessionID, beforeTurn)
+        : this.seqAfterLastMessage(db, sessionID)
+    if (cursorSeq === undefined) {
+      // 会话没有消息，返回空页
+      return { ...summary, turns: [], hasMore: false, nextBefore: 0 }
+    }
+    const boundaryRows = db
+      .query<Row>(
+        `SELECT seq, time_created FROM session_message
+         WHERE session_id = ? AND type = 'user' AND seq < ?
+         ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(sessionID, cursorSeq, limit + 1)
+    // 页起点：本页最多 limit 个回合。boundaryRows 倒序取 limit+1 个：前 limit 个
+    // 属于本页；第 limit+1 个说明更早还有回合（供 hasMore 判断），它及其之前的
+    // 消息不属于本页。pageStartSeq = 第 limit 个边界（倒序）的 seq —— 若不足
+    // limit 个边界，则本页一直覆盖到会话头（含头部合成回合）。
+    const pageStartSeq = boundaryRows.length > limit ? num(boundaryRows[limit - 1]?.seq) : 0
+    // 本页回合数：页内 user 边界数 +（pageStartSeq 覆盖头部群组时的 1）。
+    // 旧实现的终止语义：beforeTurn=1 时 index<1 无回合 → 空页。cursor 是
+    // 头部合成回合时（cursorSeq = headSeq+1 且无 user 边界 < cursorSeq）同样
+    // 只含合成回合本身——与旧实现的 [合成] 终止页一致。
+    const headRow = db
+      .query<Row>("SELECT type FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .get(sessionID)
+    const headIsAssistant = text(headRow?.type) === "assistant"
+    const pageCount = Math.min(boundaryRows.length, limit) + (pageStartSeq === 0 && headIsAssistant ? 1 : 0)
+
+    // 2) 只读本页消息（含 data 正文）并重放现有切分逻辑。
+    // 读取计数暴露到 globalThis，供测试断言「单页读取消息数受游标约束」
+    //（真分页证据；旧实现每次都读全会话）。生产环境无消费者，零开销。
+    const messageRows =
+      pageCount > 0
+        ? db
+            .query<Row>(
+              `SELECT id, type, seq, time_created, data FROM session_message
+               WHERE session_id = ? AND seq >= ? AND seq < ?
+               ORDER BY seq`,
+            )
+            .all(sessionID, pageStartSeq, cursorSeq)
+        : []
+    const counters = (globalThis as { __ucPageReads?: { messages: number; assistant: number } }).__ucPageReads
+    if (counters) {
+      counters.messages += messageRows.length
+      counters.assistant += messageRows.filter((m) => text(m.type) === "assistant").length
+    }
+
     const turns: MutableTurn[] = []
-    const requests: SessionRequest[] = []
-    let userCount = 0
-    let turn: MutableTurn | undefined
+
+    // 回合全局序号：游标前的回合总数 = user 边界数 + 头部合成回合。
+    // 本页第一回合的全局 index = 游标前回合总数 − 本页回合数 + 1。
+    const turnsBeforeCursor = num(
+      db.query<Row>("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ? AND type = 'user' AND seq < ?").get(sessionID, cursorSeq)?.n,
+    ) + (headIsAssistant ? 1 : 0)
+    let turnIndex = turnsBeforeCursor - pageCount + 1
 
     const finalize = () => {
-      if (!turn) return
-      const local = turn
+      if (!pendingTurn) return
+      const local = pendingTurn
       const tokenTotal = sumTokens(local.requests)
       const end = local.requests.reduce(
         (max, request) => Math.max(max, request.time + request.total * 1000),
@@ -1466,16 +1722,18 @@ export class UsageStore {
       local.ttft = ttfts.length ? ttfts.reduce((sum, value) => sum + value, 0) / ttfts.length : 0
       local.cacheHit = cacheHitRate(tokenTotal)
       turns.push(local)
-      turn = undefined
+      pendingTurn = undefined
     }
 
+    let pendingTurn: MutableTurn | undefined
+    let userCountSeen = 0
     for (const message of messageRows) {
       const type = text(message.type)
       const created = num(message.time_created)
       const data = parseJSON(String(message.data))
       if (type === "user") {
         finalize()
-        userCount += 1
+        userCountSeen += 1
         const prompt = clip(text(data?.text), PREVIEW.prompt)
         const rawFiles = Array.isArray(data?.files) ? data.files : []
         const files = rawFiles.slice(0, 12).map((raw) => {
@@ -1488,8 +1746,8 @@ export class UsageStore {
           const record = asRecord(agent)
           return text(agent) || text(record?.name) || text(record?.type) || "agent"
         })
-        turn = blankTurn(
-          turns.length + 1,
+        pendingTurn = blankTurn(
+          turnIndex++,
           num(message.seq),
           created,
           prompt.text,
@@ -1501,67 +1759,70 @@ export class UsageStore {
       }
       if (type === "assistant") {
         const request = this.sessionRequest(message, data)
-        requests.push(request)
-        if (!turn) {
-          turn = blankTurn(turns.length + 1, num(message.seq), request.time, "（会话开始）", false, [], [])
+        if (!pendingTurn) {
+          // 头部合成回合（无前置 user 的 assistant）。
+          pendingTurn = blankTurn(turnIndex++, num(message.seq), request.time, "（会话开始）", false, [], [])
         }
-        turn.requests.push(request)
+        pendingTurn.requests.push(request)
       }
     }
     finalize()
 
-    const tokens = sumTokens(requests)
-    const latency = latencyStats(
-      requests.map((request) => ({ ttft: request.ttft, total: request.total, output: request.tokens.output })),
-    )
-    const sessionModel = row?.model ? parseJSON(String(row.model)) : undefined
-    const firstModel = requests.find((request) => request.modelID !== "unknown")
-    const projectID = text(row?.project_id)
-    const directory = text(row?.directory)
-    const projectWorktree = text(row?.projectWorktree)
-    const projectName =
-      text(row?.projectName) || (projectWorktree ? basename(projectWorktree) : "") || projectID || "未命名项目"
-    const errorCount = requests.reduce(
-      (sum, request) =>
-        sum +
-        (request.error ? 1 : 0) +
-        request.tools.filter((tool) => tool.status === "error" || Boolean(tool.error)).length,
-      0,
-    )
-
+    // hasMore / nextBefore 语义与旧实现一致：本页第一回合 index > 1 说明
+    // 之前还有回合；下一页游标 = 本页第一回合的全局 index。
+    const hasMore = turns.length > 0 && turns[0]!.index > 1
     return {
-      found: Boolean(row) || messageRows.length > 0,
-      id: sessionID,
-      title: text(row?.title) || "未命名会话",
-      projectID,
-      projectName,
-      directory,
-      providerID: text(sessionModel?.providerID) || firstModel?.providerID || "unknown",
-      modelID: text(sessionModel?.id) || firstModel?.modelID || "unknown",
-      agent: text(row?.agent) || firstModel?.agent || "",
-      timeCreated:
-        num(row?.time_created) || (messageRows.length ? num(messageRows[0]?.time_created) : 0),
-      timeUpdated:
-        num(row?.time_updated) ||
-        (messageRows.length ? num(messageRows[messageRows.length - 1]?.time_created) : 0),
-      cost: requests.reduce((sum, request) => sum + request.cost, 0),
-      tokens,
+      ...summary,
       turns,
-      totalTurns: turns.length,
-      hasMore: false,
-      nextBefore: 0,
-      promptCount: userCount,
-      requestCount: requests.length,
-      toolCount: requests.reduce((sum, request) => sum + request.tools.length, 0),
-      errorCount,
-      ttftP50: latency.ttftP50,
-      ttftP95: latency.ttftP95,
-      totalP50: latency.totalP50,
-      totalP95: latency.totalP95,
-      slowRate: latency.slowRate,
-      cacheHit: cacheHitRate(tokens),
-      generatedAt: Date.now(),
+      hasMore,
+      nextBefore: hasMore ? turns[0]!.index : 0,
     }
+  }
+
+  /** 会话最后一条消息 seq + 1（开区间上界）；无消息返回 undefined。 */
+  private seqAfterLastMessage(db: Database, sessionID: string): number | undefined {
+    const r = db
+      .query<Row>("SELECT MAX(seq) AS s FROM session_message WHERE session_id = ?")
+      .get(sessionID)
+    return r && r.s !== null ? num(r.s) + 1 : undefined
+  }
+
+  /**
+   * 把 1-based 回合序号翻译成该回合起始消息的 seq。回合起点 = 第 n 个 user
+   * 边界（或头部 assistant 群组的第一条）。探测基于轻量元数据（type/seq），
+   * 不读正文。找不到（会话为空或序号越界）返回 undefined。
+   */
+  private seqOfTurnStart(db: Database, sessionID: string, turnNumber: number): number | undefined {
+    const headRow = db
+      .query<Row>("SELECT type, seq FROM session_message WHERE session_id = ? ORDER BY seq LIMIT 1")
+      .get(sessionID)
+    if (!headRow) return undefined
+    const headIsAssistant = text(headRow.type) === "assistant"
+    if (headIsAssistant) {
+      // index 1 = 头部合成回合（第一条消息）。游标是开区间上界，必须包含
+      // 头部消息本身，因此返回 headSeq + 1（其余回合的起点本就是下一回合的
+      // 首条消息，天然作上界）。beforeTurn=1 时旧实现语义是「index<1 无回合」
+      // → 空页；headSeq+1 会让区间含头部消息，需在这里维持旧终止语义：
+      // 调用方（loadMore 链）以 beforeTurn=1 拿到合成回合页后 hasMore=false
+      // 自然终止，与旧实现的 [合成] 页一致。返回 headSeq+1 使本页含合成回合。
+      if (turnNumber <= 1) return num(headRow.seq) + 1
+      const row = db
+        .query<Row>(
+          `SELECT seq FROM session_message
+           WHERE session_id = ? AND type = 'user'
+           ORDER BY seq LIMIT 1 OFFSET ?`,
+        )
+        .get(sessionID, turnNumber - 2)
+      return row ? num(row.seq) : undefined
+    }
+    const row = db
+      .query<Row>(
+        `SELECT seq FROM session_message
+         WHERE session_id = ? AND type = 'user'
+         ORDER BY seq LIMIT 1 OFFSET ?`,
+      )
+      .get(sessionID, turnNumber - 1)
+    return row ? num(row.seq) : undefined
   }
 
   private sessionRequest(message: Row, data: Record<string, unknown> | undefined): SessionRequest {
@@ -1644,34 +1905,10 @@ export class UsageStore {
 
   private emptySessionDetail(id: string): SessionDetail {
     return {
-      found: false,
-      id,
-      title: "未找到会话",
-      projectID: "",
-      projectName: "",
-      directory: "",
-      providerID: "unknown",
-      modelID: "unknown",
-      agent: "",
-      timeCreated: 0,
-      timeUpdated: 0,
-      cost: 0,
-      tokens: emptyTokens(),
+      ...this.emptySummary(id),
       turns: [],
-      totalTurns: 0,
       hasMore: false,
       nextBefore: 0,
-      promptCount: 0,
-      requestCount: 0,
-      toolCount: 0,
-      errorCount: 0,
-      ttftP50: 0,
-      ttftP95: 0,
-      totalP50: 0,
-      totalP95: 0,
-      slowRate: 0,
-      cacheHit: 0,
-      generatedAt: Date.now(),
     }
   }
 

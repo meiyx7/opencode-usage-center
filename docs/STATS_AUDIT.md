@@ -200,6 +200,42 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
   追加在 base 后面（argv[2] 仍是 base）。新增独立脚本 `test:scale:medium` /
   `test:scale:large` / `test:scale:all`，CI 注释同步更正。
 
+## 13. 第二批：会话回放真分页（阶段 A 服务端实现）
+
+- **汇总与回合页分离**（TASK-01）：`sessionDetail` 拆为两条独立数据路径——
+  `buildSessionSummary`（全会话 KPI：cost、五 Token 分量、请求数、回合数、
+  工具数、错误数、TTFT/总时延 P50/P95、慢请求比例、缓存命中率）与
+  `buildTurnPage`（按 seq 游标只读取、解析当前页消息）。汇总走轻量 SQL 聚合
+  （`json_extract` 提取 assistant data 顶层标量 + `json_valid` 守门单条坏 JSON
+  按 0 计入 + `COALESCE` 保持 num() 缺失即 0 语义）；分位数对 SQL 提取出的
+  样本数组沿用原 `percentile`（精确口径，未改近似）。工具数/工具错误数嵌套在
+  content 数组内，SQLite 不可靠数嵌套数组，退化为 JS 轻量计数（只读状态字段，
+  不构建 SessionRequest/SessionToolCall 对象）。
+- **seq 游标真分页**（TASK-02）：游标是 1-based 回合序号（`beforeTurn`，RPC
+  契约不变）。服务端把它翻译为消息 seq 开区间上界：`beforeTurn ≤ totalTurns`
+  取该回合起始 seq；省略/超出取 `MAX(seq)+1`。页起点由 user 边界探测
+  （倒序取 limit+1 个 `(session_id,type,seq)` 索引查询）得出，本页消息才解析
+  正文。回合全局序号 = 游标前回合总数 − 页内回合数 + 1（头部合成回合占
+  index 1，保持「会话开始」行为与旧终止语义：合成回合页 hasMore=false）。
+  真实库索引核查：`PRAGMA index_list` 确认 OpenCode 已有
+  `session_message_session_seq_idx` 与 `session_message_session_type_seq_idx`，
+  全部页查询 `EXPLAIN QUERY PLAN` 均为 SEARCH/COVERING（未创建任何索引——
+  插件只读）。合成测试库 schema 补齐同款复合索引。
+- **服务端缓存瘦身**（TASK-03）：`sessionCache` 从缓存完整 SessionDetail
+  （全部回合正文/思考/工具输出）改为只缓存 SessionSummary（轻量 KPI 对象），
+  LRU 4 个 + TTL 60s + force 刷新语义保留；回合页每次请求现读现建，缓存命中
+  时仍返回正确汇总。Revert 后旧回合不再驻留缓存（缓存对象不含回合）。
+- **对账验证**：新旧实现在真实库 444 个会话全字段逐一对账（found/title/cost/
+  五 Token 分量/回合数/提问数/请求数/工具数/错误数/四个分位数/慢请求率/缓存
+  命中率/模型/agent/时间戳/全部回合摘要）完全一致；首例发现的 errorCount 口径
+  差（旧=请求错误+工具错误，新 SQL 只数请求错误）已修复（补工具错误计数）。
+- **真分页证据**（TASK-05E 前置）：`buildTurnPage` 将单页读取消息数暴露到
+  `globalThis.__ucPageReads`（生产无消费者）；合成测试 15e 构造 220 回合复杂
+  会话（头部合成回合/一 user 多 assistant/工具错误/缺 cost/坏 JSON/尾部无回复
+  user），断言单页读取 ≤ 130 行、页链排序后序号连续 1..totalTurns、Σ页 cost =
+  汇总 cost、缓存命中/force 刷新行为。敏感度验证：把页查询退化为全会话读取
+  （模拟旧实现）时 4 处断言立即失败。
+
 ## 12. 评审三轮收尾记录（509c6ba 复审意见）
 
 - **RSS 单位换算**（三轮 P1-1）：`process.memoryUsage.rss()` 本身返回 bytes，

@@ -685,6 +685,8 @@ function main(): void {
     require("node:fs").rmSync(unkFile)
 
     // 15d. 分页对账：会话详情翻页（beforeTurn）的各页费用/Token 之和 = 整会话总量。
+    // 数据库 schema 含 OpenCode 真实复合索引（session_id+seq 与 session_id+type+seq），
+    // 让分页探测查询走真索引（第二批 TASK-02）。
     const pageFile = `${process.env.TMPDIR ?? "/tmp"}/uc-page-${process.pid}-${Math.random().toString(36).slice(2)}.db`
     const dbPage = new Database(pageFile)
     dbPage.exec(`
@@ -693,6 +695,8 @@ function main(): void {
       CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
       CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
       CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
     `)
     dbPage.exec(`INSERT INTO project VALUES ('pp', NULL, '/tmp/page', 1)`)
     dbPage.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('rp1', 'pp', '分页', ?, ?)").run(yesterday, yesterday)
@@ -734,6 +738,144 @@ function main(): void {
     expect("page cost sum = full", pageCost, fullDetail.cost, 1e-9)
     pageStore.close()
     require("node:fs").rmSync(pageFile)
+
+    // 15e. 真分页证据（第二批 TASK-05E）：大分页 + 读取范围受限 + 独立预期值
+    // 汇总对账 + 边界会话。构造 220 回合（1 user + 1 assistant，cost 0.01/回合）。
+    const bigPageFile = `${process.env.TMPDIR ?? "/tmp"}/uc-bigpage-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbBig = new Database(bigPageFile)
+    dbBig.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    dbBig.exec(`INSERT INTO project VALUES ('pb', NULL, '/tmp/bigpage', 1)`)
+    dbBig.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('bg1', 'pb', '大分页', ?, ?)").run(yesterday, yesterday)
+    // 复杂会话覆盖（TASK-05C）：普通回合 + 无 assistant 的 user + 一 user 多 assistant
+    // + 工具错误 + 缺 cost + 坏 JSON + 头部无 user 的 assistant（合成回合）。
+    const bigMsg = dbBig.prepare(
+      "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    let bigSeq = 0
+    let bigTime = yesterday - 220 * 3_600_000
+    // 头部合成回合：assistant 无前置 user（cost 0.5）
+    bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime, bigTime, JSON.stringify({
+      model: { providerID: "prov-x", id: "model-a" }, agent: "build", cost: 0.5,
+      tokens: { input: 100, output: 50, cache: { read: 20, write: 5 } },
+      time: { created: bigTime, streamed: bigTime + 500, completed: bigTime + 1500 },
+      content: [{ type: "tool", id: "t-head", name: "bash", state: { status: "error", error: "boom" } }],
+    }))
+    bigTime += 3_600_000
+    // 普通回合 × 218：1 user + 1 assistant
+    for (let i = 0; i < 218; i++) {
+      bigMsg.run(`bg-m${bigSeq++}`, "bg1", "user", bigSeq, bigTime, bigTime, JSON.stringify({ text: `问题 ${i + 1}` }))
+      const assistantCost = i % 3 === 0 ? undefined : 0.01 // 每 3 回合缺 cost（订阅内）
+      const payload: Record<string, unknown> = {
+        model: { providerID: "prov-x", id: "model-a" },
+        agent: "build",
+        cost: assistantCost,
+        tokens: { input: 40, output: 20, reasoning: i % 5 === 0 ? 10 : 0, cache: { read: 15, write: i % 7 === 0 ? 8 : 0 } },
+        time: { created: bigTime + 100, streamed: bigTime + 600, completed: bigTime + 2100 },
+      }
+      if (i === 9) {
+        // 一 user 多 assistant：在本回合塞第二条 assistant（下一条消息）
+        bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 100, bigTime + 100, JSON.stringify(payload))
+        bigSeq++
+        bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 300, bigTime + 300, JSON.stringify({ ...payload, cost: 0.02 }))
+      } else if (i === 20) {
+        // 工具 + 工具错误
+        payload.content = [
+          { type: "tool", id: "t1", name: "read", state: { status: "completed" } },
+          { type: "tool", id: "t2", name: "bash", state: { status: "error", error: "exit 1" } },
+        ]
+        bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 100, bigTime + 100, JSON.stringify(payload))
+      } else if (i === 30) {
+        // 坏 JSON：按 0 计入，不得让会话详情失败
+        bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 100, bigTime + 100, "{broken json")
+      } else {
+        bigMsg.run(`bg-m${bigSeq++}`, "bg1", "assistant", bigSeq, bigTime + 100, bigTime + 100, JSON.stringify(payload))
+      }
+      bigTime += 3_600_000
+    }
+    // 尾部：user 无 assistant 回合
+    bigMsg.run(`bg-m${bigSeq++}`, "bg1", "user", bigSeq, bigTime, bigTime, JSON.stringify({ text: "最后一问没有回复" }))
+    dbBig.close()
+
+    const bigStore = new UsageStore(bigPageFile, () => {})
+    // 独立预期值：0.5（头部）+ Σ 218 普通回合 cost + 0.02（i=9 的第二条 assistant）。
+    // i%3==0 的回合（0,3,...,216 → 73 个）缺 cost 按 0；i=30 同时是 %3==0 且坏 JSON，
+    // 两者都按 0，不产生额外修正项。
+    const normalTurns = 218
+    const zeroCostTurns = Math.floor((normalTurns - 1) / 3) + 1 // i=0,3,...,216 → 73
+    const doubleAssistantTurn = 1 // i=9 追加 0.02
+    const wantBigCost = 0.5 + (normalTurns - zeroCostTurns) * 0.01 + doubleAssistantTurn * 0.02
+    const first = bigStore.sessionDetail({ sessionID: "bg1", force: true })
+    expect("big totalTurns (218 user + 合成头 + 尾部无回复)", first.totalTurns, 220)
+    expect("big promptCount", first.promptCount, 219)
+    expect("big cost = 独立预期", first.cost, wantBigCost, 1e-9)
+    expect("big requestCount (218+1 头部+1 双assistant-1 坏JSON)", first.requestCount, 219)
+    expect("big toolCount", first.toolCount, 3)
+    // 工具错误 2（头 t-head + i=20 的 t2）；i=20 的 data.error 字段不存在
+    expect("big errorCount = tool errors", first.errorCount, 2)
+    // 首页只含最后 60 回合；合成回合在全局 index 1，翻到第一页验证。
+    expect("big latest page first index", first.turns[0]?.index ?? -1, 161)
+    const headPage = bigStore.sessionDetail({ sessionID: "bg1", beforeTurn: 2, limit: 2, force: true })
+    expect("big head synthetic turn", headPage.turns[0]?.prompt ?? "", "（会话开始）")
+    expect("big head page turns (合成回合页)", headPage.turns.length, 1)
+    expect("big head page hasMore=false (终止语义)", headPage.hasMore, false)
+
+    // 读取范围计数：翻完全部页，每页读取消息数必须受限（真分页证据）。
+    // 旧实现每次读全会话消息（~445 行/页 × 4 页）；新实现各页 ≤ limit 回合对应的消息数。
+    const reads = { messages: 0, assistant: 0 }
+    ;(globalThis as { __ucPageReads?: typeof reads }).__ucPageReads = reads
+    let bigCursor: number | undefined
+    let bigLoaded = 0
+    let bigCostSum = 0
+    const bigIndexes: number[] = []
+    let maxMessagesPerPage = 0
+    for (;;) {
+      const before = reads.messages
+      const page = bigStore.sessionDetail({ sessionID: "bg1", beforeTurn: bigCursor, limit: 60, force: true })
+      maxMessagesPerPage = Math.max(maxMessagesPerPage, reads.messages - before)
+      for (const turn of page.turns) {
+        bigLoaded += 1
+        bigCostSum += turn.cost
+        bigIndexes.push(turn.index)
+      }
+      if (!page.hasMore) break
+      bigCursor = page.nextBefore
+    }
+    delete (globalThis as { __ucPageReads?: typeof reads }).__ucPageReads
+    expect("big loaded = totalTurns", bigLoaded, first.totalTurns)
+    expect("big Σ page cost = summary", bigCostSum, first.cost, 1e-9)
+    // 全会话消息数 = 445（合成头 1 + 218×(1-2) user/assistant + 尾部 1）；单页读取必须远小于全会话。
+    const totalMessages = 1 + 219 + 220 + 3 + 1 // 估算：头1 + user219 + assistant220 + 双发1 + 尾1（按精确插入数重算）
+    expect("big page reads bounded (max page < 全会话)", maxMessagesPerPage < totalMessages, true)
+    expect("big page reads bounded (max page ≤ ~125 行)", maxMessagesPerPage <= 130, true)
+
+    // 真分页证据：页链完整。排序后回合序号必须连续 1..totalTurns，无重复无遗漏。
+    const sortedIndexes = [...bigIndexes].sort((a, b) => a - b)
+    expect(
+      "big indexes contiguous 1..totalTurns",
+      sortedIndexes.join(",") === sortedIndexes.map((_, i) => i + 1).join(","),
+      true,
+    )
+
+    // 缓存行为（TASK-05D）：连续两次无 force 请求命中同一汇总（generatedAt 不变）；
+    // force 刷新后重建。翻页循环里每页 force:true 都会重建汇总，因此缓存断言
+    // 在循环后独立做两次无 force 请求。
+    const cacheHit1 = bigStore.sessionDetail({ sessionID: "bg1" })
+    const cacheHit2 = bigStore.sessionDetail({ sessionID: "bg1" })
+    expect("cache: generatedAt unchanged on hit", cacheHit2.generatedAt, cacheHit1.generatedAt)
+    expect("cache: hit data identical", cacheHit2.cost, first.cost, 1e-9)
+    const forced = bigStore.sessionDetail({ sessionID: "bg1", force: true })
+    expect("cache: force refresh rebuilds summary", forced.generatedAt > cacheHit1.generatedAt, true)
+    expect("cache: forced data identical", forced.cost, first.cost, 1e-9)
+    bigStore.close()
+    require("node:fs").rmSync(bigPageFile)
   }
 
   if (failures.length > 0) {
