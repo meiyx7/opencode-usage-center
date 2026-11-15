@@ -452,3 +452,74 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
 - **未改动**：服务端分页算法、R1/C1/C2 口径、会话列表 500 条限制、Schema/
   索引、搜索与导出行为、UI 结构、依赖与版本号。`loadMore` 的并发/重复页/
   失败恢复留到 TASK-16.2，Revert/Delete 事件竞态留到 TASK-16.3。
+
+## 20. 阶段 B 第四轮（TASK-16.2：刷新与加载更多并发）
+
+- **现状结论**：16.1 把 `load` / 刷新收进 `createDetailLoader`（generation +
+  会话 + 响应 id 判定，只有最新代能收尾），`loadMore` 仍是组件内联：只读取
+  `loader.generation` 且**不递增**，响应回来只判 `id !== generation` 与
+  `sessionGone()`，`catch` 无条件写 `error`、`finally` 无条件清 `loadingMore`，
+  `rememberDetail(merged)` 按载荷 id 分槽。执行前审计列出 7 类竞态
+  （`docs/TASK16_ASYNC.md` §4.2 D1–D7）：同实例切换时旧分页追加到新会话并按
+  A 的 id 写缓存；响应 id 串包写错缓存槽；过期/删除/切换后的失败污染新视图；
+  旧分页清掉新请求 `loadingMore`；两次分页之间无请求身份隔离；发起时快照
+  覆盖较新结果；卸载后仍写缓存（留 16.4）。正常分页判定本身未发现缺陷。
+- **加固**：`loadMore()` 纳入 `createDetailLoader`，组件按钮与 16n 测试调用
+  同一入口。ticket 记录主 `generation` + 独立 `moreGeneration` + 请求会话；
+  `checkpointMore` 依次判 `stale`（主代 / 分页代）→ `gone` → `switched`，
+  `commitMore` 再校验响应 id 与当前 detail 归属会话，通过后按**提交时刻的最新
+  detail** 走生产 `applyLoadMoreResult` 并写视图 / 缓存。`catch` 只在该请求仍
+  是最新且属于当前会话时写 `error`；`finally` 只由最新分页代清 `loadingMore`。
+  入口守卫仍是 `canLoadMore`（删除 / 无更早 / 加载中 / 刷新中 / 其他请求在途），
+  新增 reason `skipped` 表示守卫拦下、未发请求；`isRefreshing` /
+  `isLoadingMore` / `setLoadingMore` 由组件信号注入，UI、文案与游标语义未变。
+- **16n 自动化回归**（Deferred 精确控制返回顺序，113 条断言语句，驱动上述
+  生产路径）：
+  - `a`：同一会话连续刷新，#1 晚于 #2 返回 → #1 判 `stale`，视图与缓存只留
+    #2，提交次数 1，加载态恢复。
+  - `b` / `m`：loadMore 在途同实例切到 B（未发新请求）→ 判 `switched`，A
+    分页不追加、A/B 缓存都不写；重建路径下 A 分页只落 A 实例与 A 缓存，
+    B 视图只提交一次，无第三会话 key。
+  - `c` / `d`：连续两次 loadMore → 第二次判 `skipped`、只发一请求；
+    loadMore 与刷新并发 → 刷新提交、旧分页判 `stale`、游标不被旧页推进，
+    `loadingMore` / `refreshing` 均恢复。
+  - `e` / `f` / `g` / `l`：重复页、空页、游标倒退页一律保留已有回合对象、
+    终止分页（`hasMore=false` / `nextBefore=0`）、守卫拒绝后续请求；连续两页
+    正常加载时 157–162 无重复无乱序、游标单调前移。
+  - `h` / `i` / `j`：loadMore 失败后 `loadingMore` 恢复、已有数据与缓存不变、
+    重试成功且只追加一次；连续刷新中旧刷新失败不写错误、不破坏新刷新；
+    过期 loadMore 失败判 `stale` 且错误态保持为空。
+  - `k`：loadMore 响应 id 与会话不一致 → 判 `mismatch`，不提交、不写 B 缓存。
+  - `o1` / `o2`：构造两次 loadMore 生命周期交叠，旧分页先回 / 晚回均判
+    `stale`，只追加一次、提交次数 2；旧请求不得清掉新请求的 `loadingMore`。
+- **缓存隔离与失效验证**：所有 16n 用例开始时 `invalidateDetailCache()` 清空
+  模块级 `DETAIL_CACHE`；断言均读真实 `readDetailCache`。切换 / 过期 / 响应
+  id 不匹配 / 失败路径下缓存条目不被创建或不被改写；正常与无进展路径下缓存
+  回合数与视图逐项一致；`m` 验证 A、B 各自缓存分槽且无第三 key。缓存容量
+  （4 条）与淘汰策略未改，本轮未做容量压力验证。
+- **覆盖层级**：未挂载 SolidJS 组件（不新增依赖）。测试驱动的是组件实际调用
+  的 `createDetailLoader.load()` / `.loadMore()`、入口守卫、归并函数与真实缓存
+  写入，不是组件 E2E，也不是独立 helper 的返回值复刻。真实 `Show` 重建 /
+  卸载时机、真实 RPC 时序、按钮 `disabled` 的 DOM 表现不在自动化范围内。
+- **敏感度验证**（逐项削弱生产判定 → 对应用例失败 → 全部恢复后重跑全绿）：
+  | 削弱项 | 检出用例 | 失败断言数 |
+  | --- | --- | --- |
+  | 去掉会话一致性判定 | 16n-b | 4 |
+  | 去掉响应 id 判定 | 16n-k | 4 |
+  | 去掉主 `generation` 判定 | 16n-d | 7 |
+  | 去掉 `moreGeneration` 判定 | 16n-o1 / o2 | 6 |
+  | `catch` 无条件 `setError` | 16n-j | 2 |
+  | `finally` 无条件清 `loadingMore` | 16n-o1 | 1 |
+  | 去掉 `commitMore` 缓存写入 | 16n-m / c / l / h | 6 |
+- **本地全套验收**（本轮代码，全部通过）：`typecheck` ✓；`build` ✓
+  （vite 220.35 kB / esbuild 74.2 kB）；`test:plugin` wire ✓；`test:synthetic` ✓
+  （10000 回合首屏 339ms、全链 167 页 55223ms、单页最大读取 120 行）；
+  三档规模回归 ✓（base 冷 76ms / 峰值 74MB，medium 430ms / 165MB，
+  large 1613ms / 402MB，独立预期值与三维度对账全部一致）。
+- **未改动**：服务端分页算法、R1/C1/C2 统计口径、会话列表 500 条限制、
+  Schema/索引、搜索与导出行为、UI 结构与文案、`canLoadMore` 守卫语义、
+  `loadMoreProgress` / `applyLoadMoreResult` 判定实现、缓存容量、依赖、版本号、
+  发布流程。
+- **尚未覆盖**：卸载后响应写入缓存（D7，留 16.4）；Revert / Delete /
+  cleared 事件竞态（留 16.3）；缓存淘汰压力与长会话 10,000 回合性能
+  （留 TASK-17）。

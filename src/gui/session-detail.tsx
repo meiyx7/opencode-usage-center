@@ -128,14 +128,16 @@ export type DetailRequestInput = { sessionID: string; force?: boolean; beforeTur
  * 响应提交判定结果（TASK-16.1）。测试与文档共用同一份词汇：
  * `ok` 属于最新一代且仍是当前会话；`stale` 更新一代请求已发出；
  * `gone` 会话已删除；`switched` 请求发起后当前会话已切换；
- * `mismatch` 响应 id 与请求会话不一致（防串写缓存）；`error` 请求失败。
+ * `mismatch` 响应 id 与请求会话不一致（防串写缓存）；`error` 请求失败；
+ * `skipped` 入口守卫拦下、未发出请求（仅 loadMore）。
  */
-export type DetailRejectReason = "ok" | "stale" | "gone" | "switched" | "mismatch" | "error"
+export type DetailRejectReason = "ok" | "stale" | "gone" | "switched" | "mismatch" | "error" | "skipped"
 
 export type DetailLoadOutcome = { committed: boolean; reason: DetailRejectReason }
 
 /**
- * 会话详情请求协调器（TASK-16.1）：首次加载、刷新、Revert 强刷都经由这里。
+ * 会话详情请求协调器（TASK-16.1 建立，TASK-16.2 纳入 loadMore）：首次加载、
+ * 刷新、Revert 强刷、加载更早回合都经由这里。
  *
  * 为什么要有它：实例级的 `request` 计数只能区分「本实例的第几代请求」，分不清
  * 会话。一旦详情页在同一个实例里切换 `props.session`（Solid 的 Show 在 when
@@ -143,10 +145,14 @@ export type DetailLoadOutcome = { committed: boolean; reason: DetailRejectReason
  * 这里用「会话 id + 响应 id」双重校验把「旧响应不得覆盖新会话、不得串写缓存」
  * 变成显式判定，提交与缓存写入共用同一个结果。
  *
+ * loadMore 与 load 共用主 `generation`（刷新 / Revert / 删除会令旧分页作废），
+ * 另有独立的 `moreGeneration` 区分分页请求自身的新旧：即便守卫状态被旧生命
+ * 周期提前复位，旧分页也不会重复追加或清掉新请求的 loadingMore。
+ *
  * 测试用 Deferred 直接驱动本函数（与组件同一实现），精确控制返回顺序。
  */
 export function createDetailLoader(options: {
-  /** 真实 RPC；测试注入可控 Promise。 */
+  /** 真实 RPC；测试注入可控 Promise。load 与 loadMore 共用，入参同 wire 契约。 */
   fetch: (input: DetailRequestInput) => Promise<SessionDetail>
   /** 当前会话 id（组件传 `props.session.id` 访问器，不是固定值）。 */
   currentSessionID: () => string
@@ -157,6 +163,9 @@ export function createDetailLoader(options: {
   /** 提交详情（组件传 `setDetail`）。 */
   setDetail: (detail: SessionDetail) => void
   setRefreshing: (value: boolean) => void
+  isRefreshing: () => boolean
+  setLoadingMore: (value: boolean) => void
+  isLoadingMore: () => boolean
   setError: (message: string) => void
   describeError: (cause: unknown) => string
   /** 写前端缓存（组件传 `rememberDetail`）。 */
@@ -164,6 +173,7 @@ export function createDetailLoader(options: {
 }) {
   let generation = 0
   let inFlight = 0
+  let moreGeneration = 0
 
   /** 响应能否落到当前视图（不看载荷内容）。 */
   function checkpoint(ticket: { generation: number; sessionID: string }): DetailRejectReason {
@@ -190,8 +200,34 @@ export function createDetailLoader(options: {
     return "ok"
   }
 
+  type MoreTicket = { generation: number; moreGeneration: number; sessionID: string }
+
+  /** 分页响应能否落到当前视图：主代 + 分页代 + 删除 + 会话切换。 */
+  function checkpointMore(ticket: MoreTicket): DetailRejectReason {
+    if (ticket.generation !== generation) return "stale"
+    if (ticket.moreGeneration !== moreGeneration) return "stale"
+    if (options.isGone()) return "gone"
+    if (ticket.sessionID !== options.currentSessionID()) return "switched"
+    return "ok"
+  }
+
+  /** 提交分页：判定通过才按最新详情合并、写视图与缓存。 */
+  function commitMore(ticket: MoreTicket, next: SessionDetail): DetailRejectReason {
+    const reason = checkpointMore(ticket)
+    if (reason !== "ok") return reason
+    // 响应必须属于发起请求的会话，否则 remember 会按载荷 id 写进别的缓存槽。
+    if (next.id !== ticket.sessionID) return "mismatch"
+    // 以提交时刻的详情为基线：不用发起时的快照覆盖较新结果。
+    const current = options.getDetail()
+    if (!current || current.id !== ticket.sessionID) return "switched"
+    const merged = applyLoadMoreResult(current, next)
+    options.setDetail(merged)
+    options.remember(merged)
+    return "ok"
+  }
+
   return {
-    /** 最新一代请求编号（loadMore 用它判断响应是否过期）。 */
+    /** 最新一代请求编号（协调器内部与测试探针共用）。 */
     get generation() {
       return generation
     },
@@ -220,6 +256,46 @@ export function createDetailLoader(options: {
         inFlight = Math.max(0, inFlight - 1)
         // 只有最新一代能结束加载态：旧请求晚返回不得清掉新请求的 refreshing。
         if (ticket.generation === generation) options.setRefreshing(false)
+      }
+    },
+    /**
+     * 加载更早回合（TASK-16.2）：入口守卫沿用 canLoadMore（删除 / 无更早 /
+     * 加载中 / 刷新中 / 其他请求在途），响应身份用「主代 + 分页代 + 会话 +
+     * 响应 id」判定；只有最新且匹配的分页才合并并写缓存。
+     */
+    async loadMore(): Promise<DetailLoadOutcome> {
+      if (options.isGone()) return { committed: false, reason: "gone" }
+      const current = options.getDetail()
+      if (
+        !current ||
+        !canLoadMore({
+          sessionGone: options.isGone(),
+          hasMore: current.hasMore,
+          loadingMore: options.isLoadingMore(),
+          refreshing: options.isRefreshing(),
+          inFlight,
+        })
+      )
+        return { committed: false, reason: "skipped" }
+      const ticket = {
+        generation,
+        moreGeneration: ++moreGeneration,
+        sessionID: options.currentSessionID(),
+      }
+      options.setLoadingMore(true)
+      options.setError("")
+      try {
+        const next = await options.fetch({ sessionID: ticket.sessionID, beforeTurn: current.nextBefore })
+        const reason = commitMore(ticket, next)
+        return { committed: reason === "ok", reason }
+      } catch (cause) {
+        // 过期 / 已删除 / 已切换的请求失败不得把错误写到当前视图。
+        const reason = checkpointMore(ticket)
+        if (reason === "ok") options.setError(options.describeError(cause))
+        return { committed: false, reason: reason === "ok" ? "error" : reason }
+      } finally {
+        // 只有最新一代分页能结束 loadingMore；旧请求晚返回不得清掉新请求的状态。
+        if (ticket.moreGeneration === moreGeneration) options.setLoadingMore(false)
       }
     },
   }
@@ -815,8 +891,9 @@ export function SessionDetailView(props: {
   /** JSON 导出的脱敏开关：开启时剥掉提示词、回复、思考与工具内容，只留结构化数字。 */
   const [sanitizeExport, setSanitizeExport] = createSignal(true)
   const [openTurns, setOpenTurns] = createSignal<Set<number>>(new Set())
-  // 请求协调（TASK-16.1）：首次加载 / 刷新 / Revert 强刷共用；会话切换或删除时
-  // invalidate 让在途响应作废，响应 id 与会话不一致时拒绝提交（不写缓存）。
+  // 请求协调（TASK-16.1 建立，TASK-16.2 纳入 loadMore）：首次加载 / 刷新 /
+  // Revert 强刷 / 加载更早回合共用；会话切换或删除时 invalidate 让在途响应
+  // 作废，响应 id 与会话不一致时拒绝提交（不写缓存）。
   const loader = createDetailLoader({
     fetch: (input) => api.sessionDetail(input),
     currentSessionID: () => props.session.id,
@@ -824,6 +901,9 @@ export function SessionDetailView(props: {
     getDetail: () => detail(),
     setDetail: (next) => setDetail(next),
     setRefreshing,
+    isRefreshing: () => refreshing(),
+    setLoadingMore,
+    isLoadingMore: () => loadingMore(),
     setError,
     describeError: readableError,
     remember: rememberDetail,
@@ -920,42 +1000,8 @@ export function SessionDetailView(props: {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  async function loadMore() {
-    const current = detail()
-    if (!current) return
-    // 入口守卫（TASK-14 收尾）：与 15k 测试共用 canLoadMore，删除/加载中/
-    // 刷新中/请求在途/无更早回合时都不发请求。
-    if (
-      !canLoadMore({
-        sessionGone: sessionGone(),
-        hasMore: current.hasMore,
-        loadingMore: loadingMore(),
-        refreshing: refreshing(),
-        inFlight: loader.inFlight,
-      })
-    )
-      return
-    const id = loader.generation
-    setLoadingMore(true)
-    setError("")
-    try {
-      const next = await api.sessionDetail({
-        sessionID: props.session.id,
-        beforeTurn: current.nextBefore,
-      })
-      if (id !== loader.generation) return
-      if (sessionGone()) return // 请求进行中会话被删除（TASK-13）：结果作废
-      // 归并/终止判定统一走 applyLoadMoreResult（TASK-14 收尾）：与 15k 测试
-      // 同一实现——无进展保留 current 回合，有进展合并新页。
-      const merged = applyLoadMoreResult(current, next)
-      setDetail(merged)
-      rememberDetail(merged)
-    } catch (cause) {
-      setError(readableError(cause))
-    } finally {
-      setLoadingMore(false)
-    }
-  }
+  // 加载更早回合（TASK-16.2）统一走 loader.loadMore()：入口守卫、请求身份
+  // 判定、归并、缓存写入与状态恢复都在协调器内，按钮与测试调用同一入口。
 
   // Revert / 删除事件订阅（TASK-10）：必须在缓存判断之前建立——cachedFresh
   // 命中时跳过初始请求是缓存优化，但事件订阅不能跟着跳过，否则缓存展示期间
@@ -1212,7 +1258,7 @@ export function SessionDetailView(props: {
             </div>
 
             <Show when={value().hasMore}>
-              <button type="button" class="uc-sd-more" onClick={() => void loadMore()} disabled={loadingMore() || sessionGone()}>
+              <button type="button" class="uc-sd-more" onClick={() => void loader.loadMore()} disabled={loadingMore() || sessionGone()}>
                 {loadingMore() ? "正在读取更早的回合…" : `加载更早的 ${value().nextBefore - 1} 个回合`}
               </button>
             </Show>

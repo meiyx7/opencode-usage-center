@@ -1931,13 +1931,20 @@ async function main(): Promise<void> {
     interface Deferred<T> {
       promise: Promise<T>
       resolve: (value: T) => void
+      reject: (cause: unknown) => void
     }
     function deferred<T>(): Deferred<T> {
       let resolve!: (value: T) => void
-      const promise = new Promise<T>((res) => {
+      let reject!: (cause: unknown) => void
+      const promise = new Promise<T>((res, rej) => {
         resolve = res
+        reject = rej
       })
-      return { promise, resolve }
+      return { promise, resolve, reject }
+    }
+    type LoadOutcome = {
+      committed: boolean
+      reason: "ok" | "stale" | "gone" | "switched" | "mismatch" | "error" | "skipped"
     }
     const requestModule = require("../src/gui/session-detail") as {
       createDetailLoader: (options: {
@@ -1947,6 +1954,9 @@ async function main(): Promise<void> {
         getDetail: () => SessionDetail | undefined
         setDetail: (detail: SessionDetail) => void
         setRefreshing: (value: boolean) => void
+        isRefreshing: () => boolean
+        setLoadingMore: (value: boolean) => void
+        isLoadingMore: () => boolean
         setError: (message: string) => void
         describeError: (cause: unknown) => string
         remember: (detail: SessionDetail) => void
@@ -1954,10 +1964,8 @@ async function main(): Promise<void> {
         generation: number
         inFlight: number
         invalidate: () => void
-        load: (force?: boolean, quiet?: boolean) => Promise<{
-          committed: boolean
-          reason: "ok" | "stale" | "gone" | "switched" | "mismatch" | "error"
-        }>
+        load: (force?: boolean, quiet?: boolean) => Promise<LoadOutcome>
+        loadMore: () => Promise<LoadOutcome>
       }
       rememberDetail: (detail: SessionDetail) => void
       readDetailCache: (sessionID: string) => { value: SessionDetail } | undefined
@@ -1986,8 +1994,9 @@ async function main(): Promise<void> {
         detail?: SessionDetail
         committed: SessionDetail[]
         refreshing: boolean
+        loadingMore: boolean
         error: string
-      } = { committed: [], refreshing: false, error: "" }
+      } = { committed: [], refreshing: false, loadingMore: false, error: "" }
       const loader = requestModule.createDetailLoader({
         fetch: setup.fetch,
         currentSessionID: setup.sessionID,
@@ -2000,6 +2009,11 @@ async function main(): Promise<void> {
         setRefreshing: (value) => {
           state.refreshing = value
         },
+        isRefreshing: () => state.refreshing,
+        setLoadingMore: (value) => {
+          state.loadingMore = value
+        },
+        isLoadingMore: () => state.loadingMore,
         setError: (message) => {
           state.error = message
         },
@@ -2115,6 +2129,334 @@ async function main(): Promise<void> {
       expect("16m-f B 完成后 refreshing 恢复", shared.state.refreshing, false)
       expect("16m-f B 完成后视图为 B", shared.state.detail?.id, "sess-B")
     }
+    requestModule.invalidateDetailCache()
+
+    // 16n. 刷新与加载更多并发（TASK-16.2）。与 16m 共用 Deferred / harness /
+    // 真实 DETAIL_CACHE；驱动的是组件实际调用的 createDetailLoader.load() 与
+    // .loadMore()（含 canLoadMore 守卫、applyLoadMoreResult 归并与缓存写入），
+    // 未挂载 SolidJS 组件，覆盖层级为生产请求协调与状态/缓存副作用，不是 E2E。
+    type FetchInput = { sessionID: string; force?: boolean; beforeTurn?: number }
+    /**
+     * 建立分页环境：第一次无 beforeTurn 的请求是首屏（走生产 load()），
+     * 之后带 beforeTurn 的请求按序分配给 pages Deferred；refresh Deferred
+     * 用于「loadMore 与刷新并发」场景。所有请求入参记录在 calls。
+     */
+    const paged = (
+      id: string,
+      pages: Deferred<SessionDetail>[],
+      opts?: { sessionID?: () => string; gone?: () => boolean; refresh?: Deferred<SessionDetail> },
+    ) => {
+      const seed = deferred<SessionDetail>()
+      const calls: FetchInput[] = []
+      let loadCalls = 0
+      let pageCalls = 0
+      const h = harness({
+        fetch: (input) => {
+          calls.push({ ...input })
+          if (input.beforeTurn === undefined) {
+            return loadCalls++ === 0 ? seed.promise : (opts?.refresh?.promise ?? seed.promise)
+          }
+          const page = pages[pageCalls++]
+          if (!page) throw new Error("unexpected loadMore request")
+          return page.promise
+        },
+        sessionID: opts?.sessionID ?? (() => id),
+        gone: opts?.gone,
+      })
+      const loading = h.loader.load()
+      return { id, h, seed, loading, calls, get pageCalls() { return pageCalls } }
+    }
+    /** 首屏用例自行决定何时返回：提交后得到 hasMore=true / nextBefore=首回合 index。 */
+    const openPaged = async (env: ReturnType<typeof paged>, indexes: number[]) => {
+      env.seed.resolve(detailOf(env.id, indexes.map(turnOf)))
+      const outcome = await env.loading
+      expect(`16n 首屏 ${env.id} 提交`, outcome.reason, "ok")
+      return outcome
+    }
+    const cacheTurns = (id: string) => requestModule.readDetailCache(id)?.value.turns.length ?? -1
+    const viewIndexes = (h: ReturnType<typeof harness>) => h.state.detail?.turns.map((t) => t.index).join(",") ?? ""
+
+    // 16n-a. 同一会话连续刷新：#1 晚于 #2 返回，旧响应不得覆盖视图或缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const first = deferred<SessionDetail>()
+      const second = deferred<SessionDetail>()
+      let nth = 0
+      const h = harness({
+        fetch: () => (nth++ === 0 ? first.promise : second.promise),
+        sessionID: () => "sess-A",
+      })
+      const load1 = h.loader.load(true)
+      const load2 = h.loader.load(true)
+      second.resolve(detailOf("sess-A", [turnOf(8)]))
+      expect("16n-a 新刷新提交", (await load2).reason, "ok")
+      expect("16n-a 新刷新视图", h.state.detail?.turns[0]?.index ?? -1, 8)
+      first.resolve(detailOf("sess-A", [turnOf(1)]))
+      expect("16n-a 旧刷新晚返回判 stale", (await load1).reason, "stale")
+      expect("16n-a 旧刷新不覆盖视图", h.state.detail?.turns[0]?.index ?? -1, 8)
+      expect("16n-a 只提交一次", h.state.committed.length, 1)
+      expect("16n-a 缓存只保留新刷新", cacheTurns("sess-A"), 1)
+      expect("16n-a 缓存回合为新刷新", requestModule.readDetailCache("sess-A")?.value.turns[0]?.index ?? -1, 8)
+      expect("16n-a 加载态恢复", `${h.state.refreshing}/${h.state.loadingMore}`, "false/false")
+      expect("16n-a 旧响应不写错误", h.state.error, "")
+    }
+
+    // 16n-b. loadMore 在途，同一实例原地切到 B 且未发新请求：旧 A 分页作废。
+    {
+      requestModule.invalidateDetailCache()
+      let active = "sess-A"
+      const page = deferred<SessionDetail>()
+      const env = paged("sess-A", [page], { sessionID: () => active })
+      await openPaged(env, [161, 162])
+      const more = env.h.loader.loadMore()
+      expect("16n-b 分页请求游标", env.calls[1]?.beforeTurn ?? -1, 161)
+      active = "sess-B"
+      page.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-b 切换后旧分页判 switched", (await more).reason, "switched")
+      expect("16n-b 未追加 A 分页", env.h.state.detail?.turns.length ?? -1, 2)
+      expect("16n-b 提交次数仍为 1", env.h.state.committed.length, 1)
+      expect("16n-b 不写 B 缓存", String(requestModule.readDetailCache("sess-B")), "undefined")
+      expect("16n-b A 缓存仍为首屏", cacheTurns("sess-A"), 2)
+      expect("16n-b loadingMore 恢复", env.h.state.loadingMore, false)
+    }
+
+    // 16n-m. 重建路径：A 实例的分页挂起，B 实例先返回，A 后返回。
+    {
+      requestModule.invalidateDetailCache()
+      const pageA = deferred<SessionDetail>()
+      const a = paged("sess-A", [pageA])
+      await openPaged(a, [161, 162])
+      const moreA = a.h.loader.loadMore()
+      const b = paged("sess-B", [])
+      await openPaged(b, [41, 42])
+      pageA.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-m A 旧分页落在 A 实例", (await moreA).reason, "ok")
+      expect("16n-m B 视图无 A 分页", viewIndexes(b.h), "41,42")
+      expect("16n-m B 只提交一次", b.h.state.committed.length, 1)
+      expect("16n-m A 缓存为 A 且含追加页", cacheTurns("sess-A"), 4)
+      expect("16n-m B 缓存为 B", requestModule.readDetailCache("sess-B")?.value.id ?? "", "sess-B")
+      expect("16n-m B 缓存回合数", cacheTurns("sess-B"), 2)
+      expect("16n-m 无第三会话缓存", String(requestModule.readDetailCache("sess-C")), "undefined")
+      expect("16n-m 两实例加载态恢复", `${a.h.state.loadingMore}/${b.h.state.refreshing}`, "false/false")
+    }
+
+    // 16n-c. 连续两次 loadMore：守卫拦下第二次，只发一个请求、只追加一次。
+    {
+      requestModule.invalidateDetailCache()
+      const page = deferred<SessionDetail>()
+      const env = paged("sess-A", [page])
+      await openPaged(env, [161, 162])
+      const more = env.h.loader.loadMore()
+      const blocked = await env.h.loader.loadMore()
+      expect("16n-c 第二次被守卫拦下", blocked.reason, "skipped")
+      expect("16n-c 只发出一次分页请求", env.pageCalls, 1)
+      expect("16n-c 拦下时 loadingMore 保持", env.h.state.loadingMore, true)
+      page.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-c 分页提交", (await more).reason, "ok")
+      expect("16n-c 只追加一次", viewIndexes(env.h), "159,160,161,162")
+      expect("16n-c 游标前移", env.h.state.detail?.nextBefore ?? -1, 159)
+      expect("16n-c 提交次数 2", env.h.state.committed.length, 2)
+      expect("16n-c loadingMore 恢复", env.h.state.loadingMore, false)
+      expect("16n-c 缓存与视图一致", cacheTurns("sess-A"), 4)
+    }
+
+    // 16n-d. loadMore 在途时触发刷新：刷新提交，旧分页判 stale，状态与游标正确。
+    {
+      requestModule.invalidateDetailCache()
+      const page = deferred<SessionDetail>()
+      const refresh = deferred<SessionDetail>()
+      const env = paged("sess-A", [page], { refresh })
+      await openPaged(env, [161, 162])
+      const more = env.h.loader.loadMore()
+      expect("16n-d 分页请求游标", env.calls[1]?.beforeTurn ?? -1, 161)
+      const reload = env.h.loader.load(true)
+      expect("16n-d 刷新置 refreshing", env.h.state.refreshing, true)
+      refresh.resolve(detailOf("sess-A", [161, 162].map(turnOf)))
+      expect("16n-d 刷新提交", (await reload).reason, "ok")
+      page.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-d 旧分页判 stale", (await more).reason, "stale")
+      expect("16n-d 旧分页未追加", viewIndexes(env.h), "161,162")
+      expect("16n-d 游标未被旧页推进", env.h.state.detail?.nextBefore ?? -1, 161)
+      expect("16n-d 提交次数 2（首屏+刷新）", env.h.state.committed.length, 2)
+      expect("16n-d 两状态均恢复", `${env.h.state.loadingMore}/${env.h.state.refreshing}`, "false/false")
+      expect("16n-d 缓存与视图一致", cacheTurns("sess-A"), 2)
+      expect("16n-d 过期分页不写错误", env.h.state.error, "")
+    }
+
+    // 16n-e/f/g. 重复页 / 空页 / 游标倒退页：保留已有回合、终止分页、不重复请求。
+    const stalledCase = async (label: string, pageTurns: number[]) => {
+      requestModule.invalidateDetailCache()
+      const page = deferred<SessionDetail>()
+      const env = paged("sess-A", [page])
+      await openPaged(env, [161, 162])
+      const beforeTurns = env.h.state.detail!.turns
+      const more = env.h.loader.loadMore()
+      page.resolve(detailOf("sess-A", pageTurns.map(turnOf)))
+      expect(`${label} 归并提交`, (await more).reason, "ok")
+      expect(`${label} 回合数不变`, env.h.state.detail?.turns.length ?? -1, 2)
+      expect(`${label} 回合对象原样保留`, env.h.state.detail?.turns[0] === beforeTurns[0], true)
+      expect(`${label} 终止分页`, env.h.state.detail?.hasMore ?? true, false)
+      expect(`${label} 游标归零`, env.h.state.detail?.nextBefore ?? -1, 0)
+      expect(`${label} 缓存与视图一致`, cacheTurns("sess-A"), 2)
+      expect(`${label} 守卫拒绝后续请求`, (await env.h.loader.loadMore()).reason, "skipped")
+      expect(`${label} 未额外发请求`, env.pageCalls, 1)
+      expect(`${label} 加载态恢复`, env.h.state.loadingMore, false)
+    }
+    await stalledCase("16n-e 重复页", [161, 162])
+    await stalledCase("16n-f 空页", [])
+    await stalledCase("16n-g 游标倒退页", [200, 201])
+
+    // 16n-l. 连续两页正常有进展：游标单调前移、无重复 index、缓存与视图一致。
+    {
+      requestModule.invalidateDetailCache()
+      const page1 = deferred<SessionDetail>()
+      const page2 = deferred<SessionDetail>()
+      const env = paged("sess-A", [page1, page2])
+      await openPaged(env, [161, 162])
+      const m1 = env.h.loader.loadMore()
+      expect("16n-l 第一页请求游标", env.calls[1]?.beforeTurn ?? -1, 161)
+      page1.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-l 第一页提交", (await m1).reason, "ok")
+      expect("16n-l 第一页游标前移", env.h.state.detail?.nextBefore ?? -1, 159)
+      const m2 = env.h.loader.loadMore()
+      expect("16n-l 第二页请求游标", env.calls[2]?.beforeTurn ?? -1, 159)
+      page2.resolve(detailOf("sess-A", [157, 158].map(turnOf)))
+      expect("16n-l 第二页提交", (await m2).reason, "ok")
+      expect("16n-l 六回合无重复", viewIndexes(env.h), "157,158,159,160,161,162")
+      expect("16n-l 游标单调前移", env.h.state.detail?.nextBefore ?? -1, 157)
+      expect("16n-l 缓存与视图一致", cacheTurns("sess-A"), 6)
+      expect("16n-l 两页后加载态恢复", env.h.state.loadingMore, false)
+    }
+
+    // 16n-h. loadMore 失败后状态恢复、已有数据与缓存不受损、允许重试成功。
+    {
+      requestModule.invalidateDetailCache()
+      const fail = deferred<SessionDetail>()
+      const retry = deferred<SessionDetail>()
+      const env = paged("sess-A", [fail, retry])
+      await openPaged(env, [161, 162])
+      const first = env.h.loader.loadMore()
+      fail.reject(new Error("network-down"))
+      expect("16n-h 失败返回 error", (await first).reason, "error")
+      expect("16n-h 错误态已设置", env.h.state.error, "Error: network-down")
+      expect("16n-h loadingMore 恢复", env.h.state.loadingMore, false)
+      expect("16n-h 失败不破坏已加载回合", viewIndexes(env.h), "161,162")
+      expect("16n-h 失败不破坏缓存", cacheTurns("sess-A"), 2)
+      const again = env.h.loader.loadMore()
+      expect("16n-h 允许重试", env.pageCalls, 2)
+      retry.resolve(detailOf("sess-A", [159, 160].map(turnOf)))
+      expect("16n-h 重试提交", (await again).reason, "ok")
+      expect("16n-h 只追加一次", viewIndexes(env.h), "159,160,161,162")
+      expect("16n-h 游标前移", env.h.state.detail?.nextBefore ?? -1, 159)
+      expect("16n-h 重试后错误态清空", env.h.state.error, "")
+      expect("16n-h 缓存与视图一致", cacheTurns("sess-A"), 4)
+    }
+
+    // 16n-i. 连续刷新中旧刷新失败、新刷新成功：旧失败不得写错误或破坏数据。
+    {
+      requestModule.invalidateDetailCache()
+      const seed = deferred<SessionDetail>()
+      const r1 = deferred<SessionDetail>()
+      const r2 = deferred<SessionDetail>()
+      let nth = 0
+      const h = harness({
+        fetch: () => {
+          const n = nth++
+          return n === 0 ? seed.promise : n === 1 ? r1.promise : r2.promise
+        },
+        sessionID: () => "sess-A",
+      })
+      const loading = h.loader.load()
+      seed.resolve(detailOf("sess-A", [turnOf(3)]))
+      await loading
+      const refresh1 = h.loader.load(true)
+      const refresh2 = h.loader.load(true)
+      r1.reject(new Error("stale-failure"))
+      expect("16n-i 旧刷新失败判 stale", (await refresh1).reason, "stale")
+      expect("16n-i 错误态保持为空", h.state.error, "")
+      r2.resolve(detailOf("sess-A", [turnOf(9)]))
+      expect("16n-i 新刷新提交", (await refresh2).reason, "ok")
+      // load() 的既定语义：刷新只返回最新一页，已加载的更早回合会被保留。
+      expect("16n-i 视图含新刷新回合", viewIndexes(h), "3,9")
+      expect("16n-i 只提交 2 次（首屏+新刷新）", h.state.committed.length, 2)
+      expect("16n-i refreshing 恢复", h.state.refreshing, false)
+      expect(
+        "16n-i 缓存含新刷新回合",
+        requestModule.readDetailCache("sess-A")?.value.turns.map((t) => t.index).join(",") ?? "",
+        "3,9",
+      )
+    }
+
+    // 16n-j. 过期 loadMore 失败（刷新已发起）：不得把错误写到当前视图。
+    {
+      requestModule.invalidateDetailCache()
+      const fail = deferred<SessionDetail>()
+      const refresh = deferred<SessionDetail>()
+      const env = paged("sess-A", [fail], { refresh })
+      await openPaged(env, [161, 162])
+      const more = env.h.loader.loadMore()
+      const reload = env.h.loader.load(true)
+      fail.reject(new Error("late-failure"))
+      expect("16n-j 过期分页失败判 stale", (await more).reason, "stale")
+      expect("16n-j 错误态不被污染", env.h.state.error, "")
+      refresh.resolve(detailOf("sess-A", [161, 162].map(turnOf)))
+      expect("16n-j 刷新提交", (await reload).reason, "ok")
+      expect("16n-j 数据保持有效", viewIndexes(env.h), "161,162")
+      expect("16n-j 缓存保持有效", cacheTurns("sess-A"), 2)
+    }
+
+    // 16n-k. loadMore 响应 id 与请求会话不一致：拒绝提交、不串写缓存。
+    {
+      requestModule.invalidateDetailCache()
+      const bad = deferred<SessionDetail>()
+      const env = paged("sess-A", [bad])
+      await openPaged(env, [161, 162])
+      const more = env.h.loader.loadMore()
+      bad.resolve(detailOf("sess-B", [159, 160].map(turnOf)))
+      expect("16n-k 响应 id 不一致判 mismatch", (await more).reason, "mismatch")
+      expect("16n-k 不提交", env.h.state.committed.length, 1)
+      expect("16n-k 视图保持首屏", viewIndexes(env.h), "161,162")
+      expect("16n-k 不写 B 缓存", String(requestModule.readDetailCache("sess-B")), "undefined")
+      expect("16n-k A 缓存仍为首屏", cacheTurns("sess-A"), 2)
+      expect("16n-k A 缓存 id 正确", requestModule.readDetailCache("sess-A")?.value.id ?? "", "sess-A")
+      expect("16n-k 加载态恢复", env.h.state.loadingMore, false)
+    }
+
+    // 16n-o. 两次 loadMore 生命周期交叠（显式复位状态信号模拟旧生命周期提前
+    // 清状态；守卫语义与生产代码不变）。分别覆盖「旧分页先返回」与「旧分页
+    // 晚返回」：旧分页不得提交、不得清掉新请求的 loadingMore。
+    const overlapCase = async (label: string, oldFirst: boolean) => {
+      requestModule.invalidateDetailCache()
+      const p1 = deferred<SessionDetail>()
+      const p2 = deferred<SessionDetail>()
+      const env = paged("sess-A", [p1, p2])
+      await openPaged(env, [161, 162])
+      const m1 = env.h.loader.loadMore()
+      env.h.state.loadingMore = false // 构造交叠：模拟旧生命周期提前复位状态
+      const m2 = env.h.loader.loadMore()
+      expect(`${label} 两次分页请求`, env.pageCalls, 2)
+      const oldPage = () => detailOf("sess-A", [159, 160].map(turnOf))
+      if (oldFirst) {
+        p1.resolve(oldPage())
+        expect(`${label} 旧分页判 stale`, (await m1).reason, "stale")
+        expect(`${label} 新请求 loadingMore 未被清`, env.h.state.loadingMore, true)
+        p2.resolve(oldPage())
+        expect(`${label} 新分页提交`, (await m2).reason, "ok")
+      } else {
+        p2.resolve(oldPage())
+        expect(`${label} 新分页提交`, (await m2).reason, "ok")
+        p1.resolve(oldPage())
+        expect(`${label} 旧分页晚返回判 stale`, (await m1).reason, "stale")
+      }
+      expect(`${label} 只追加一次`, viewIndexes(env.h), "159,160,161,162")
+      expect(`${label} 提交次数 2（首屏+新分页）`, env.h.state.committed.length, 2)
+      expect(`${label} 游标只由新分页推进`, env.h.state.detail?.nextBefore ?? -1, 159)
+      expect(`${label} 缓存与视图一致`, cacheTurns("sess-A"), 4)
+      expect(`${label} 加载态恢复`, env.h.state.loadingMore, false)
+      expect(`${label} 错误态为空`, env.h.state.error, "")
+    }
+    await overlapCase("16n-o1 旧分页先回", true)
+    await overlapCase("16n-o2 旧分页晚回", false)
     requestModule.invalidateDetailCache()
   }
 

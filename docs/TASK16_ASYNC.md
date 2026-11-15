@@ -165,7 +165,7 @@ inFlight: loader.inFlight })`；`inFlight` 只统计 `load()`，loadMore 自身�
 | 16n-i | 连续刷新中 #1 失败、#2 成功 | #1 失败不写 `error`、不破坏 #2 数据；`refreshing` 正确恢复 |
 | 16n-j | 过期 loadMore 失败（refresh 已发起） | 不 `setError`，错误态保持空 |
 | 16n-k | loadMore 响应 id 与请求会话不一致 | 判 `mismatch`；不提交、不写别的会话缓存 |
-| 16n-o | 构造两次 loadMore 生命周期交叠（外部提前复位 `loadingMore`），#2 先回、#1 后回 | #1 判 `stale`、不重复追加、不清 #2 的 `loadingMore`；游标只由 #2 推进 |
+| 16n-o1 / 16n-o2 | 构造两次 loadMore 生命周期交叠（外部提前复位 `loadingMore`），分别让 #1 先回 / #2 先回 | 旧分页一律判 `stale`、不重复追加；#1 先回时不得清掉 #2 的 `loadingMore`；游标只由 #2 推进 |
 
 > 16n-o 只为验证「响应身份兜底」：守卫语义与生产代码不变，测试显式复位的是
 > 状态信号（模拟旧生命周期提前清状态），不是让生产绕过守卫。
@@ -191,3 +191,70 @@ inFlight: loader.inFlight })`；`inFlight` 只统计 `load()`，loadMore 自身�
 - 文档：本文 §4–§5 + `docs/STATS_AUDIT.md` §20。
 - **不动**：服务端分页算法、R1/C1/C2 统计口径、会话列表 500 条限制、Schema/索引、
   搜索与导出、UI 结构与文案、既有 loadMore 守卫语义与游标判定、依赖、版本号、发布流程。
+
+---
+
+## 6. TASK-16.2 执行结果
+
+### 6.1 变更文件清单（相对 16.1 完成态 `e036ff4`）
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/gui/session-detail.tsx` | 协调器新增 `loadMore()`（`MoreTicket` / `checkpointMore` / `commitMore`、独立 `moreGeneration`）；options 增加 `isRefreshing` / `isLoadingMore` / `setLoadingMore`；`DetailRejectReason` 增加 `skipped`；组件删除内联 `loadMore()`，按钮改调 `loader.loadMore()`；注释同步。约 +90 / −44 行 |
+| `scripts/check-synthetic.ts` | `Deferred` 增加 `reject`；手写类型签名与 harness 状态同步新入口；新增 16n 用例组（113 条断言语句，含参数化复用）。约 +349 / −7 行 |
+| `docs/TASK16_ASYNC.md` | 本文 §4（现状分析）、§5（测试设计）、§6（执行结果） |
+| `docs/STATS_AUDIT.md` | §20 阶段 B 第四轮审计记录 |
+
+未改动：服务端分页、R1/C1/C2 口径、500 条限制、Schema/索引、搜索与导出、
+UI 结构与文案、`canLoadMore` 守卫语义、游标判定实现、缓存容量、依赖、版本号。
+
+### 6.2 关键竞态测试清单及结果
+
+全部用例由 Deferred 固定返回顺序，驱动生产 `createDetailLoader` 与真实缓存，
+`npm run test:synthetic` **通过**（无失败断言）。
+
+| 用例 | 覆盖竞态 | 结果 |
+| --- | --- | --- |
+| 16n-a | 连续刷新、旧响应晚于新响应 | `stale`，视图/缓存只留新刷新，提交 1 次，加载态恢复 |
+| 16n-b | loadMore 在途同实例切换会话 | `switched`，旧分页不追加，A/B 缓存都不写 |
+| 16n-m | 重建路径 A/B 两个实例 | A 只写 A 缓存，B 视图只提交 1 次，无第三会话 key |
+| 16n-c | 连续两次 loadMore | 第二次 `skipped`，只发 1 请求、只追加 1 次 |
+| 16n-d | loadMore 与 refresh 并发 | 刷新提交，旧分页 `stale`，游标不前进，两状态恢复 |
+| 16n-e/f/g | 重复页 / 空页 / 游标倒退页 | 保留原回合对象，终止分页，守卫拒绝后续请求 |
+| 16n-l | 连续两页正常加载 | 157–162 无重复无乱序，游标 161→159→157 单调前移 |
+| 16n-h | loadMore 失败后重试 | 错误态设置、`loadingMore` 恢复、数据/缓存不变、重试成功且只追加 1 次 |
+| 16n-i | 连续刷新中旧刷新失败 | 旧失败不写错误、不破坏新刷新 |
+| 16n-j | 过期 loadMore 失败 | 判 `stale`，错误态保持为空 |
+| 16n-k | 响应 id 与会话不一致 | `mismatch`，不提交、不串写 B 缓存 |
+| 16n-o1/o2 | 两次分页生命周期交叠（旧分页先回 / 晚回） | 旧分页一律 `stale`，只追加 1 次，不清新请求 `loadingMore` |
+
+**敏感度验证**：§5.4 的 7 项削弱全部被对应用例检出（失败断言 1–7 条不等），
+逐项恢复后重跑全绿。明细见 `docs/STATS_AUDIT.md` §20。
+
+### 6.3 缓存隔离与失效验证结果
+
+- 每个用例起始 `invalidateDetailCache()` 清空模块级 `DETAIL_CACHE`，断言全部
+  通过真实 `readDetailCache` 读取，不是模拟缓存对象。
+- 切换 / 过期 / 响应 id 不匹配 / 失败路径：缓存条目不被创建，也不被旧响应改写。
+- 正常追加与无进展终止路径：缓存回合数与视图逐项一致。
+- 重建路径（16n-m）：A、B 各自分槽，互不污染，无第三会话 key。
+- 缓存容量（4 条）与淘汰策略未改；本轮未做容量压力验证。
+
+### 6.4 本地全套回归
+
+`typecheck` ✓ · `build` ✓ · `test:plugin` wire ✓ · `test:synthetic` ✓ ·
+`test:scale` base / medium / large ✓（冷缓存 76 / 430 / 1613 ms，峰值内存
+74 / 165 / 402 MB）。CI run 的 ID、对应 SHA 与各步骤结果以本轮交付报告为准。
+
+### 6.5 覆盖层级与尚未覆盖的风险
+
+**不是组件 E2E**：未挂载 SolidJS 组件，不新增依赖；驱动的是组件实际调用的
+请求协调、状态更新与缓存写入路径。
+
+| 风险 | 原因 / 归属 |
+| --- | --- |
+| 卸载后响应仍写 `DETAIL_CACHE` | 真实存在（`onCleanup` 只 abort 事件订阅，无卸载标志），按任务划分留 TASK-16.4；本轮不引入额外状态层 |
+| Revert / Delete / cleared 事件竞态 | 留 TASK-16.3；结构上 `invalidate()` / `load(true)` 已令在途分页作废，但尚无确定性用例 |
+| Solid `Show` 真实重建 / 卸载时机 | 无 DOM 与测试渲染器；用两个协调器实例模拟重建、同实例改 `currentSessionID()` 模拟原地切换 |
+| 真实 RPC 网络时序 / 按钮 `disabled` 的 DOM 表现 | 由 Deferred 替代；只断言 `loadingMore` / `refreshing` 信号值 |
+| 缓存淘汰压力、10,000 回合长会话性能 | 留 TASK-17 |
