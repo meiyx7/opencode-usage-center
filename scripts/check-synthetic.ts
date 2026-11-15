@@ -983,8 +983,46 @@ async function main(): Promise<void> {
     })()
     dbHuge.close()
     const hugeStore = new UsageStore(hugeFile, () => {})
+    // TASK-17.3.1：汇总 SQL 执行计数探针——运行时包裹 bun:sqlite（不改生产代码），
+    // 只对两条全会话汇总 SQL（toolStats / scalars）计数，作为「翻页是否重复执行
+    // 汇总」的权威证据。WeakSet 防止 Bun 按 SQL 文本复用 Statement 导致重复包裹；
+    // 15g 结束后恢复原型，不影响同进程后续用例。
+    const { Database: hugeProbeDb } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const hugeProbeProto = (hugeProbeDb as unknown as { prototype: Record<string, unknown> }).prototype
+    const hugeOriginalQuery = hugeProbeProto.query as (this: unknown, sql: string) => Record<string, unknown>
+    const hugeWrappedStatements = new WeakSet<object>()
+    const hugeSummarySql = { toolStats: 0, scalars: 0 }
+    const hugeSummarySqlKind = (sql: string): "toolStats" | "scalars" | undefined => {
+      const s = sql.replace(/\s+/g, " ").trim()
+      if (s.includes("json_each(")) return "toolStats"
+      if (s.includes("$.tokens.input")) return "scalars"
+      return undefined
+    }
+    hugeProbeProto.query = function (this: unknown, sql: string) {
+      const statement = hugeOriginalQuery.call(this, sql) as Record<string, unknown>
+      const kind = hugeSummarySqlKind(sql)
+      if (kind && !hugeWrappedStatements.has(statement)) {
+        hugeWrappedStatements.add(statement)
+        for (const method of ["all", "get", "run"] as const) {
+          const original = statement[method]
+          if (typeof original !== "function") continue
+          try {
+            statement[method] = function (this: unknown, ...args: unknown[]) {
+              hugeSummarySql[kind] += 1
+              return (original as (...a: unknown[]) => unknown).apply(this, args)
+            }
+          } catch {
+            // 个别内置语句方法不可写时跳过计数，不影响执行。
+          }
+        }
+      }
+      return statement
+    }
     const tBuild = performance.now()
     const hugeFirst = hugeStore.sessionDetail({ sessionID: "hg1", force: true })
+    // 首屏冷汇总路径覆盖：force 请求恰好执行一次全会话汇总 SQL。
+    expect("huge 首屏 force 汇总 SQL 恰好 1 次（冷路径覆盖）", hugeSummarySql.scalars, 1)
+    expect("huge 首屏 force toolStats SQL 恰好 1 次", hugeSummarySql.toolStats, 1)
     const tFirst = performance.now()
     expect("huge totalTurns", hugeFirst.totalTurns, hugeTurns)
     expect("huge 首屏回合数 = 60", hugeFirst.turns.length, 60)
@@ -1022,17 +1060,28 @@ async function main(): Promise<void> {
     let hugePages = 0
     const readPerFirst = firstReads
     let maxPageReads = readPerFirst
+    // TASK-17.3.1：翻页不传 force——与生产 loadMore()（fetch({sessionID, beforeTurn})，
+    // 从不带 force）语义一致，复用首屏建立的服务端汇总缓存。汇总正确性由
+    // Σ页 cost 对账与独立预期断言兜底；是否真的复用缓存由 SQL 计数断言证明。
+    const hugeSeenIndexes = new Set<number>()
+    let hugeDuplicates = 0
+    const hugeLoopSqlBefore = { ...hugeSummarySql }
     for (;;) {
       const before = hugeReads.messages
-      const page = hugeStore.sessionDetail({ sessionID: "hg1", beforeTurn: hugeCursor, limit: 60, force: true })
+      const page = hugeStore.sessionDetail({ sessionID: "hg1", beforeTurn: hugeCursor, limit: 60 })
       const pageReads = hugeReads.messages - before
       maxPageReads = Math.max(maxPageReads, pageReads)
       hugeLoaded += page.turns.length
-      for (const turn of page.turns) hugeCost += turn.cost
+      for (const turn of page.turns) {
+        hugeCost += turn.cost
+        if (hugeSeenIndexes.has(turn.index)) hugeDuplicates += 1
+        else hugeSeenIndexes.add(turn.index)
+      }
       hugePages += 1
       if (!page.hasMore) break
       hugeCursor = page.nextBefore
     }
+    const hugeLoopSummarySql = hugeSummarySql.scalars - hugeLoopSqlBefore.scalars
     ;(globalThis as { __ucPageReads?: typeof hugeReads }).__ucPageReads = undefined
     ;(globalThis as { __ucSummaryProbe?: typeof hugeSummary }).__ucSummaryProbe = undefined
     ;(globalThis as { __ucReadProbe?: typeof hugeParse }).__ucReadProbe = undefined
@@ -1041,11 +1090,107 @@ async function main(): Promise<void> {
     expect("huge Σ页cost = 汇总", hugeCost, hugeFirst.cost, 1e-9)
     expect("huge 汇总 = 独立预期", hugeFirst.cost, hugeTurns * 0.001, 1e-9)
     expect("huge 每页读取 ≤ 130 行（真分页，全会话 20000 行）", maxPageReads <= 130, true)
+    // TASK-17.3.1 新增断言：翻页零汇总 SQL（缓存复用）+ 无缺失 / 无重复回合。
+    expect("huge 翻页汇总 SQL 执行 0 次（复用首屏缓存，非 force 重复汇总）", hugeLoopSummarySql, 0)
+    expect("huge 翻页 toolStats SQL 执行 0 次", hugeSummarySql.toolStats - hugeLoopSqlBefore.toolStats, 0)
+    expect("huge 全链汇总 SQL 总计 2 次（两次 force 首屏 + 0 次翻页）", hugeSummarySql.scalars, 2)
+    expect("huge 全链无重复回合", hugeDuplicates, 0)
+    expect("huge 全链无缺失回合", hugeSeenIndexes.size, hugeTurns)
+    // 恢复 SQL 计数探针：15g 之后的所有用例不再计数。
+    hugeProbeProto.query = hugeOriginalQuery
     console.log(
-      `[长会话] ${hugeTurns} 回合: 首屏 ${(tFirst - tBuild).toFixed(0)}ms / 正文 ${firstReads} 行 ${(firstBytes / 1048576).toFixed(1)}MB / JSON 解析 ${firstParses} 次 ${(firstParseBytes / 1048576).toFixed(1)}MB / 汇总结构化扫描 ${firstScanned} 行（正文传入 0 字节）/ 全链 ${hugePages} 页 ${(tAll - tFirst).toFixed(0)}ms / 单页最大读取 ${maxPageReads} 行`,
+      `[长会话] ${hugeTurns} 回合: 首屏 ${(tFirst - tBuild).toFixed(0)}ms / 正文 ${firstReads} 行 ${(firstBytes / 1048576).toFixed(1)}MB / JSON 解析 ${firstParses} 次 ${(firstParseBytes / 1048576).toFixed(1)}MB / 汇总结构化扫描 ${firstScanned} 行（正文传入 0 字节）/ 全链 ${hugePages} 页 ${(tAll - tFirst).toFixed(0)}ms / 单页最大读取 ${maxPageReads} 行 / 汇总 SQL 首屏 2 次・翻页 ${hugeLoopSummarySql} 次`,
     )
     hugeStore.close()
     require("node:fs").rmSync(hugeFile)
+
+    // 17a. UsageStore.sessionDetail 缓存行为（TASK-17.3.2）：独立验证服务端
+    // sessionCache 的完整生命周期——冷建缓存、命中不重算、force 绕过缓存、
+    // 刷新后重新命中、四条路径统计结果一致。以汇总 SQL 执行计数（运行时包裹
+    // bun:sqlite，不改生产代码）为权威证据，而不是只比对返回对象。
+    const cacheFile = `${process.env.TMPDIR ?? "/tmp"}/uc-cache-${process.pid}-${Math.random().toString(36).slice(2)}.db`
+    const dbCache = new Database(cacheFile)
+    dbCache.exec(`
+      CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, directory TEXT, model TEXT, agent TEXT, time_created INTEGER, time_updated INTEGER, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+      CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, time_active INTEGER);
+      CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+      CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    `)
+    dbCache.exec(`INSERT INTO project VALUES ('pc', NULL, '/tmp/cache', 1)`)
+    dbCache.prepare("INSERT INTO session_v2 (id, project_id, title, time_created, time_updated) VALUES ('cs1', 'pc', '缓存行为', 1, 1)").run()
+    const cacheMsg = dbCache.prepare("INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, 'cs1', ?, ?, ?, ?, ?)")
+    const cachePayload = JSON.stringify({
+      cost: 0.002,
+      model: { providerID: "prov-c", id: "model-c" },
+      agent: "build",
+      tokens: { input: 20, output: 10, cache: { read: 5, write: 1 } },
+      time: { created: 1, completed: 10 },
+    })
+    dbCache.transaction(() => {
+      for (let i = 0; i < 40; i++) {
+        cacheMsg.run(`c${i}u`, "user", i * 2 + 1, i, i, JSON.stringify({ text: `缓存回合 ${i}` }))
+        cacheMsg.run(`c${i}a`, "assistant", i * 2 + 2, i, i, cachePayload)
+      }
+    })()
+    dbCache.close()
+    // SQL 计数探针（同 15g 手法；块结束恢复原型）。
+    const { Database: cacheProbeDb } = require("bun:sqlite") as typeof import("bun:sqlite")
+    const cacheProbeProto = (cacheProbeDb as unknown as { prototype: Record<string, unknown> }).prototype
+    const cacheOriginalQuery = cacheProbeProto.query as (this: unknown, sql: string) => Record<string, unknown>
+    const cacheWrappedStatements = new WeakSet<object>()
+    const cacheSummarySql = { count: 0 }
+    cacheProbeProto.query = function (this: unknown, sql: string) {
+      const statement = cacheOriginalQuery.call(this, sql) as Record<string, unknown>
+      if (sql.replace(/\s+/g, " ").trim().includes("$.tokens.input") && !cacheWrappedStatements.has(statement)) {
+        cacheWrappedStatements.add(statement)
+        for (const method of ["all", "get", "run"] as const) {
+          const original = statement[method]
+          if (typeof original !== "function") continue
+          try {
+            statement[method] = function (this: unknown, ...args: unknown[]) {
+              cacheSummarySql.count += 1
+              return (original as (...a: unknown[]) => unknown).apply(this, args)
+            }
+          } catch {
+            // 个别内置语句方法不可写时跳过计数，不影响执行。
+          }
+        }
+      }
+      return statement
+    }
+    const cacheStore = new UsageStore(cacheFile, () => {})
+    // 1) 普通首次请求（无缓存）：执行一次汇总 SQL，建立汇总缓存。
+    const cacheCold = cacheStore.sessionDetail({ sessionID: "cs1" })
+    expect("17a 普通首次请求建缓存：汇总 SQL 1 次", cacheSummarySql.count, 1)
+    expect("17a 普通首次请求回合数", cacheCold.totalTurns, 40)
+    expect("17a 普通首次请求成本", cacheCold.cost, 40 * 0.002, 1e-9)
+    // 2) 普通再次请求：命中缓存，不重复执行汇总 SQL。
+    const cacheHit = cacheStore.sessionDetail({ sessionID: "cs1" })
+    expect("17a 缓存命中：汇总 SQL 0 次", cacheSummarySql.count, 1)
+    expect("17a 缓存命中 generatedAt 不变", cacheHit.generatedAt, cacheCold.generatedAt)
+    // 3) force 请求：绕过缓存，重新执行汇总 SQL（间隔 5ms 保证 generatedAt 前进）。
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const cacheForced = cacheStore.sessionDetail({ sessionID: "cs1", force: true })
+    expect("17a 强制刷新：汇总 SQL 1 次（绕过缓存）", cacheSummarySql.count, 2)
+    expect("17a 强制刷新 generatedAt 前进（重建缓存）", cacheForced.generatedAt > cacheHit.generatedAt, true)
+    // 4) 强制刷新后的普通请求：重新命中新缓存。
+    const cacheHitAfter = cacheStore.sessionDetail({ sessionID: "cs1" })
+    expect("17a 刷新后普通请求：汇总 SQL 0 次（重新命中）", cacheSummarySql.count, 2)
+    expect("17a 刷新后命中新缓存 generatedAt = force 后", cacheHitAfter.generatedAt, cacheForced.generatedAt)
+    // 5) 汇总结果一致：缓存路径不同不改变统计结果。
+    const cachePaths = [cacheCold, cacheHit, cacheForced, cacheHitAfter]
+    expect(
+      "17a 四条路径统计结果一致（cost/回合/工具数）",
+      cachePaths.every((d) => Math.abs(d.cost - 40 * 0.002) < 1e-9 && d.totalTurns === 40 && d.turns.length === 40) &&
+        cachePaths.every((d) => d.toolCount === cacheCold.toolCount),
+      true,
+    )
+    // 恢复探针。
+    cacheProbeProto.query = cacheOriginalQuery
+    cacheStore.close()
+    require("node:fs").rmSync(cacheFile)
 
     // 15i. Revert 缓存失效行为测试（TASK-08 行为验证，复审补充）：服务端侧
     // 模拟 Revert——删除消息后 force 读取，已删回合不得出现，其他会话缓存
