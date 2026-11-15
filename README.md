@@ -4,7 +4,7 @@
 
 ![设计草图](design/sketch.png)
 
-> 当前是 `1.0.0`。数字来自本机真实数据库快照，界面会随本机数据变化。完整版本历史见 [ROADMAP.md](ROADMAP.md)。
+> npm 最新发布版 `0.3.1`；`0.3.2`（会话回放真分页、长会话性能与生命周期可靠性）发布准备中，变更清单见 [CHANGELOG.md](CHANGELOG.md)。数字来自本机真实数据库快照，界面会随本机数据变化。完整版本历史见 [ROADMAP.md](ROADMAP.md)。
 
 ## 功能
 
@@ -29,7 +29,7 @@
 
 ```json
 {
-  "plugins": ["opencode-usage-center@1.0.0"]
+  "plugins": ["opencode-usage-center@0.3.2"]
 }
 ```
 
@@ -122,28 +122,23 @@ preview/              本地渲染预览（不发布）
 
 ## 发布
 
-> 本地 `npm publish` 已被 `prepublishOnly` 守卫禁止；版本只通过推送 `v*` tag 由 GitHub Actions 发布（`npm version patch && git push --follow-tags`）。
+> 本地 `npm publish` 已被 `prepublishOnly` 守卫禁止；版本只通过推送 `v*` tag 由 GitHub Actions 发布（`.github/workflows/publish.yml`）。
 
-第一次发布（npm 目前没有这个包）：
+发布流程（包已在 npm 上，走 Trusted Publishing）：
 
-```bash
-npm login --registry=https://registry.npmjs.org
-npm publish --access public --registry=https://registry.npmjs.org
-```
-
-发布成功后，在 npmjs.com 的包设置里配置 Trusted Publisher：
-
-- Repository: `meiyx7/opencode-usage-center`
-- Workflow: `publish.yml`
-
-之后推送 `v*` tag 就会由 GitHub Actions 自动发布：
+1. 发布决策确认后，把 `package.json` 的 `version` 更新为目标版本（如 `0.3.2`），并核对 [CHANGELOG.md](CHANGELOG.md) 已有对应条目；
+2. 提交并推送 tag：
 
 ```bash
-npm version patch
-git push --follow-tags
+git push origin main
+git tag v0.3.2
+git push origin v0.3.2
 ```
 
-第一次发布不能直接走 OIDC，因为 npm 需要包已经存在后才能配置 Trusted Publisher；这是 npm 的限制，不是仓库配置问题。
+3. `publish.yml` 自动执行：校验 tag 与 `package.json` 版本一致 → `npm ci` → typecheck → build → `npm publish --access public --provenance`；
+4. 发布后在 npm 包页面确认 provenance 徽标（0.3.1 起已验证 OIDC Trusted Publishing 链路实际生效）。
+
+说明：npm 的 Trusted Publisher 要求包存在后才能配置；本包首个版本（0.1.0）已于 2026-11-08 手动发布完成，此限制已成历史，不再需要本地或令牌发布。
 
 ## License
 
