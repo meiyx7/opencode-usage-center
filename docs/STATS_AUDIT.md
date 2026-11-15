@@ -608,3 +608,36 @@ Token KPI、趋势图、模型占比上升约 +37%（取决于模型构成），
 - **尚未覆盖**：Solid 真实 `onCleanup` 触发与 `<Show>` 重建、组件级
   `cachedFresh` 渲染分支、事件订阅 abort 后上游迭代器挂起、真实 RPC 时序与
   DOM 表现；缓存淘汰压力与 10,000 回合性能留 TASK-17。
+
+## 23. 阶段 B 收尾（TASK-16.5：整体集成验收）
+
+- **性质**：基线 `5e1d129` 只读验收，**无生产代码改动**；仅修正 README 一处
+  与实现不符的性能描述（原称「一次数据库扫描」，实际 `snapshot` 按天聚合、
+  历史天复用落盘聚合、只有当天现算、分批合并）。完整交付报告见
+  `docs/TASK16_5_ACCEPTANCE.md`。
+- **链路审计**：源码实读确认服务端 `sessionDetail` = `buildSessionSummary`
+  （全会话标量聚合 + 60s / 4 条 LRU 缓存）与 `buildTurnPage`（seq 游标 +
+  user 边界探测 + 本页消息读取）分离；前端首屏 / loadMore / 搜索 / 导出 /
+  事件 / dispose 全部收敛到 `createDetailLoader` 与 `DETAIL_CACHE`。未发现
+  「假分页」全量读取残留路径；`invalidate()` / `generation` getter 为无生产
+  调用者的防御性 API，按 P3 记录不重构。
+- **口径与对账**：R1（有效 Token = input + output，不含 reasoning）、C1（cost
+  缺失/0 均按 0）、C2（Sessions 按 `modelID` 精确匹配）均与源码一致；15b–15l
+  覆盖 Σ 页 = Σ 全会话、六类 Token、请求/回合/工具/错误数、TTFT/P50/P95/
+  慢请求、一 user 多 assistant、合成头回合、无 assistant 回合、seq 不连续、
+  坏 JSON、Revert 截断、空页/重复页/游标无进展。无公式或异常策略变更。
+- **集成回归**：16m/16n/16p/16q 覆盖会话切换、乱序刷新、分页与刷新交错、
+  Revert/Delete/cleared、卸载 dispose、实例隔离、缓存复用；前端缓存 4 条 /
+  120s / LRU 与服务端 4 条 / 60s / 默认 60 回合均保持。
+- **自动化**：typecheck / build / plugin wire / synthetic / scale base·medium·
+  large 全部通过（base 冷 69ms、medium 362ms、large 1449ms；峰值 74 / 165 /
+  400 MB）。核查测试隔离（pid + random 临时目录、用例起始清缓存）、Deferred
+  假绿防护（16p/16q 兜底 resolve + `synthetic ok` 证明 main 执行到底）、
+  mutation 临时改动已恢复（工作区干净、常量与判定复核）、生产函数直连证据与
+  非组件 E2E 的覆盖声明。
+- **文档核对**：README 一处修正；`STATS_AUDIT.md` §9 / §19–§22、三份 TASK-16
+  任务记录与实现一致；历史范围声明、历史行号、`metrics.ts` 的「待确认」措辞、
+  ROADMAP 未收录阶段 B 等按 P3 记录，不改写审计链、不扩展文档体系。
+- **结论**：无 P0 / P1，唯一 P2 已修复；统计口径不变、分页链路完整、缓存与
+  请求生命周期无回归、CI 等价本地全套全绿。**建议关闭第二批**（待独立复审），
+  随后进入 TASK-17 长会话性能专项。
